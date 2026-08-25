@@ -1,0 +1,131 @@
+name: FLASH-Ghostty Release Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release candidate version (vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flash-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'tourzhao/flash-ghostty'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify fork product overlay
+        run: flash/verify-product-overlay.sh
+
+      - name: Validate version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$REQUESTED_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must use vX.Y.Z format" >&2
+            exit 1
+          fi
+          echo "value=${REQUESTED_VERSION#v}" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: validate
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      XCODE_XCCONFIG_FILE: ${{ github.workspace }}/macos/Configurations/FlashGhostty.ReleaseLocal.xcconfig
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Load product manifest
+        run: |
+          set -a
+          source flash/product.env
+          set +a
+          env | grep '^FLASH_GHOSTTY_' >> "$GITHUB_ENV"
+
+      - name: Verify fork product overlay
+        run: flash/verify-product-overlay.sh
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+
+      - name: Build GhosttyKit
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Dversion-string="$RELEASE_VERSION"
+
+      - name: Install Nushell
+        run: brew install nushell
+
+      - name: Build unsigned release candidate
+        run: |
+          macos/build.nu \
+            --configuration ReleaseLocal \
+            --xcconfig "$XCODE_XCCONFIG_FILE" \
+            --action build
+
+      - name: Apply build metadata and verify updater isolation
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          app="macos/build/ReleaseLocal/$FLASH_GHOSTTY_APP_BUNDLE"
+          plist="$app/Contents/Info.plist"
+          build_number=$(git rev-list --count HEAD)
+          commit=$(git rev-parse --short HEAD)
+
+          /usr/libexec/PlistBuddy -c "Set :GhosttyCommit $commit" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$plist"
+          plutil -replace SUEnableAutomaticChecks -bool NO "$plist"
+          /usr/libexec/PlistBuddy -c 'Delete :SUFeedURL' "$plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Delete :SUPublicEDKey' "$plist" 2>/dev/null || true
+
+          test "$(defaults read "$PWD/$plist" CFBundleIdentifier)" = "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID"
+          test "$(defaults read "$PWD/$plist" CFBundleDisplayName)" = "$FLASH_GHOSTTY_DISPLAY_NAME"
+          if /usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$plist" >/dev/null 2>&1; then exit 1; fi
+          if /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" >/dev/null 2>&1; then exit 1; fi
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+
+      - name: Archive app
+        run: |
+          app="macos/build/ReleaseLocal/$FLASH_GHOSTTY_APP_BUNDLE"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$app" \
+            "$FLASH_GHOSTTY_ARTIFACT_BASENAME.zip"
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-ghostty-${{ needs.validate.outputs.version }}-macos
+          path: flash-ghostty-macos-universal.zip
+          if-no-files-found: error
+          retention-days: 14
+
+# Deliberately no GitHub Release, appcast, R2, Sentry, notarization, or
+# Sparkle signing step. Add those only after FLASH-Ghostty owns the required
+# identities and secrets.
