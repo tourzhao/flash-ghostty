@@ -18,3 +18,10 @@ FOUNDATION_EXPORT BOOL GhosttyShowWindowSafely(
     id _Nullable sender,
     NSError * _Nullable * _Nullable error
 );
+
+/// NSWindowTabGroup.selectedWindow wrapper
+FOUNDATION_EXPORT BOOL GhosttySelectTabWindowSafely(
+    id _Nonnull group,
+    id _Nonnull window,
+    NSError * _Nullable * _Nullable error
+);

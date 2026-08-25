@@ -54,3 +54,35 @@ BOOL GhosttyShowWindowSafely(
         return NO;
     }
 }
+
+BOOL GhosttySelectTabWindowSafely(
+    id group,
+    id window,
+    NSError * _Nullable * _Nullable error
+) {
+    // AppKit documents selectedWindow as throwing when the target is not a
+    // member. A membership check in Swift is still subject to a transition
+    // between native tab groups, so the setter must remain inside @try.
+    @try {
+        NSWindowTabGroup *tabGroup = (NSWindowTabGroup *)group;
+        NSWindow *targetWindow = (NSWindow *)window;
+        if (![tabGroup.windows containsObject:targetWindow]) {
+            return NO;
+        }
+
+        tabGroup.selectedWindow = targetWindow;
+
+        // AppKit may defer updating the selectedWindow getter until it has
+        // transferred the native tab stack and titlebar accessory. Treat a
+        // completed setter as success; reading the getter synchronously can
+        // report the previous window even though the visual selection is
+        // already underway.
+        return YES;
+    } @catch (NSException *exception) {
+        if (error != NULL) {
+            *error = GhosttyErrorFromException(exception, 3);
+        }
+
+        return NO;
+    }
+}
