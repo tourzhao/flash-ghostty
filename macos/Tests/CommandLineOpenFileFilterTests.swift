@@ -3,6 +3,37 @@ import Testing
 
 @Suite
 struct CommandLineOpenFileFilterTests {
+    @Test func executeLaunchInstallsVolatilePersistenceOverride() {
+        let defaults = UserDefaults.standard
+        let domainName = "CommandLinePersistencePolicyTests-\(UUID())"
+        defer { defaults.removeVolatileDomain(forName: domainName) }
+        defaults.setVolatileDomain(["ExistingArgument": "kept"], forName: domainName)
+
+        CommandLinePersistencePolicy.installIfNeeded(
+            arguments: ["ghostty", "-e", "echo", "hello"],
+            defaults: defaults,
+            argumentDomainName: domainName
+        )
+
+        let domain = defaults.volatileDomain(forName: domainName)
+        #expect(domain["ExistingArgument"] as? String == "kept")
+        #expect(domain[CommandLinePersistencePolicy.ignoreStateKey] as? Bool == true)
+    }
+
+    @Test func interactiveLaunchDoesNotInstallPersistenceOverride() {
+        let defaults = UserDefaults.standard
+        let domainName = "CommandLinePersistencePolicyTests-\(UUID())"
+        defer { defaults.removeVolatileDomain(forName: domainName) }
+
+        CommandLinePersistencePolicy.installIfNeeded(
+            arguments: ["ghostty"],
+            defaults: defaults,
+            argumentDomainName: domainName
+        )
+
+        #expect(defaults.volatileDomain(forName: domainName).isEmpty)
+    }
+
     @Test func requiresExecuteFlag() {
         let filter = CommandLineOpenFileFilter(
             arguments: ["ghostty", "/tmp/file.txt"],
@@ -10,6 +41,7 @@ struct CommandLineOpenFileFilterTests {
             fileExists: { _ in true }
         )
 
+        #expect(!filter.hasExecuteCommand)
         #expect(!filter.shouldIgnore("/tmp/file.txt"))
     }
 
@@ -33,6 +65,7 @@ struct CommandLineOpenFileFilterTests {
             fileExists: { existing.contains($0) }
         )
 
+        #expect(filter.hasExecuteCommand)
         #expect(!filter.shouldIgnore("/tmp/before.txt"))
         #expect(filter.shouldIgnore("/usr/bin/vim"))
         #expect(filter.shouldIgnore("/tmp/project/file.txt"))

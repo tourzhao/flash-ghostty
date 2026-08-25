@@ -1,9 +1,35 @@
 import Foundation
 
+/// Installs process-local Cocoa defaults needed by one-shot command launches.
+/// `ApplePersistenceIgnoreState` prevents AppKit from restoring or replacing
+/// the interactive launch's Saved Application State archive. Using a volatile
+/// argument domain gives it command-line precedence without persisting a user
+/// preference that could affect a later normal launch.
+enum CommandLinePersistencePolicy {
+    static let ignoreStateKey = "ApplePersistenceIgnoreState"
+
+    static func installIfNeeded(
+        arguments: [String],
+        defaults: UserDefaults = .standard,
+        argumentDomainName: String = UserDefaults.argumentDomain
+    ) {
+        guard arguments.contains("-e") else { return }
+
+        var domain = defaults.volatileDomain(forName: argumentDomainName)
+        domain[ignoreStateKey] = true
+        defaults.setVolatileDomain(domain, forName: argumentDomainName)
+    }
+}
+
 /// Filters the open-file events AppKit creates from command arguments following
 /// `-e`. Each matching event is consumed once so later requests to open the same
 /// file are handled normally.
 final class CommandLineOpenFileFilter {
+    /// Whether this process was launched with Ghostty's execute-command flag.
+    /// Such launches are one-shot command sessions and must not consume a
+    /// previously saved interactive workspace.
+    let hasExecuteCommand: Bool
+
     private let workingDirectory: URL
     private var filesToIgnore: Set<URL>
 
@@ -18,7 +44,10 @@ final class CommandLineOpenFileFilter {
         ).absoluteURL.standardizedFileURL
         self.workingDirectory = workingDirectory
 
-        guard let commandIndex = arguments.firstIndex(of: "-e") else {
+        let commandIndex = arguments.firstIndex(of: "-e")
+        self.hasExecuteCommand = commandIndex != nil
+
+        guard let commandIndex else {
             self.filesToIgnore = []
             return
         }
