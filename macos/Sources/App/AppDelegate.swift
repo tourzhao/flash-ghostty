@@ -16,7 +16,6 @@ class AppDelegate: NSObject,
         subsystem: Bundle.main.bundleIdentifier!,
         category: String(describing: AppDelegate.self)
     )
-
     /// Various menu items so that we can programmatically sync the keyboard shortcut with the Ghostty config
     @IBOutlet private var menuAbout: NSMenuItem?
     @IBOutlet private var menuServices: NSMenu?
@@ -88,6 +87,13 @@ class AppDelegate: NSObject,
     /// This is only true before application has become active.
     private var applicationHasBecomeActive: Bool = false
 
+    /// AppKit posts its restoration completion notification even when there
+    /// are no saved windows. Waiting for it prevents an extra blank window
+    /// while restoration requests are paused for user confirmation.
+    private var applicationDidFinishRestoringWindows: Bool = false
+    private var applicationDidFinishLaunchingCompleted: Bool = false
+    private var initialWindowLaunchHandled: Bool = false
+
     /// This is set in applicationDidFinishLaunching with the system uptime so we can determine the
     /// seconds since the process was launched.
     private var applicationLaunchTime: TimeInterval = 0
@@ -100,6 +106,23 @@ class AppDelegate: NSObject,
         workingDirectory: FileManager.default.currentDirectoryPath,
         fileExists: { FileManager.default.fileExists(atPath: $0) }
     )
+
+    /// True for Ghostty's special `-e` one-shot command launch.
+    var launchedWithExecuteCommand: Bool {
+        commandLineOpenFileFilter.hasExecuteCommand
+    }
+
+    /// Owns launch policy, archive marker writes, prompting, and the queue of
+    /// passive materialization requests. AppDelegate only supplies lifecycle
+    /// facts and app-specific state queries.
+    @MainActor private lazy var sessionRestorationCoordinator =
+        SessionRestorationCoordinator(
+            archiveStore: UserDefaultsSessionRestorationArchiveStore(),
+            promptPresenter: AppKitSessionRestorationPromptPresenter(),
+            didResolveFromPrompt: { [weak self] decision in
+                self?.startupRestorationDidResolve(decision)
+            }
+        )
 
     /// This is the current configuration from the Ghostty configuration that we need.
     private var derivedConfig: DerivedConfig = DerivedConfig()
@@ -181,10 +204,23 @@ class AppDelegate: NSObject,
         super.init()
 
         ghostty.delegate = self
+
+        // AppKit posts this between will-finish-launching and
+        // did-finish-launching when there are no windows to restore. Register
+        // during delegate construction rather than from
+        // applicationWillFinishLaunching; observing from the latter races the
+        // notification and can leave a clean launch with no terminal window.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidFinishRestoringWindows(_:)),
+            name: NSApplication.didFinishRestoringWindowsNotification,
+            object: nil
+        )
     }
 
     // MARK: - NSApplicationDelegate
 
+    @MainActor
     func applicationWillFinishLaunching(_ notification: Notification) {
         #if DEBUG
         if
@@ -194,10 +230,16 @@ class AppDelegate: NSObject,
             UserDefaults.ghostty.removePersistentDomain(forName: suite)
         }
         #endif
-        UserDefaults.ghostty.register(defaults: [
+        TerminalSessionSidebarPreferences.store.register(defaults: [
             // Disable the automatic full screen menu item because we handle
             // it manually.
             "NSFullScreenMenuItemEverywhere": false,
+
+            // Global presentation preferences for the macOS session sidebar.
+            TerminalSessionSidebarPreferences.sessionFontSizeKey:
+                TerminalSessionSidebarPreferences.defaultSessionFontSize,
+            TerminalSessionSidebarPreferences.sidebarWidthKey:
+                TerminalSessionSidebarPreferences.defaultSidebarWidth,
 
             // On macOS 26 RC1, the autofill heuristic controller causes unusable levels
             // of slowdowns and CPU usage in the terminal window under certain [unknown]
@@ -209,8 +251,14 @@ class AppDelegate: NSObject,
             // Manual autofill via the `Edit => AutoFill` menu item still work as expected.
             "NSAutoFillHeuristicControllerEnabled": false,
         ])
+
+        sessionRestorationCoordinator.prepareLaunch(
+            launchedWithExecuteCommand: launchedWithExecuteCommand,
+            restorationEnabled: ghostty.config.windowSaveState != "never"
+        )
     }
 
+    @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
         // System settings overrides
         UserDefaults.ghostty.register(defaults: [
@@ -229,7 +277,7 @@ class AppDelegate: NSObject,
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
 
-        // Start our update checker.
+        // This is a no-op while FLASH-Ghostty has no product-owned update feed.
         updateController.startUpdater()
 
         // Register our service provider. This must happen after everything is initialized.
@@ -354,6 +402,25 @@ class AppDelegate: NSObject,
                 NSApp.arrangeInFront(nil)
             }
         }
+
+        // AppKit can activate us from a nested launch-time modal before this
+        // method has finished. Do not create the fallback terminal until all
+        // configuration, menus, notifications, and signal handlers are ready.
+        applicationDidFinishLaunchingCompleted = true
+
+        // AppKit documents that the no-window restoration notification occurs
+        // before did-finish-launching. Older registration timing could miss
+        // that event, leaving a clean launch permanently windowless. Preserve
+        // genuinely deferred restoration requests, but treat the request-free
+        // launch as complete here as a second line of defense.
+        if SessionRestorationLaunchMilestonePolicy
+            .mayInferCompletionAtDidFinishLaunching(
+                notificationWasObserved: applicationDidFinishRestoringWindows,
+                hasPendingRequests: sessionRestorationCoordinator.hasPendingRequests
+            ) {
+            applicationDidFinishRestoringWindows = true
+        }
+        openInitialWindowAfterRestorationIfNeeded()
     }
 
     func applicationDidHide(_ notification: Notification) {
@@ -361,6 +428,7 @@ class AppDelegate: NSObject,
         self.hiddenState = .init()
     }
 
+    @MainActor
     func applicationDidBecomeActive(_ notification: Notification) {
         // If we're back manually then clear the hidden state because macOS handles it.
         self.hiddenState = nil
@@ -368,17 +436,49 @@ class AppDelegate: NSObject,
         // First launch stuff
         if !applicationHasBecomeActive {
             applicationHasBecomeActive = true
-
-            // Let's launch our first window. We only do this if we have no other windows. It
-            // is possible to have other windows in a few scenarios:
-            //   - if we're opening a URL since `application(_:openFile:)` is called before this.
-            //   - if we're restoring from persisted state
-            if TerminalController.all.isEmpty && derivedConfig.initialWindow {
-                undoManager.disableUndoRegistration()
-                _ = TerminalController.newWindow(ghostty)
-                undoManager.enableUndoRegistration()
-            }
+            openInitialWindowAfterRestorationIfNeeded()
         }
+    }
+
+    @MainActor
+    @objc private func applicationDidFinishRestoringWindows(_ notification: Notification) {
+        applicationDidFinishRestoringWindows = true
+        if sessionRestorationCoordinator.shouldInvalidateSavedState {
+            NSApp.invalidateRestorableState()
+        }
+        if sessionRestorationCoordinator.decision == .restore {
+            updateRestorableSessionsAvailable()
+        }
+        openInitialWindowAfterRestorationIfNeeded()
+    }
+
+    /// Launch the normal fallback window only after all AppKit restoration
+    /// callbacks have completed (or were discarded).
+    @MainActor
+    private func openInitialWindowAfterRestorationIfNeeded() {
+        guard applicationHasBecomeActive,
+              applicationDidFinishLaunchingCompleted,
+              applicationDidFinishRestoringWindows,
+              !initialWindowLaunchHandled else { return }
+
+        // No restoration callback means there was no actual saved payload,
+        // even if a stale marker claimed otherwise. Resolve silently so first
+        // launch and stale archives never show a false-positive prompt.
+        guard sessionRestorationCoordinator.resolveNoPayloadIfPossible() else {
+            return
+        }
+        if sessionRestorationCoordinator.decision == .startFresh {
+            updateRestorableSessionsAvailable()
+        }
+
+        initialWindowLaunchHandled = true
+        guard TerminalController.all.isEmpty,
+              !hasRestorableSessions,
+              derivedConfig.initialWindow else { return }
+
+        undoManager.disableUndoRegistration()
+        _ = TerminalController.newWindow(ghostty)
+        undoManager.enableUndoRegistration()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -386,6 +486,24 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        switch SessionRestorationTerminationPolicy.disposition(
+            isSystemTermination: isSystemTerminationRequest,
+            isAwaitingUserDecision:
+                sessionRestorationCoordinator.shouldCancelTermination
+        ) {
+        case .terminateNow:
+            // System termination cannot be vetoed. The restoration lifecycle
+            // still avoids tombstoning the marker or writing an app-level
+            // payload while a decision is pending.
+            return .terminateNow
+        case .cancel:
+            // The restored windows do not exist yet while the startup prompt is
+            // pending. An ordinary Quit must wait for an explicit decision.
+            return .terminateCancel
+        case .continueNormalFlow:
+            break
+        }
+
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
 
@@ -395,31 +513,38 @@ class AppDelegate: NSObject,
             return .terminateNow
         }
 
-        // If the user is shutting down, restarting, or logging out, we don't confirm quit.
-        why: if let event = NSAppleEventManager.shared().currentAppleEvent {
-            // If all Ghostty windows are in the background (i.e. you Cmd-Q from the Cmd-Tab
-            // view), then this is null. I don't know why (pun intended) but we have to
-            // guard against it.
-            guard let keyword = AEKeyword("why?") else { break why }
-
-            if let why = event.attributeDescriptor(forKeyword: keyword) {
-                switch why.typeCodeValue {
-                case kAEShutDown, kAERestart, kAEReallyLogOut:
-                    return .terminateNow
-
-                default:
-                    break
-                }
-            }
-        }
-
         // If our app says we don't need to confirm, we can exit now.
         if !ghostty.needsConfirmQuit { return .terminateNow }
 
         return terminate()
     }
 
+    /// True when AppKit is terminating the process for a system shutdown,
+    /// restart, or logout rather than an ordinary application Quit.
+    private var isSystemTerminationRequest: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent,
+              let keyword = AEKeyword("why?"),
+              let reason = event.attributeDescriptor(forKeyword: keyword)
+        else { return false }
+
+        switch reason.typeCodeValue {
+        case kAEShutDown, kAERestart, kAEReallyLogOut:
+            return true
+        default:
+            return false
+        }
+    }
+
+    @MainActor
     func applicationWillTerminate(_ notification: Notification) {
+        // `willEncodeRestorableState` is the evidence that AppKit is actually
+        // persisting a workspace. Never turn the marker true merely because
+        // termination began: doing so could resurrect an older archive if the
+        // new encode fails. We only clear impossible/stale markers here.
+        if ghostty.config.windowSaveState == "never" || !hasRestorableSessions {
+            updateRestorableSessionsAvailable()
+        }
+
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.
@@ -506,7 +631,7 @@ class AppDelegate: NSObject,
             // may want to show this as a sheet on the focused window (especially if we're
             // opening a tab). I'm not sure.
             let alert = NSAlert()
-            alert.messageText = "Allow Ghostty to execute \"\(filename)\"?"
+            alert.messageText = "Allow \(FlashGhosttyProductProfile.displayName) to execute \"\(filename)\"?"
             alert.addButton(withTitle: "Allow")
             alert.addButton(withTitle: "Cancel")
             alert.alertStyle = .warning
@@ -643,6 +768,7 @@ class AppDelegate: NSObject,
         self.menuQuickTerminal?.state = if quickController.visible { .on } else { .off }
     }
 
+    @MainActor
     @objc private func ghosttyConfigDidChange(_ notification: Notification) {
         // We only care if the configuration is a global configuration, not a surface one.
         guard notification.object == nil else { return }
@@ -762,6 +888,7 @@ class AppDelegate: NSObject,
         NSApp.dockTile.display()
     }
 
+    @MainActor
     private func ghosttyConfigDidChange(config: Ghostty.Config) {
         // Update the config we need to store
         self.derivedConfig = DerivedConfig(config)
@@ -770,7 +897,9 @@ class AppDelegate: NSObject,
         // configuration. This is the only way to carefully control whether macOS invokes the
         // state restoration system.
         switch config.windowSaveState {
-        case "never": UserDefaults.ghostty.setValue(false, forKey: "NSQuitAlwaysKeepsWindows")
+        case "never":
+            UserDefaults.ghostty.setValue(false, forKey: "NSQuitAlwaysKeepsWindows")
+            sessionRestorationCoordinator.discardArchiveBecauseRestorationIsDisabled()
         case "always": UserDefaults.ghostty.setValue(true, forKey: "NSQuitAlwaysKeepsWindows")
         case "default": fallthrough
         default: UserDefaults.ghostty.removeObject(forKey: "NSQuitAlwaysKeepsWindows")
@@ -780,7 +909,8 @@ class AppDelegate: NSObject,
         // explicitly false (NO), auto-updates are disabled. Otherwise, we use the behavior
         // defined by our "auto-update" configuration (if set) or fall back to Sparkle
         // user-based defaults.
-        if Bundle.main.infoDictionary?["SUEnableAutomaticChecks"] as? Bool == false {
+        if !updateController.updatesEnabled ||
+            Bundle.main.infoDictionary?["SUEnableAutomaticChecks"] as? Bool == false {
             updateController.updater.automaticallyChecksForUpdates = false
             updateController.updater.automaticallyDownloadsUpdates = false
         } else if let autoUpdate = config.autoUpdate {
@@ -870,7 +1000,81 @@ class AppDelegate: NSObject,
         return true
     }
 
+    /// Hold passive restoration snapshots behind one launch-wide decision.
+    /// Callers must copy data out of AppKit's NSCoder before entering this gate.
+    @MainActor
+    func enqueueStartupRestoration(
+        restore: @escaping () -> Void,
+        discard: @escaping () -> Void
+    ) {
+        guard ghostty.config.windowSaveState != "never" else {
+            discard()
+            return
+        }
+
+        sessionRestorationCoordinator.enqueue(
+            restore: restore,
+            discard: discard
+        )
+    }
+
+    @MainActor
+    private func startupRestorationDidResolve(
+        _ decision: SessionRestorationDecision
+    ) {
+        if decision == .startFresh {
+            discardPendingQuickTerminalRestoration()
+        }
+        if applicationDidFinishRestoringWindows,
+           sessionRestorationCoordinator.shouldInvalidateSavedState {
+            NSApp.invalidateRestorableState()
+        }
+        if decision == .restore {
+            updateRestorableSessionsAvailable()
+        }
+        openInitialWindowAfterRestorationIfNeeded()
+    }
+
+    private var hasRestorableSessions: Bool {
+        let hasRegularSessions = TerminalController.all.contains {
+            $0.supportsRestorableState
+        }
+        let hasQuickTerminal: Bool
+        switch quickTerminalControllerState {
+        case .initialized(let controller):
+            hasQuickTerminal = controller.restorable
+        case .pendingRestore:
+            hasQuickTerminal = true
+        case .uninitialized:
+            hasQuickTerminal = false
+        }
+
+        return hasRegularSessions || hasQuickTerminal
+    }
+
+    @MainActor
+    private func updateRestorableSessionsAvailable() {
+        let isAvailable = ghostty.config.windowSaveState != "never" &&
+            hasRestorableSessions
+        sessionRestorationCoordinator.recordArchiveAvailability(isAvailable)
+    }
+
+    private func discardPendingQuickTerminalRestoration() {
+        guard case .pendingRestore = quickTerminalControllerState else { return }
+        quickTerminalControllerState = .uninitialized
+    }
+
+    @MainActor
     func application(_ app: NSApplication, willEncodeRestorableState coder: NSCoder) {
+        // A one-shot `-e` launch and a launch awaiting its restore decision
+        // must not replace the application-level portion of the previous
+        // interactive archive. In the latter case the current workspace is
+        // empty only because materialization is intentionally gated.
+        guard !sessionRestorationCoordinator.preservesExistingArchive else {
+            return
+        }
+
+        updateRestorableSessionsAvailable()
         guard ghostty.config.windowSaveState != "never" else { return }
 
         // Encode our quick terminal state if we have it.
@@ -887,14 +1091,31 @@ class AppDelegate: NSObject,
         }
     }
 
+    @MainActor
     func application(_ app: NSApplication, didDecodeRestorableState coder: NSCoder) {
         Self.logger.debug("application will restore window state")
 
-        // Decode our quick terminal state.
-        if ghostty.config.windowSaveState != "never",
-            let state = QuickTerminalRestorableState(coder: coder) {
-            quickTerminalControllerState = .pendingRestore(state)
-        }
+        guard ghostty.config.windowSaveState != "never",
+              coder.containsValue(forKey: QuickTerminalRestorableState.selfKey) else { return }
+
+        // Copy the archive while this application-state coder is valid. The
+        // snapshot remains passive until the restore choice is known.
+        guard let snapshot = TerminalRestorableSnapshot<QuickTerminalRestorableState>(
+            coder: coder
+        ) else { return }
+
+        // Use the same one-time gate as normal terminal windows. The gate asks
+        // before decoding because a decoded SurfaceView starts a shell immediately.
+        enqueueStartupRestoration(
+            restore: { [weak self] in
+                guard let self,
+                      case .uninitialized = quickTerminalControllerState,
+                      let state = snapshot.decodedValue() else { return }
+                quickTerminalControllerState = .pendingRestore(state)
+            },
+            discard: { [weak self] in
+                self?.discardPendingQuickTerminalRestoration()
+            })
     }
 
     // MARK: - UNUserNotificationCenterDelegate
@@ -1115,6 +1336,8 @@ extension AppDelegate {
         // modify this stuff as code.
         self.menuAbout?.setImageIfDesired(systemSymbolName: "info.circle")
         self.menuCheckForUpdates?.setImageIfDesired(systemSymbolName: "square.and.arrow.down")
+        self.menuCheckForUpdates?.isHidden = !updateController.updatesEnabled
+        self.menuCheckForUpdates?.isEnabled = updateController.updatesEnabled
         self.menuOpenConfig?.setImageIfDesired(systemSymbolName: "gear")
         self.menuReloadConfig?.setImageIfDesired(systemSymbolName: "arrow.trianglehead.2.clockwise.rotate.90")
         self.menuSecureInput?.setImageIfDesired(systemSymbolName: "lock.display")
@@ -1286,6 +1509,9 @@ extension AppDelegate {
 extension AppDelegate: NSMenuItemValidation {
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(checkForUpdates(_:)):
+            return updateController.updatesEnabled
+
         case #selector(setAsDefaultTerminal(_:)):
             return NSWorkspace.shared.defaultTerminal != Bundle.main.bundleURL
 
@@ -1332,7 +1558,7 @@ extension AppDelegate {
         if controllersNeedConfirmation.count == 1 {
             Task {
                 let response = await controllersNeedConfirmation[0].confirmCloseAsync(
-                    messageText: "Quit Ghostty?",
+                    messageText: "Quit \(FlashGhosttyProductProfile.displayName)?",
                     informativeText: "The terminal still has a running process. If you quit, the process will be killed.",
                     confirmButtonTitle: "Terminate",
                 )
@@ -1370,14 +1596,14 @@ extension AppDelegate {
         Task {
             for controller in controllers {
                 let response = await controller.confirmCloseAsync(
-                    messageText: "Quit Ghostty?",
+                    messageText: "Quit \(FlashGhosttyProductProfile.displayName)?",
                     informativeText: "The terminal still has a running process. If you quit, the process will be killed.",
                     confirmButtonTitle: "Terminate",
                 )
 
                 if [.OK, .alertFirstButtonReturn].contains(response) {
-                    // Close this window and until next review is cancelled
-                    await controller.window?.close()
+                    // Keep the confirmed window alive until AppKit encodes the
+                    // final application state during termination.
                     continue
                 } else {
                     await NSApp.reply(toApplicationShouldTerminate: false)

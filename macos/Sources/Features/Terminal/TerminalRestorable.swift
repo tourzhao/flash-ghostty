@@ -31,21 +31,9 @@ extension TerminalRestorable {
     var baseConfig: Ghostty.SurfaceConfiguration? { nil }
 
     init?(coder aDecoder: NSCoder) {
-        // If the version doesn't match then we can't decode. In the future we can perform
-        // version upgrading or something but for now we only have one version so we
-        // don't bother.
-        let current = aDecoder.decodeInteger(forKey: Self.versionKey)
-        guard current >= Self.minimumVersion else {
-            AppDelegate.logger.error("error restoring terminal: version not supported: expected=\(Self.minimumVersion, privacy: .public), got=\(current, privacy: .public)")
-            return nil
-        }
-
-        guard let v = aDecoder.decodeObject(of: CodableBridge<Self>.self, forKey: Self.selfKey) else {
-            AppDelegate.logger.error("error restoring terminal: decode failed")
-            return nil
-        }
-
-        self.init(copy: v.value)
+        guard let snapshot = TerminalRestorableSnapshot<Self>(coder: aDecoder),
+              let value = snapshot.decodedValue() else { return nil }
+        self.init(copy: value)
     }
 
     func encode(with coder: NSCoder) {
@@ -58,7 +46,7 @@ extension TerminalRestorable {
 
 /// The state stored for terminal window restoration.
 final class TerminalRestorableState: TerminalRestorable {
-    static var version: Int { 7 }
+    static var version: Int { 8 }
     static var minimumVersion: Int { 5 }
 
     var focusedSurface: String? {
@@ -75,6 +63,9 @@ final class TerminalRestorableState: TerminalRestorable {
     }
     var titleOverride: String? {
         internalState.titleOverride
+    }
+    var sessionSidebarIsVisible: Bool {
+        internalState.sessionSidebarIsVisible ?? true
     }
 
     /// Internal State we use to perform unit tests
@@ -145,92 +136,27 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             return
         }
 
-        // Decode the state. If we can't decode the state, then we can't restore.
-        guard let state = TerminalRestorableState(coder: state) else {
+        // Copy the serialized payload before returning from AppKit's callback.
+        // This does not decode SurfaceViews or start any PTYs.
+        guard let snapshot = TerminalRestorableSnapshot<TerminalRestorableState>(
+            coder: state
+        ) else {
             completionHandler(nil, TerminalRestoreError.stateDecodeFailed)
             return
         }
 
-        // The window creation has to go through our terminalManager so that it
-        // can be found for events from libghostty. This uses the low-level
-        // createWindow so that AppKit can place the window wherever it should
-        // be.
-        let c = TerminalController.init(
-            appDelegate.ghostty,
-            withSurfaceTree: state.surfaceTree)
-        guard let window = c.window else {
-            completionHandler(nil, TerminalRestoreError.windowDidNotLoad)
-            return
-        }
-
-        // Restore our tab color and avoid unnecessary `invalidateRestorableState` calls
-        if let tabColor = state.tabColor {
-            (window as? TerminalWindow)?.tabColor = tabColor
-        }
-
-        // Restore the tab title override
-        c.titleOverride = state.titleOverride
-
-        // Setup our restored state on the controller
-        // Find the focused surface in surfaceTree
-        if let focusedStr = state.focusedSurface {
-            var foundView: Ghostty.SurfaceView?
-            for view in c.surfaceTree where view.id.uuidString == focusedStr {
-                foundView = view
-                break
-            }
-
-            if let view = foundView {
-                c.focusedSurface = view
-                restoreFocus(to: view, inWindow: window)
-            }
-        }
-
-        completionHandler(window, nil)
-        guard let mode = state.effectiveFullscreenMode, mode != .native else {
-            // We let AppKit handle native fullscreen
-            return
-        }
-        // Give the window to AppKit first, then adjust its frame and style
-        // to minimise any visible frame changes.
-        c.toggleFullscreen(mode: mode)
+        // State decoding creates terminal surfaces and starts their PTYs. Defer
+        // that work until the user has decided whether to restore this launch.
+        appDelegate.enqueueStartupRestoration(
+            restore: {
+                TerminalSessionRestorationMaterializer.materialize(
+                    snapshot: snapshot,
+                    appDelegate: appDelegate,
+                    completionHandler: completionHandler)
+            },
+            discard: {
+                completionHandler(nil, nil)
+            })
     }
 
-    /// This restores the focus state of the surfaceview within the given window. When restoring,
-    /// the view isn't immediately attached to the window since we have to wait for SwiftUI to
-    /// catch up. Therefore, we sit in an async loop waiting for the attachment to happen.
-    private static func restoreFocus(to: Ghostty.SurfaceView, inWindow: NSWindow, attempts: Int = 0) {
-        // For the first attempt, we schedule it immediately. Subsequent events wait a bit
-        // so we don't just spin the CPU at 100%. Give up after some period of time.
-        let after: DispatchTime
-        if attempts == 0 {
-            after = .now()
-        } else if attempts > 40 {
-            // 2 seconds, give up
-            return
-        } else {
-            after = .now() + .milliseconds(50)
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: after) {
-            // If the view is not attached to a window yet then we repeat.
-            guard let viewWindow = to.window else {
-                restoreFocus(to: to, inWindow: inWindow, attempts: attempts + 1)
-                return
-            }
-
-            // If the view is attached to some other window, we give up
-            guard viewWindow == inWindow else { return }
-
-            inWindow.makeFirstResponder(to)
-
-            // If the window is main, then we also make sure it comes forward. This
-            // prevents a bug found in #1177 where sometimes on restore the windows
-            // would be behind other applications.
-            if viewWindow.isMainWindow {
-                viewWindow.orderFront(nil)
-            }
-        }
-    }
 }
-

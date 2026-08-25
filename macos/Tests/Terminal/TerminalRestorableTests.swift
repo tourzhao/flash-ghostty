@@ -5,8 +5,28 @@ import AppKit
 @Suite
 struct TerminalRestorableTests {
     @Test
+    func codableBridgeReencodesDecodedReferenceMutations() throws {
+        let original = CodableBridge(MutableCodableState(name: "before"))
+        let firstArchive = try archive(original, className: nil)
+        let decoded: CodableBridge<MutableCodableState> = try unarchive(
+            firstArchive,
+            className: nil
+        )
+
+        let value = try #require(decoded.decodedValue())
+        value.name = "after"
+
+        let secondArchive = try archive(decoded, className: nil)
+        let redecoded: CodableBridge<MutableCodableState> = try unarchive(
+            secondArchive,
+            className: nil
+        )
+        #expect(redecoded.decodedValue()?.name == "after")
+    }
+
+    @Test
     func areYouForgettingToAddMigrationTests() {
-        #expect(TerminalRestorableState.version == 7)
+        #expect(TerminalRestorableState.version == 8)
         #expect(TerminalRestorableState.minimumVersion == 5)
 
         #expect(QuickTerminalRestorableState.version == 1)
@@ -58,6 +78,7 @@ struct TerminalRestorableTests {
         #expect(v5.effectiveFullscreenMode == nil)
         #expect(v5.tabColor == nil)
         #expect(v5.titleOverride == nil)
+        #expect(v5.sessionSidebarIsVisible == nil)
         #expect(v5.surfaceTree.contains(where: { $0.id.uuidString == "926F3F2A-824C-40C9-87CA-2CDCA4E11049" }))
         #expect(v5.surfaceTree.contains(where: { $0.id.uuidString == "AC5E829B-85FD-4C69-B196-2EE469C72A90" }))
 
@@ -81,6 +102,7 @@ struct TerminalRestorableTests {
         #expect(v7.effectiveFullscreenMode == .native)
         #expect(v7.tabColor == .green)
         #expect(v7.titleOverride == "1.3.0")
+        #expect(v7.sessionSidebarIsVisible == nil)
         #expect(v7.surfaceTree.contains(where: { $0.id.uuidString == "5D580A7A-81EA-47C6-BB9A-AD4B1783E478" }))
         #expect(v7.surfaceTree.contains(where: { $0.id.uuidString == "96EA1189-7482-41BC-A6CD-26E5190E4BFA" }))
 
@@ -106,12 +128,148 @@ struct TerminalRestorableTests {
         #expect(v7Generic.effectiveFullscreenMode == .native)
         #expect(v7Generic.tabColor == .green)
         #expect(v7Generic.titleOverride == "tip")
+        #expect(v7Generic.sessionSidebarIsVisible == nil)
         #expect(v7Generic.surfaceTree.contains(where: { $0.id.uuidString == "953CE952-D91D-4D36-AC72-9D0F1F6BCE73" }))
         #expect(v7Generic.surfaceTree.contains(where: { $0.id.uuidString == "D3223569-2E01-4BC5-9DB2-DBFC3AFF46D1" }))
+    }
+
+    @MainActor
+    @Test func restoreTerminal8SidebarVisibilityRoundTrip() throws {
+        let tree = try SplitTreeTests.makeHorizontalSplit()
+        let state = DummyTerminalRestorableState(.init(
+            focusedSurface: tree.1.id.uuidString,
+            surfaceTree: tree.0,
+            effectiveFullscreenMode: nil,
+            tabColor: .blue,
+            titleOverride: "Saved Session",
+            sessionSidebarIsVisible: false
+        ))
+        let data = try archive(
+            CodableBridge(state),
+            className: "CodableBridge<Terminal>"
+        )
+        let decoded: CodableBridge<DummyTerminalRestorableState> = try unarchive(
+            data,
+            className: "CodableBridge<Terminal>"
+        )
+
+        #expect(decoded.value.internalState.focusedSurface == tree.1.id.uuidString)
+        #expect(decoded.value.internalState.titleOverride == "Saved Session")
+        #expect(decoded.value.internalState.tabColor == .blue)
+        #expect(decoded.value.internalState.sessionSidebarIsVisible == false)
+    }
+
+    @MainActor
+    @Test func startupRestorationGateRestoresEveryRequestOnce() {
+        var gate = StartupRestorationGate()
+        var events: [String] = []
+
+        let first = gate.enqueue(
+            restore: { events.append("restore-1") },
+            discard: { events.append("discard-1") }
+        )
+        let second = gate.enqueue(
+            restore: { events.append("restore-2") },
+            discard: { events.append("discard-2") }
+        )
+
+        #expect(first == nil)
+        #expect(second == nil)
+        #expect(gate.hasPendingRequests)
+        #expect(events.isEmpty)
+
+        let actions = gate.resolve(.restore)
+        #expect(actions.count == 2)
+        #expect(!gate.hasPendingRequests)
+        actions.forEach { $0() }
+        #expect(events == ["restore-1", "restore-2"])
+        #expect(gate.resolve(.startFresh).isEmpty)
+
+        let late = gate.enqueue(
+            restore: { events.append("restore-late") },
+            discard: { events.append("discard-late") }
+        )
+        #expect(late != nil)
+        late?()
+        #expect(events == ["restore-1", "restore-2", "restore-late"])
+    }
+
+    @MainActor
+    @Test func startupRestorationGateDiscardsEveryRequest() {
+        var gate = StartupRestorationGate()
+        var events: [String] = []
+
+        _ = gate.enqueue(
+            restore: { events.append("restore") },
+            discard: { events.append("discard") }
+        )
+        let actions = gate.resolve(.startFresh)
+        actions.forEach { $0() }
+
+        #expect(events == ["discard"])
+        #expect(gate.decision == .startFresh)
+    }
+
+    @MainActor
+    @Test func startupRestorationDefersDecodeUntilRestoreDecision() throws {
+        DeferredDecodeRestorableState.decodeCount = 0
+
+        let discardedSnapshot = try snapshot(
+            DeferredDecodeRestorableState(name: "discarded")
+        )
+        #expect(DeferredDecodeRestorableState.decodeCount == 0)
+
+        var discarded = false
+        var discardGate = StartupRestorationGate()
+        _ = discardGate.enqueue(
+            restore: { _ = discardedSnapshot.decodedValue() },
+            discard: { discarded = true }
+        )
+        discardGate.resolve(.startFresh).forEach { $0() }
+
+        #expect(discarded)
+        #expect(DeferredDecodeRestorableState.decodeCount == 0)
+
+        let restoredSnapshot = try snapshot(
+            DeferredDecodeRestorableState(name: "restored")
+        )
+        #expect(DeferredDecodeRestorableState.decodeCount == 0)
+
+        var restoredName: String?
+        var restoreGate = StartupRestorationGate()
+        _ = restoreGate.enqueue(
+            restore: { restoredName = restoredSnapshot.decodedValue()?.name },
+            discard: {}
+        )
+        restoreGate.resolve(.restore).forEach { $0() }
+
+        #expect(restoredName == "restored")
+        #expect(DeferredDecodeRestorableState.decodeCount == 1)
+    }
+
+    @Test func startupRestorationMarkerDistinguishesLegacyAndDiscardedState() {
+        #expect(SessionRestorationArchiveMarker(storedValue: nil) == .legacy)
+        #expect(SessionRestorationArchiveMarker(storedValue: NSNumber(value: true)) == .available)
+        #expect(SessionRestorationArchiveMarker(storedValue: NSNumber(value: false)) == .discarded)
+        #expect(SessionRestorationArchiveMarker(storedValue: "invalid") == .discarded)
     }
 }
 
 private extension TerminalRestorableTests {
+    func snapshot<State: TerminalRestorable>(
+        _ state: State
+    ) throws -> TerminalRestorableSnapshot<State> {
+        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
+        state.encode(with: archiver)
+        archiver.finishEncoding()
+
+        let unarchiver = try NSKeyedUnarchiver(
+            forReadingFrom: archiver.encodedData
+        )
+        defer { unarchiver.finishDecoding() }
+        return try #require(TerminalRestorableSnapshot<State>(coder: unarchiver))
+    }
+
     func archive<T: NSObject & NSSecureCoding>(_ obj: T, className: String?) throws -> Data {
         let archiver = NSKeyedArchiver(requiringSecureCoding: true)
         defer { archiver.finishEncoding() }
@@ -135,6 +293,41 @@ private extension TerminalRestorableTests {
 }
 
 // MARK: - Dummy States
+
+private final class MutableCodableState: Codable {
+    var name: String
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+@MainActor
+private final class DeferredDecodeRestorableState: TerminalRestorable {
+    static let version = 1
+    static var decodeCount = 0
+
+    let name: String
+
+    init(name: String) {
+        self.name = name
+    }
+
+    required init(copy other: DeferredDecodeRestorableState) {
+        self.name = other.name
+    }
+
+    required init(from decoder: any Decoder) throws {
+        Self.decodeCount += 1
+        let container = try decoder.singleValueContainer()
+        self.name = try container.decode(String.self)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(name)
+    }
+}
 
 @MainActor
 private final class DummyTerminalRestorableState: TerminalRestorable {

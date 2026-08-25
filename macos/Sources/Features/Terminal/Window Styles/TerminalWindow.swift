@@ -24,6 +24,12 @@ class TerminalWindow: NSWindow {
     /// Update notification UI in titlebar
     private let updateAccessory = NSTitlebarAccessoryViewController()
 
+    /// FLASH-specific titlebar behavior is composed rather than implemented by
+    /// this upstream-facing NSWindow subclass.
+    private lazy var flashSidebarChrome = FlashSidebarWindowChromeCoordinator(
+        window: self
+    )
+
     /// Visual indicator that mirrors the selected tab color.
     private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
         let view = NSHostingView(rootView: TabColorIndicatorView(tabColor: tabColor))
@@ -65,6 +71,7 @@ class TerminalWindow: NSWindow {
             guard tabColor != oldValue else { return }
             tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
             invalidateRestorableState()
+            terminalController?.sessionSidebarMetadataDidChange()
         }
     }
 
@@ -107,7 +114,10 @@ class TerminalWindow: NSWindow {
         let config = appDelegate.ghostty.config
 
         // Setup our initial config
-        derivedConfig = .init(config)
+        derivedConfig = .init(
+            config,
+            titlebarStyle: terminalController?.windowPresentation.titlebarStyle
+        )
 
         // If there is a hardcoded title in the configuration, we set that
         // immediately. Future `set_title` apprt actions will override this
@@ -118,7 +128,9 @@ class TerminalWindow: NSWindow {
         }
 
         // If window decorations are disabled, remove our title
-        if !config.windowDecorations { styleMask.remove(.titled) }
+        let windowDecorations = terminalController?
+            .windowPresentation.windowDecorations ?? config.windowDecorations
+        if !windowDecorations { styleMask.remove(.titled) }
 
         // NOTE: setInitialWindowPosition is NOT called here because subclass
         // awakeFromNib may add decorations (e.g. toolbar for tabs style) that
@@ -133,6 +145,10 @@ class TerminalWindow: NSWindow {
         // Create our reset zoom titlebar accessory. We have to have a title
         // to do this or AppKit triggers an assertion.
         if styleMask.contains(.titled) {
+            if terminalController?.usesSessionSidebarTitlebar == true {
+                flashSidebarChrome.installToggleAccessoryIfNeeded()
+            }
+
             resetZoomAccessory.layoutAttribute = .right
             resetZoomAccessory.view = NSHostingView(rootView: ResetZoomAccessoryView(
                 viewModel: viewModel,
@@ -211,6 +227,8 @@ class TerminalWindow: NSWindow {
     override func becomeMain() {
         super.becomeMain()
 
+        flashSidebarChrome.windowDidBecomeMain()
+
         // Its possible we miss the accessory titlebar call so we check again
         // whenever the window becomes main. Both of these are idempotent.
         if tabBarView != nil {
@@ -223,6 +241,7 @@ class TerminalWindow: NSWindow {
 
     override func resignMain() {
         super.resignMain()
+        flashSidebarChrome.windowDidResignMain()
         viewModel.isMainWindow = false
     }
 
@@ -242,22 +261,74 @@ class TerminalWindow: NSWindow {
     }
 
     override func mergeAllWindows(_ sender: Any?) {
+        guard flashSidebarChrome.canMergeAllTerminalWindows() else {
+            // AppKit cannot change an already-loaded titlebar hierarchy. A
+            // mixed sidebar/native group has no coherent workspace owner.
+            NSSound.beep()
+            return
+        }
+
         super.mergeAllWindows(sender)
 
         // It takes an event loop cycle to merge all the windows so we set a
         // short timer to relabel the tabs (issue #1902)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.terminalController?.relabelTabs()
+            let selectedController = self?.tabGroup?.selectedWindow?.windowController as? TerminalController
+            selectedController?.nativeTabBarDidAppearForSessionSidebar()
         }
     }
 
+    /// The custom sidebar intentionally hides AppKit's draggable tab strip.
+    /// Disable the matching system action until AppKit offers a transactional
+    /// detach API; programmatic/external detaches are still reconciled through
+    /// the controller's complete-topology partition path.
+    override func moveTabToNewWindow(_ sender: Any?) {
+        guard !flashSidebarChrome.usesSidebarPresentation else {
+            NSSound.beep()
+            return
+        }
+        super.moveTabToNewWindow(sender)
+    }
+
+    override func toggleTabBar(_ sender: Any?) {
+        // In sidebar mode the native tab group is only a session backend. Its
+        // accessory remains attached but collapsed, so public tab-bar actions
+        // must never reveal a duplicate navigator.
+        if flashSidebarChrome.usesSidebarPresentation {
+            return
+        }
+
+        super.toggleTabBar(sender)
+    }
+
+    /// Refreshes the titlebar toggle from the controller's shared tab-group
+    /// state. Every native tab owns a separate window and titlebar accessory,
+    /// so each window must update when the shared visibility changes.
+    func sessionSidebarVisibilityDidChange() {
+        flashSidebarChrome.visibilityDidChange()
+    }
+
+    /// Updates the accessibility exposure using a tab group captured by the
+    /// controller's selection observation. This avoids relying on the window's
+    /// transient `tabGroup` value while AppKit moves native-tab accessories.
+    func sessionSidebarTabSelectionDidChange(in tabGroup: NSWindowTabGroup?) {
+        flashSidebarChrome.tabSelectionDidChange(in: tabGroup)
+    }
+
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
+        let childIsTabBar = isTabBar(childViewController)
+        flashSidebarChrome.prepareToAddTitlebarAccessory(
+            childViewController,
+            isNativeTabBar: childIsTabBar
+        )
+
         super.addTitlebarAccessoryViewController(childViewController)
 
         // Tab bar is attached as a titlebar accessory view controller (layout bottom). We
         // can detect when it is shown or hidden by overriding add/remove and searching for
         // it. This has been verified to work on macOS 12 to 26
-        if isTabBar(childViewController) {
+        if childIsTabBar {
             childViewController.identifier = Self.tabBarIdentifier
             tabBarDidAppear()
         }
@@ -308,23 +379,23 @@ class TerminalWindow: NSWindow {
     }
 
     private func tabBarDidAppear() {
-        // Remove our reset zoom accessory. For some reason having a SwiftUI
-        // titlebar accessory causes our content view scaling to be wrong.
-        // Removing it fixes it, we just need to remember to add it again later.
-        if let idx = titlebarAccessoryViewControllers.firstIndex(of: resetZoomAccessory) {
-            removeTitlebarAccessoryViewController(at: idx)
-        }
+        flashSidebarChrome.nativeTabBarDidAppear(
+            resetZoomAccessory: resetZoomAccessory
+        )
+    }
 
-        // We don't need to do this with the update accessory. I don't know why but
-        // everything works fine.
+    /// AppKit disables `toggleTabBar` when a group contains multiple windows.
+    /// Keep its native tab group attached as the `SessionWorkspace` presentation
+    /// adapter, but collapse the public accessory so it consumes no visual space.
+    @discardableResult
+    func syncSessionSidebarTabBarAccessoryVisibility() -> Bool {
+        flashSidebarChrome.syncNativeTabBarVisibility()
     }
 
     private func tabBarDidDisappear() {
-        if styleMask.contains(.titled) {
-            if titlebarAccessoryViewControllers.firstIndex(of: resetZoomAccessory) == nil {
-                addTitlebarAccessoryViewController(resetZoomAccessory)
-            }
-        }
+        flashSidebarChrome.nativeTabBarDidDisappear(
+            resetZoomAccessory: resetZoomAccessory
+        )
     }
 
     // MARK: Tab Key Equivalents
@@ -393,39 +464,16 @@ class TerminalWindow: NSWindow {
 
     override var title: String {
         didSet {
-            // Whenever we change the window title we must also update our
-            // tab title if we're using custom fonts.
-            tab.attributedTitle = attributedTitle
-            /// We also needs to update this here, just in case
-            /// the value is not what we want
-            ///
-            /// Check ``titlebarFont`` down below
-            /// to see why we need to check `hasMoreThanOneTabs` here
-            titlebarTextField?.usesSingleLineMode = !hasMoreThanOneTabs
+            // The title's intrinsic width changes independently of the font.
+            // Reapply both so sidebar titles do not retain AppKit's stale
+            // system-font width and truncate otherwise short session names.
+            flashSidebarChrome.applyTitlebarFont(titlebarFont)
         }
     }
 
     // Used to set the titlebar font.
     var titlebarFont: NSFont? {
-        didSet {
-            let font = titlebarFont ?? NSFont.titleBarFont(ofSize: NSFont.systemFontSize)
-
-            titlebarTextField?.font = font
-            /// We check `hasMoreThanOneTabs` here because the system
-            /// may copy this setting to the tab’s text field at some point(e.g. entering/exiting fullscreen),
-            /// which can cause the title to be vertically misaligned (shifted downward).
-            ///
-            /// This behaviour is the opposite of what happens in the title bar’s text field, which is quite odd...
-            titlebarTextField?.usesSingleLineMode = !hasMoreThanOneTabs
-            tab.attributedTitle = attributedTitle
-        }
-    }
-
-    // Find the NSTextField responsible for displaying the titlebar's title.
-    private var titlebarTextField: NSTextField? {
-        titlebarContainer?
-            .firstDescendant(withClassName: "NSTitlebarView")?
-            .firstDescendant(withClassName: "NSTextField") as? NSTextField
+        didSet { flashSidebarChrome.applyTitlebarFont(titlebarFont) }
     }
 
     // Return a styled representation of our title property.
@@ -465,6 +513,10 @@ class TerminalWindow: NSWindow {
 
     /// This is called by the controller when there is a need to reset the window appearance.
     func syncAppearance(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
+        // The native titlebar view can be replaced independently of the window,
+        // so restore its font even when the window is not currently visible.
+        flashSidebarChrome.applyTitlebarFont(titlebarFont)
+
         // If our window is not visible, then we do nothing. Some things such as blurring
         // have no effect if the window is not visible. Ultimately, we'll have this called
         // at some point when a surface becomes focused.
@@ -600,18 +652,21 @@ class TerminalWindow: NSWindow {
             self.windowCornerRadius = 16
         }
 
-        init(_ config: Ghostty.Config) {
+        init(
+            _ config: Ghostty.Config,
+            titlebarStyle: Ghostty.Config.MacOSTitlebarStyle? = nil
+        ) {
             self.title = config.title
             self.backgroundColor = NSColor(config.backgroundColor)
             self.backgroundOpacity = config.backgroundOpacity
             self.macosWindowButtons = config.macosWindowButtons
             self.backgroundBlur = config.backgroundBlur
-            self.macosTitlebarStyle = config.macosTitlebarStyle
+            self.macosTitlebarStyle = titlebarStyle ?? config.macosTitlebarStyle
 
             // Set corner radius based on macos-titlebar-style
             // Native, transparent, and hidden styles use 16pt radius
             // Tabs style uses 20pt radius
-            switch config.macosTitlebarStyle {
+            switch self.macosTitlebarStyle {
             case .tabs:
                 self.windowCornerRadius = 20
             default:
@@ -710,6 +765,8 @@ extension TerminalWindow {
 
     func configureTabContextMenuIfNeeded(_ menu: NSMenu) {
         guard isTabContextMenu(menu) else { return }
+
+        flashSidebarChrome.configureNativeTabContextMenu(menu)
 
         // Get the target from an existing menu item. The native tab context menu items
         // target the specific window/controller that was right-clicked, not the focused one.
@@ -824,7 +881,7 @@ extension TerminalWindow: TabTitleEditorDelegate {
         for targetWindow: NSWindow
     ) {
         guard let targetController = targetWindow.windowController as? BaseTerminalController else { return }
-        targetController.titleOverride = editedTitle.isEmpty ? nil : editedTitle
+        targetController.updateTitleOverride(editedTitle)
     }
 
     func tabTitleEditor(

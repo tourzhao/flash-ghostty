@@ -15,6 +15,10 @@ extension TerminalRestorableState {
         let effectiveFullscreenMode: FullscreenMode?
         let tabColor: TerminalTabColor?
         let titleOverride: String?
+
+        // MARK: - Version 8 (FLASH-Ghostty)
+        // Optional so archives from versions 5 through 7 continue to decode.
+        let sessionSidebarIsVisible: Bool?
     }
 }
 
@@ -26,6 +30,7 @@ extension TerminalRestorableState.InternalState where ViewType == Ghostty.Surfac
             effectiveFullscreenMode: controller.fullscreenStyle?.fullscreenMode,
             tabColor: (controller.window as? TerminalWindow)?.tabColor,
             titleOverride: controller.titleOverride,
+            sessionSidebarIsVisible: controller.sessionSidebarIsVisible,
         )
     }
 }

@@ -16,7 +16,24 @@ class GhosttyCustomConfigCase: XCTestCase {
     override class var defaultTestSuite: XCTestSuite {
         // https://lldb.llvm.org/cpp_reference/PlatformDarwin_8cpp_source.html#:~:text==%20%22-,IDE_DISABLED_OS_ACTIVITY_DT_MODE
 
-        if ProcessInfo.processInfo.environment["IDE_DISABLED_OS_ACTIVITY_DT_MODE"] != nil {
+        let environment = ProcessInfo.processInfo.environment
+        #if DEBUG
+        let isDebugBuild = true
+        #if GHOSTTY_RUN_UI_TESTS
+        let builtWithCommandLineOptIn = true
+        #else
+        let builtWithCommandLineOptIn = false
+        #endif
+        let explicitlyEnabled = builtWithCommandLineOptIn ||
+            environment["GHOSTTY_RUN_UI_TESTS"] == "true"
+        #else
+        // UI tests mutate persistent application state. Release builds always
+        // skip them even if an inherited environment variable requests them.
+        let isDebugBuild = false
+        let explicitlyEnabled = false
+        #endif
+        if isDebugBuild &&
+            (environment["IDE_DISABLED_OS_ACTIVITY_DT_MODE"] != nil || explicitlyEnabled) {
             return XCTestSuite(forTestCaseClass: Self.self)
         } else {
             return XCTestSuite(name: "Skipping \(className())")

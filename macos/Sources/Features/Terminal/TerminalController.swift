@@ -4,21 +4,95 @@ import SwiftUI
 import Combine
 import GhosttyKit
 
+/// Window chrome is immutable after an AppKit window is loaded. New tabs
+/// inherit this value from their parent so a config reload cannot create a
+/// mixed-style native tab group.
+struct TerminalWindowPresentation: Equatable {
+    let windowDecorations: Bool
+    let titlebarStyle: Ghostty.Config.MacOSTitlebarStyle
+
+    init(
+        windowDecorations: Bool,
+        titlebarStyle: Ghostty.Config.MacOSTitlebarStyle
+    ) {
+        self.windowDecorations = windowDecorations
+        self.titlebarStyle = titlebarStyle
+    }
+
+    init(_ config: Ghostty.Config) {
+        self.windowDecorations = config.windowDecorations
+        self.titlebarStyle = config.macosTitlebarStyle
+    }
+
+    static func inheritedForNewTab(
+        from parent: TerminalWindowPresentation
+    ) -> TerminalWindowPresentation {
+        parent
+    }
+
+    func canShareNativeTabGroup(
+        with other: TerminalWindowPresentation
+    ) -> Bool {
+        self == other
+    }
+
+    var usesSessionSidebar: Bool {
+        windowDecorations && titlebarStyle == .sidebar
+    }
+
+    var usesHiddenTitlebar: Bool {
+        windowDecorations && titlebarStyle == .hidden
+    }
+}
+
 /// A classic, tabbed terminal experience.
 class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Controller {
+    /// Sidebar mode is fixed for the lifetime of a window because changing the
+    /// titlebar style at runtime is unsupported for existing windows.
+    private var usesSessionSidebar: Bool {
+        flashSessionTabCoordinator.usesSidebar
+    }
+
+    /// Exposes the immutable window style to the AppKit titlebar without
+    /// allowing callers to mutate the controller's sidebar lifecycle.
+    var usesSessionSidebarTitlebar: Bool { usesSessionSidebar }
+
+    /// Immutable chrome inherited by tabs and undo restorations.
+    let windowPresentation: TerminalWindowPresentation
+
+    /// SwiftUI compatibility publisher. All session mutations are owned by
+    /// `flashSessionTabCoordinator`; this value only invalidates existing views.
+    @Published private(set) var sessionSidebarRevision: UInt = 0
+
+    /// FLASH session composition root. Native-tab state, reconciliation, KVO,
+    /// focus policy, and sidebar actions live outside this AppKit controller.
+    let flashSessionTabCoordinator: FlashSessionTabCoordinator
+    var sessionID: SessionWorkspace.SessionID {
+        flashSessionTabCoordinator.sessionID
+    }
+    var sessionTabGroupAdapter: NativeTabGroupAdapter {
+        flashSessionTabCoordinator.adapter
+    }
+    var sessionWorkspace: SessionWorkspace {
+        flashSessionTabCoordinator.workspace
+    }
+    var sessionSidebarIsVisible: Bool {
+        flashSessionTabCoordinator.isSidebarVisible
+    }
+    private var sessionSidebarIsClosing: Bool {
+        flashSessionTabCoordinator.isClosing
+    }
+
     override var windowNibName: NSNib.Name? {
         let defaultValue = "Terminal"
 
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return defaultValue }
-        let config = appDelegate.ghostty.config
-
         // If we have no window decorations, there's no reason to do anything but
         // the default titlebar (because there will be no titlebar).
-        if !config.windowDecorations {
+        if !windowPresentation.windowDecorations {
             return defaultValue
         }
 
-        let nib = switch config.macosTitlebarStyle {
+        let nib = switch windowPresentation.titlebarStyle {
         case .native: "Terminal"
         case .hidden: "TerminalHiddenTitlebar"
         case .transparent: "TerminalTransparentTitlebar"
@@ -56,6 +130,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// For example, terminals executing custom scripts are not restorable.
     private var restorable: Bool = true
 
+    /// Whether this controller participates in application state restoration.
+    var supportsRestorableState: Bool { restorable }
+
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig
 
@@ -65,19 +142,36 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     init(_ ghostty: Ghostty.App,
          withBaseConfig base: Ghostty.SurfaceConfiguration? = nil,
          withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
-         parent: NSWindow? = nil
+         parent: NSWindow? = nil,
+         sessionID: SessionWorkspace.SessionID = .init(),
+         windowPresentation: TerminalWindowPresentation? = nil
     ) {
+        let windowPresentation = windowPresentation ?? .init(ghostty.config)
+        self.windowPresentation = windowPresentation
+        self.flashSessionTabCoordinator = FlashSessionTabCoordinator(
+            sessionID: sessionID,
+            usesSidebar: windowPresentation.usesSessionSidebar
+        )
+
         // The window we manage is not restorable if we've specified a command
         // to execute. We do this because the restored window is meaningless at the
         // time of writing this: it'd just restore to a shell in the same directory
         // as the script. We may want to revisit this behavior when we have scrollback
         // restoration.
-        self.restorable = (base?.command ?? "") == ""
+        let isExecuteCommandLaunch = (NSApp.delegate as? AppDelegate)?
+            .launchedWithExecuteCommand ?? false
+        self.restorable = (base?.command ?? "") == "" && !isExecuteCommandLaunch
 
         // Setup our initial derived config based on the current app config
         self.derivedConfig = DerivedConfig(ghostty.config)
 
         super.init(ghostty, baseConfig: base, surfaceTree: tree)
+
+        flashSessionTabCoordinator.attach(to: self)
+
+        if usesSessionSidebar {
+            startSessionMetadataRefreshMonitoring()
+        }
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default
@@ -141,6 +235,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     deinit {
+        stopSessionMetadataRefreshMonitoring()
+
         // Remove all of our notificationcenter subscriptions
         let center = NotificationCenter.default
         center.removeObserver(self)
@@ -167,7 +263,154 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         DispatchQueue.main.async(execute: workItem)
     }
 
+    // MARK: Session Sidebar
+
+    var sessionSidebarControllers: [TerminalController] {
+        _ = sessionSidebarRevision
+        return flashSessionTabCoordinator.controllers
+    }
+
+    private func resolvedSessionSidebarTabGroup(for window: NSWindow) -> NSWindowTabGroup? {
+        flashSessionTabCoordinator.resolvedTabGroup(for: window)
+    }
+
+    func flashSessionSidebarRevisionDidChange() {
+        sessionSidebarRevision &+= 1
+    }
+
+    @discardableResult
+    private func adoptSessionWorkspace(
+        _ adapter: NativeTabGroupAdapter,
+        at index: Int? = nil,
+        select: Bool = false
+    ) -> Bool {
+        flashSessionTabCoordinator.adoptWorkspace(
+            adapter,
+            at: index,
+            select: select
+        )
+    }
+
+    @discardableResult
+    private func becomeIndependentSessionWorkspace(
+        isSidebarVisible: Bool
+    ) -> Bool {
+        flashSessionTabCoordinator.becomeIndependent(
+            isSidebarVisible: isSidebarVisible
+        )
+    }
+
+    func nativeTabAttachmentDidFail() {
+        flashSessionTabCoordinator.nativeAttachmentDidFail()
+    }
+
+    func newSessionFromSidebar() {
+        newTab(nil)
+    }
+
+    @IBAction func toggleSessionSidebar(_ sender: Any?) {
+        flashSessionTabCoordinator.toggleSidebar()
+    }
+
+    func restoreSessionSidebarVisibility(_ isVisible: Bool) {
+        flashSessionTabCoordinator.synchronizeVisibility(
+            isVisible,
+            invalidateSavedState: false
+        )
+    }
+
+    func selectSessionFromSidebar(_ target: TerminalController) {
+        flashSessionTabCoordinator.select(target)
+    }
+
+    func isSessionSelectedFromSidebar(_ target: TerminalController) -> Bool {
+        flashSessionTabCoordinator.isSelected(target)
+    }
+
+    /// Focuses a restored session without ordering an individual native-tab
+    /// member as though it were a standalone window. AppKit can detach a member
+    /// when `makeKeyAndOrderFront` races its tab-stack transition, so sidebar
+    /// groups always select through their application-owned adapter.
+    @discardableResult
+    func focusSessionWindowSafely(
+        _ targetWindow: NSWindow,
+        in confirmedTabGroup: NSWindowTabGroup? = nil
+    ) -> Bool {
+        flashSessionTabCoordinator.focusSafely(
+            targetWindow,
+            in: confirmedTabGroup
+        )
+    }
+
+    /// App Intents, AppleScript, and present-terminal actions enter through the
+    /// base controller. Keep those selection paths subject to the same native
+    /// tab-group invariant as sidebar clicks and undo restoration.
+    override func focusWindowForPresentation() -> Bool {
+        guard let window else { return false }
+        return focusSessionWindowSafely(window)
+    }
+
+    func sessionSidebarMetadataDidChange() {
+        flashSessionTabCoordinator.metadataDidChange()
+    }
+
+    /// Called by TerminalWindow when AppKit physically attaches a native tab
+    /// strip. This event is more precise than tab-group KVO during restoration.
+    func nativeTabBarDidAppearForSessionSidebar() {
+        flashSessionTabCoordinator.setupObservation()
+    }
+
+    func closeSessionFromSidebar(_ target: TerminalController) {
+        flashSessionTabCoordinator.close(target)
+    }
+
+    func renameSessionFromSidebar(_ target: TerminalController) {
+        flashSessionTabCoordinator.rename(target)
+    }
+
+    func setSessionNameFromSidebar(_ target: TerminalController, name: String) {
+        flashSessionTabCoordinator.setName(target, name: name)
+    }
+
+    func restoreTerminalFocusAfterSidebarRename() {
+        flashSessionTabCoordinator.restoreTerminalFocusAfterRename()
+    }
+
+    func closeOtherSessionsFromSidebar(_ target: TerminalController) {
+        flashSessionTabCoordinator.closeOthers(target)
+    }
+
+    func closeSessionsToRightFromSidebar(_ target: TerminalController) {
+        flashSessionTabCoordinator.closeToRight(target)
+    }
+
+    private func setupSessionSidebarObservation() {
+        flashSessionTabCoordinator.setupObservation()
+    }
+
+    private func bindSessionSidebarObservation(to tabGroup: NSWindowTabGroup?) {
+        flashSessionTabCoordinator.bindObservation(to: tabGroup)
+    }
+
+    /// KVO and AppKit delegate callbacks may request reconciliation, but only a
+    /// complete native state can modify workspace order or selection. They
+    /// never create or delete workspace membership.
+    private func reconcileSessionSidebarTabGroup(
+        _ tabGroup: NSWindowTabGroup?,
+        fallbackWindow: NSWindow? = nil
+    ) {
+        flashSessionTabCoordinator.reconcile(
+            tabGroup,
+            fallbackWindow: fallbackWindow
+        )
+    }
+
     // MARK: Base Controller Overrides
+
+    override func fullscreenDidChange() {
+        super.fullscreenDidChange()
+        setupSessionSidebarObservation()
+    }
 
     override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
         super.surfaceTreeDidChange(from: from, to: to)
@@ -359,7 +602,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             if let window = c.window {
                 // If we have a tree size, resize the window's content to match
                 if let treeSize, treeSize.width > 0, treeSize.height > 0 {
-                    window.setContentSize(treeSize)
+                    var contentSize = treeSize
+                    if c.usesSessionSidebar {
+                        contentSize.width += TerminalSessionRootView.configuredSidebarWidth +
+                            TerminalSessionRootView.sidebarDividerWidth
+                        contentSize.height += TerminalSessionRootView.terminalMetadataHeight
+                    }
+                    window.setContentSize(contentSize)
                     window.constrainToScreen()
                 }
 
@@ -432,9 +681,45 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         // Create a new window and add it to the parent
-        let controller = TerminalController.init(ghostty, withBaseConfig: baseConfig)
+        let controller = TerminalController.init(
+            ghostty,
+            withBaseConfig: baseConfig,
+            windowPresentation: .inheritedForNewTab(
+                from: parentController.windowPresentation
+            )
+        )
         controller.isBackgroundOpaque = parentController.isBackgroundOpaque
-        guard let window = controller.window else { return controller }
+        let parentSidebarVisibility = parentController.sessionSidebarIsVisible
+        var sharedWorkspacePrepared = false
+
+        // The child must share application-owned state before `controller.window`
+        // loads its SwiftUI root. Native tab attachment happens afterward and
+        // cannot be the source of session membership.
+        if parentController.usesSessionSidebar {
+            let insertionIndex: Int
+            if ghostty.config.windowNewTabPosition == "end" {
+                insertionIndex = parentController.sessionWorkspace.sessionCount
+            } else {
+                let parentIndex = parentController.sessionWorkspace.orderedSessionIDs
+                    .firstIndex(of: parentController.sessionID) ??
+                    parentController.sessionWorkspace.sessionCount - 1
+                insertionIndex = parentIndex + 1
+            }
+            sharedWorkspacePrepared = controller.adoptSessionWorkspace(
+                parentController.sessionTabGroupAdapter,
+                at: insertionIndex,
+                select: true
+            )
+        }
+
+        guard let window = controller.window else {
+            if sharedWorkspacePrepared {
+                _ = controller.becomeIndependentSessionWorkspace(
+                    isSidebarVisible: parentSidebarVisibility
+                )
+            }
+            return controller
+        }
 
         // If the parent is miniaturized, then macOS exhibits really strange behaviors
         // so we have to bring it back out.
@@ -453,30 +738,72 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         // If we don't allow tabs then we create a new window instead.
+        var addedToTabGroup = false
         if window.tabbingMode != .disallowed {
-            let tabCreated: Bool
             // Add the window to the tab group and show it.
             switch ghostty.config.windowNewTabPosition {
             case "end":
                 // If we already have a tab group and we want the new tab to open at the end,
                 // then we use the last window in the tab group as the parent.
                 if let last = parent.tabGroup?.windows.last {
-                    tabCreated = last.addTabbedWindowSafely(window, ordered: .above)
+                    addedToTabGroup = last.addTabbedWindowSafely(window, ordered: .above)
                 } else {
                     fallthrough
                 }
 
             case "current": fallthrough
             default:
-                tabCreated = parent.addTabbedWindowSafely(window, ordered: .above)
+                addedToTabGroup = parent.addTabbedWindowSafely(window, ordered: .above)
             }
-            if tabCreated {
+            if addedToTabGroup {
                 // We set the selectedWindow early here because we want the next window
                 // to become first responder as quickly as possible. Usually this is
                 // set while `-[NSWindowController showWindow:]` is called, but we're
                 // dispatching it to resolve other issues.
-                parent.tabGroup?.selectedWindow = window
+                if parentController.usesSessionSidebar {
+                    _ = parent.tabGroup?.selectWindowSafely(window)
+                } else {
+                    parent.tabGroup?.selectedWindow = window
+                }
             }
+
+            // AppKit may show its native tab strip while constructing the new
+            // group. Both controllers rebind because either window can become
+            // the group owner after attach/reorder operations.
+            parentController.setupSessionSidebarObservation()
+            controller.setupSessionSidebarObservation()
+        }
+
+        // Capture a confirmed group while AppKit still exposes it. The public
+        // tabGroup property may briefly return nil or a different wrapper on
+        // the following runloop turn as the native accessory changes owner.
+        let capturedTabGroup: NSWindowTabGroup? = {
+            guard parentController.usesSessionSidebar else { return nil }
+            let candidates = [
+                parentController.resolvedSessionSidebarTabGroup(for: parent),
+                controller.resolvedSessionSidebarTabGroup(for: window),
+            ].compactMap { $0 }
+            return candidates.first { group in
+                group.windows.contains(where: { $0 === parent }) &&
+                    group.windows.contains(where: { $0 === window })
+            }
+        }()
+        if let capturedTabGroup {
+            parentController.bindSessionSidebarObservation(to: capturedTabGroup)
+            controller.bindSessionSidebarObservation(to: capturedTabGroup)
+            parentController.reconcileSessionSidebarTabGroup(capturedTabGroup)
+        }
+        let tabWasAdded = addedToTabGroup
+        let membershipConfirmed =
+            capturedTabGroup?.windows.contains(where: { $0 === parent }) == true &&
+            capturedTabGroup?.windows.contains(where: { $0 === window }) == true
+        let remainsNativeSidebarTab = parentController.usesSessionSidebar &&
+            (tabWasAdded || membershipConfirmed)
+
+        if parentController.usesSessionSidebar && !remainsNativeSidebarTab {
+            _ = controller.becomeIndependentSessionWorkspace(
+                isSidebarVisible: parentSidebarVisibility
+            )
         }
 
         // We're dispatching this async because otherwise the lastCascadePoint doesn't
@@ -484,16 +811,36 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // that Cocoa is doing that we need to be after.
         controller.scheduleInitialPresentation {
             // Only cascade if we aren't fullscreen and are alone in the tab group.
-            if !window.styleMask.contains(.fullScreen) &&
+            if !tabWasAdded && !window.styleMask.contains(.fullScreen) &&
                 window.tabGroup?.windows.count ?? 1 == 1 {
                 let hasFixedPos = controller.derivedConfig.windowPositionX != nil && controller.derivedConfig.windowPositionY != nil
                 Self.applyCascade(to: window, hasFixedPos: hasFixedPos)
             }
 
-            // showWindow makes regular windows key and ordered front. AppKit can
-            // throw while selecting a tab if its fullscreen stack is inconsistent,
-            // so this must cross the Objective-C exception bridge.
-            controller.showWindowSafely(self)
+            // A sidebar session remains a native tab, but its AppKit tab strip
+            // is collapsed. Select it through the group instead of ordering the
+            // child NSWindow independently, which can detach the previous tab.
+            let resolvedTabGroup = capturedTabGroup ??
+                parentController.resolvedSessionSidebarTabGroup(for: parent) ??
+                controller.resolvedSessionSidebarTabGroup(for: window)
+            if remainsNativeSidebarTab {
+                if let resolvedTabGroup {
+                    _ = parentController.sessionTabGroupAdapter.selectSession(
+                        controller.sessionID,
+                        in: resolvedTabGroup
+                    )
+                }
+            } else {
+                // Regular window styles retain their existing presentation
+                // path. This is also the safe fallback if native attachment
+                // failed and the new session is a standalone window.
+                controller.showWindowSafely(self)
+            }
+
+            // Showing the new native tab can be the point where AppKit finally
+            // selects it. Refresh both roots after that selection has settled.
+            parentController.setupSessionSidebarObservation()
+            controller.setupSessionSidebarObservation()
 
             // We also activate our app so that it becomes front. This may be
             // necessary for the dock menu.
@@ -506,6 +853,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // solution we should do that.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             controller.relabelTabs()
+            parentController.setupSessionSidebarObservation()
+            controller.setupSessionSidebarObservation()
         }
 
         // Setup our undo
@@ -631,16 +980,45 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Sync our zoom state for splits
         window.surfaceIsZoomed = surfaceTree.zoomed != nil
 
-        // Set the font for the window and tab titles.
-        if let titleFontName = surfaceConfig.windowTitleFontFamily {
-            window.titlebarFont = NSFont(name: titleFontName, size: NSFont.systemFontSize)
-        } else {
-            window.titlebarFont = nil
-        }
+        syncTitlebarFont(window, surfaceConfig: surfaceConfig)
 
         // Call this last in case it uses any of the properties above.
         window.syncAppearance(surfaceConfig)
         terminalViewContainer?.ghosttyConfigDidChange(ghostty.config, preferredBackgroundColor: window.preferredBackgroundColor)
+    }
+
+    /// Reapply the native titlebar font after the shared sidebar text size
+    /// changes. The regular appearance path also calls this logic on focus,
+    /// fullscreen, and configuration updates, so the size cannot drift back.
+    func sessionSidebarFontSizeDidChange() {
+        for controller in Self.all {
+            guard controller.usesSessionSidebar,
+                  let window = controller.window as? TerminalWindow,
+                  let focusedSurface = controller.focusedSurface else { continue }
+            controller.syncTitlebarFont(window, surfaceConfig: focusedSurface.derivedConfig)
+        }
+    }
+
+    /// Set the font for the window and tab titles. Sidebar windows use the
+    /// same user-adjustable size as their session list and metadata header;
+    /// all other titlebar styles retain Ghostty's existing system size.
+    private func syncTitlebarFont(
+        _ window: TerminalWindow,
+        surfaceConfig: Ghostty.SurfaceView.DerivedConfig
+    ) {
+        if usesSessionSidebar {
+            let size = CGFloat(TerminalSessionSidebarPreferences.storedSessionFontSize)
+            if let titleFontName = surfaceConfig.windowTitleFontFamily {
+                window.titlebarFont = NSFont(name: titleFontName, size: size)
+                    ?? NSFont.systemFont(ofSize: size, weight: .regular)
+            } else {
+                window.titlebarFont = NSFont.systemFont(ofSize: size, weight: .regular)
+            }
+        } else if let titleFontName = surfaceConfig.windowTitleFontFamily {
+            window.titlebarFont = NSFont(name: titleFontName, size: NSFont.systemFontSize)
+        } else {
+            window.titlebarFont = nil
+        }
     }
 
     /// Adjusts the given frame for the configured window position.
@@ -695,11 +1073,17 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
     }
 
-    func closeTabImmediately(registerRedo: Bool = true) {
+    func closeTabImmediately(
+        registerRedo: Bool = true,
+        didRestore: ((TerminalController) -> Void)? = nil
+    ) {
         guard let window = window else { return }
         guard let tabGroup = window.tabGroup,
                 tabGroup.windows.count > 1 else {
-            closeWindowImmediately()
+            closeWindowImmediately(
+                registerRedo: registerRedo,
+                didRestore: didRestore
+            )
             return
         }
 
@@ -714,6 +1098,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 expiresAfter: undoExpiration
             ) { ghostty in
                 let newController = TerminalController(ghostty, with: undoState)
+                didRestore?(newController)
 
                 if registerRedo {
                     undoManager.registerUndo(
@@ -734,48 +1119,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard let tabGroup = window.tabGroup else { return }
         guard tabGroup.windows.count > 1 else { return }
 
-        // Start an undo grouping
-        if let undoManager {
-            undoManager.beginUndoGrouping()
+        // Ignore non-terminal tabs. They do not currently exist and cannot be
+        // reconstructed by Ghostty's undo model.
+        let controllers = tabGroup.windows.compactMap { candidate -> TerminalController? in
+            guard candidate !== window else { return nil }
+            return candidate.windowController as? TerminalController
         }
-        defer {
-            undoManager?.endUndoGrouping()
-        }
-
-        // Iterate through all tabs except the current one.
-        for window in tabGroup.windows where window != self.window {
-            // We ignore any non-terminal tabs. They don't currently exist and we can't
-            // properly undo them anyways so I'd rather ignore them and get a bug report
-            // later if and when we introduce non-terminal tabs.
-            if let controller = window.windowController as? TerminalController {
-                // We must not register a redo, because it messes with our own redo
-                // that we register later.
-                controller.closeTabImmediately(registerRedo: false)
-            }
-        }
-
-        if let undoManager {
-            undoManager.setActionName("Close Other Tabs")
-
-            // We need to register an undo that refocuses this window. Otherwise, the
-            // undo operation above for each tab will steal focus.
-            undoManager.registerUndo(
-                withTarget: self,
-                expiresAfter: undoExpiration
-            ) { target in
-                DispatchQueue.main.async {
-                    target.window?.makeKeyAndOrderFront(nil)
-                }
-
-                // Register redo action
-                undoManager.registerUndo(
-                    withTarget: target,
-                    expiresAfter: target.undoExpiration
-                ) { target in
-                    target.closeOtherTabsImmediately()
-                }
-            }
-        }
+        closeSessionsAsTrackedUndoGroup(
+            controllers,
+            actionName: "Close Other Tabs"
+        )
     }
 
     private func closeTabsOnTheRightImmediately() {
@@ -786,46 +1139,78 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let tabsToClose = tabGroup.windows.enumerated().filter { $0.offset > currentIndex }
         guard !tabsToClose.isEmpty else { return }
 
-        undoManager?.beginUndoGrouping()
-        defer {
-            undoManager?.endUndoGrouping()
+        let controllers = tabsToClose.compactMap {
+            $0.element.windowController as? TerminalController
+        }
+        closeSessionsAsTrackedUndoGroup(
+            controllers,
+            actionName: "Close Tabs to the Right"
+        )
+    }
+
+    /// Closes a concrete set and records whichever controllers its undo later
+    /// materializes. Redo closes that same set, including sessions whose native
+    /// attachment failed and therefore became standalone windows.
+    private func closeSessionsAsTrackedUndoGroup(
+        _ controllers: [TerminalController],
+        actionName: String
+    ) {
+        guard !controllers.isEmpty else { return }
+
+        guard let undoManager else {
+            controllers.forEach { $0.closeTabImmediately(registerRedo: false) }
+            return
         }
 
-        for (_, candidate) in tabsToClose {
-            if let controller = candidate.windowController as? TerminalController {
-                controller.closeTabImmediately(registerRedo: false)
+        let restorations = SessionUndoRestorationSet<TerminalController>()
+        undoManager.beginUndoGrouping()
+        defer { undoManager.endUndoGrouping() }
+
+        for controller in controllers {
+            controller.closeTabImmediately(registerRedo: false) { restoredController in
+                restorations.insert(restoredController)
             }
         }
 
-        if let undoManager {
-            undoManager.setActionName("Close Tabs to the Right")
+        undoManager.registerUndo(
+            withTarget: self,
+            expiresAfter: undoExpiration
+        ) { target in
+            // Individual tab restorations execute after this coordinator in the
+            // undo group. Defer focus until all native attachments have settled.
+            DispatchQueue.main.async {
+                if let window = target.window {
+                    _ = target.focusSessionWindowSafely(window)
+                }
+            }
 
             undoManager.registerUndo(
-                withTarget: self,
-                expiresAfter: undoExpiration
+                withTarget: target,
+                expiresAfter: target.undoExpiration
             ) { target in
-                DispatchQueue.main.async {
-                    target.window?.makeKeyAndOrderFront(nil)
-                }
-
-                undoManager.registerUndo(
-                    withTarget: target,
-                    expiresAfter: target.undoExpiration
-                ) { target in
-                    target.closeTabsOnTheRightImmediately()
-                }
+                target.closeSessionsAsTrackedUndoGroup(
+                    restorations.liveValues,
+                    actionName: actionName
+                )
             }
         }
+        undoManager.setActionName(actionName)
     }
 
     /// Closes the current window (including any other tabs) immediately and without
     /// confirmation. This will setup proper undo state so the action can be undone.
-    func closeWindowImmediately() {
+    func closeWindowImmediately(
+        registerRedo: Bool = true,
+        didRestore: ((TerminalController) -> Void)? = nil
+    ) {
         guard let window = window else { return }
 
         cancelPendingInitialPresentation()
 
-        registerUndoForCloseWindow()
+        registerUndoForCloseWindow(
+            registerRedo: registerRedo,
+            didRestore: didRestore
+        )
 
         if let tabGroup = window.tabGroup, tabGroup.windows.count > 1 {
             tabGroup.windows.forEach { window in
@@ -845,7 +1230,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     /// Registers undo for closing window(s), handling both single windows and tab groups.
-    private func registerUndoForCloseWindow() {
+    private func registerUndoForCloseWindow(
+        registerRedo: Bool,
+        didRestore: ((TerminalController) -> Void)?
+    ) {
         guard let undoManager, undoManager.isUndoRegistrationEnabled else { return }
         guard let window else { return }
 
@@ -862,13 +1250,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                     expiresAfter: undoExpiration) { ghostty in
                         // Restore the undo state
                         let newController = TerminalController(ghostty, with: undoState)
+                        didRestore?(newController)
 
                         // Register redo action
-                        undoManager.registerUndo(
-                            withTarget: newController,
-                            expiresAfter: newController.undoExpiration) { target in
-                                target.closeWindowImmediately()
-                            }
+                        if registerRedo {
+                            undoManager.registerUndo(
+                                withTarget: newController,
+                                expiresAfter: newController.undoExpiration) { target in
+                                    target.closeWindowImmediately()
+                                }
+                        }
                     }
             }
 
@@ -921,35 +1312,105 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             let controllers = undoStates.map { undoState in
                 TerminalController(ghostty, with: undoState)
             }
+            controllers.forEach { didRestore?($0) }
 
             // The first controller becomes the parent window for all tabs.
             // If we don't have a first controller (shouldn't be possible?)
             // then we can't restore tabs.
             guard let firstController = controllers.first else { return }
 
-            // Add all subsequent controllers as tabs to the first window
-            for controller in controllers.dropFirst() {
+            let selectedIndex = keyWindowIndex ?? controllers.count - 1
+            var restoredAsOneNativeGroup = true
+
+            // Adopt and attach each tab as one transaction. If any attachment
+            // fails, all restored sessions are rolled back to independent
+            // workspaces/windows rather than leaving a half-logical group.
+            for (index, controller) in controllers.enumerated().dropFirst() {
                 controller.showWindow(nil)
-                if let firstWindow = firstController.window,
-                   let newWindow = controller.window {
-                    firstWindow.addTabbedWindowSafely(newWindow, ordered: .above)
+                guard let firstWindow = firstController.window,
+                      let newWindow = controller.window else {
+                    restoredAsOneNativeGroup = false
+                    continue
+                }
+
+                let adopted = !firstController.usesSessionSidebar ||
+                    controller.adoptSessionWorkspace(
+                        firstController.sessionTabGroupAdapter,
+                        at: index,
+                        select: index == selectedIndex
+                    )
+                let attachmentAnchor = firstWindow.tabGroup?.windows.last ?? firstWindow
+                let attachReportedSuccess = adopted && attachmentAnchor
+                    .addTabbedWindowSafely(newWindow, ordered: .above)
+                let attached = attachReportedSuccess &&
+                    firstWindow.tabGroup?.windows.contains(where: {
+                        $0 === newWindow
+                    }) == true
+                if !attached {
+                    restoredAsOneNativeGroup = false
+                }
+            }
+
+            if firstController.usesSessionSidebar && !restoredAsOneNativeGroup {
+                // Remove any tabs that did attach before the failure. This is
+                // the physical half of the group transaction rollback.
+                for controller in controllers.dropFirst() {
+                    guard let restoredWindow = controller.window,
+                          let tabGroup = restoredWindow.tabGroup,
+                          tabGroup.windows.count > 1 else { continue }
+                    tabGroup.removeWindow(restoredWindow)
+                }
+
+                for (controller, undoState) in zip(controllers, undoStates) {
+                    _ = controller.becomeIndependentSessionWorkspace(
+                        isSidebarVisible: undoState.sessionSidebarIsVisible
+                    )
                 }
             }
 
             // Make the appropriate window key. If we had a key window, restore it.
             // Otherwise, make the last window key.
+            let focusController: TerminalController?
             if let keyWindowIndex, keyWindowIndex < controllers.count {
-                controllers[keyWindowIndex].window?.makeKeyAndOrderFront(nil)
+                focusController = controllers[keyWindowIndex]
             } else {
-                controllers.last?.window?.makeKeyAndOrderFront(nil)
+                focusController = controllers.last
+            }
+            if let focusController,
+               let focusWindow = focusController.window {
+                let confirmedTabGroup = restoredAsOneNativeGroup ?
+                    firstController.window?.tabGroup : nil
+                _ = focusController.focusSessionWindowSafely(
+                    focusWindow,
+                    in: confirmedTabGroup
+                )
             }
 
-            // Register redo action on the first controller
-            undoManager.registerUndo(
-                withTarget: firstController,
-                expiresAfter: firstController.undoExpiration
-            ) { target in
-                target.closeWindowImmediately()
+            // Register redo for either the native group or every standalone
+            // window produced by a failed group restoration.
+            if registerRedo {
+                undoManager.registerUndo(
+                    withTarget: firstController,
+                    expiresAfter: firstController.undoExpiration
+                ) { target in
+                    if restoredAsOneNativeGroup {
+                        target.closeWindowImmediately()
+                        return
+                    }
+
+                    undoManager.beginUndoGrouping()
+                    defer { undoManager.endUndoGrouping() }
+                    var closedWindows = Set<ObjectIdentifier>()
+                    for controller in controllers {
+                        guard let restoredWindow = controller.window,
+                              !closedWindows.contains(ObjectIdentifier(restoredWindow)) else {
+                            continue
+                        }
+                        let groupWindows = restoredWindow.tabGroup?.windows ?? [restoredWindow]
+                        closedWindows.formUnion(groupWindows.map(ObjectIdentifier.init))
+                        controller.closeWindowImmediately()
+                    }
+                }
             }
         }
     }
@@ -1002,14 +1463,50 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let tabIndex: Int?
         weak var tabGroup: NSWindowTabGroup?
         let tabColor: TerminalTabColor
+        let titleOverride: String?
+        let sessionSidebarIsVisible: Bool
+        let sessionID: SessionWorkspace.SessionID
+        let windowPresentation: TerminalWindowPresentation
     }
 
     convenience init(_ ghostty: Ghostty.App, with undoState: UndoState) {
-        self.init(ghostty, withSurfaceTree: undoState.surfaceTree)
+        self.init(
+            ghostty,
+            withSurfaceTree: undoState.surfaceTree,
+            sessionID: undoState.sessionID,
+            windowPresentation: undoState.windowPresentation
+        )
+        titleOverride = undoState.titleOverride
+
+        // A restored tab adopts the live group before loading its SwiftUI root.
+        // A whole-window undo has no surviving group and restores its archived
+        // presentation state on the independent workspace instead.
+        let existingGroupController = undoState.tabGroup?.windows.lazy.compactMap {
+            $0.windowController as? TerminalController
+        }.first(where: { !$0.sessionSidebarIsClosing })
+        var adoptedExistingWorkspace = false
+        if let existingGroupController, existingGroupController.usesSessionSidebar {
+            adoptedExistingWorkspace = adoptSessionWorkspace(
+                existingGroupController.sessionTabGroupAdapter,
+                at: undoState.tabIndex,
+                select: true
+            )
+        } else {
+            restoreSessionSidebarVisibility(undoState.sessionSidebarIsVisible)
+        }
 
         // Show the window and restore its frame
         showWindow(nil)
-        if let window {
+        guard let window else {
+            if adoptedExistingWorkspace {
+                _ = becomeIndependentSessionWorkspace(
+                    isSidebarVisible: undoState.sessionSidebarIsVisible
+                )
+            }
+            return
+        }
+
+        do {
             window.setFrame(undoState.frame, display: true)
             if let terminalWindow = window as? TerminalWindow {
                 terminalWindow.tabColor = undoState.tabColor
@@ -1017,17 +1514,38 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
             // If we have a tab group and index, restore the tab to its original position
             if let tabGroup = undoState.tabGroup,
-               let tabIndex = undoState.tabIndex {
-                if tabIndex < tabGroup.windows.count {
+               let tabIndex = undoState.tabIndex,
+               (!usesSessionSidebar || adoptedExistingWorkspace) {
+                let attachReportedSuccess: Bool
+                if tabGroup.windows.contains(where: { $0 === window }) {
+                    attachReportedSuccess = true
+                } else if tabIndex < tabGroup.windows.count {
                     // Find the window that is currently at that index
                     let currentWindow = tabGroup.windows[tabIndex]
-                    currentWindow.addTabbedWindowSafely(window, ordered: .below)
+                    attachReportedSuccess = currentWindow.addTabbedWindowSafely(
+                        window,
+                        ordered: .below
+                    )
                 } else {
-                    tabGroup.windows.last?.addTabbedWindowSafely(window, ordered: .above)
+                    attachReportedSuccess = tabGroup.windows.last?
+                        .addTabbedWindowSafely(window, ordered: .above) ?? false
                 }
 
-                // Make it the key window
-                window.makeKeyAndOrderFront(nil)
+                let attachmentSucceeded = attachReportedSuccess &&
+                    tabGroup.windows.contains(where: { $0 === window })
+                if usesSessionSidebar && !attachmentSucceeded {
+                    if tabGroup.windows.contains(where: { $0 === window }) {
+                        tabGroup.removeWindow(window)
+                    }
+                    _ = becomeIndependentSessionWorkspace(
+                        isSidebarVisible: undoState.sessionSidebarIsVisible
+                    )
+                }
+
+                // Select a restored sidebar tab through its native group. A
+                // failed attachment has already become standalone and retains
+                // the regular order-front behavior.
+                _ = focusSessionWindowSafely(window, in: tabGroup)
             }
 
             // Restore focus to the previously focused surface
@@ -1057,7 +1575,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             focusedSurface: focusedSurface?.id,
             tabIndex: window.tabGroup?.windows.firstIndex(of: window),
             tabGroup: window.tabGroup,
-            tabColor: (window as? TerminalWindow)?.tabColor ?? .none)
+            tabColor: (window as? TerminalWindow)?.tabColor ?? .none,
+            titleOverride: titleOverride,
+            sessionSidebarIsVisible: sessionSidebarIsVisible,
+            sessionID: sessionID,
+            windowPresentation: windowPresentation)
     }
 
     // MARK: - NSWindowController
@@ -1070,6 +1592,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     override func windowDidLoad() {
         super.windowDidLoad()
         guard let window else { return }
+
+        flashSessionTabCoordinator.register(window: window)
 
         // I copy this because we may change the source in the future but also because
         // I regularly audit our codebase for "ghostty.config" access because generally
@@ -1093,15 +1617,30 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         // Initialize our content view to the SwiftUI root
-        let container = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+        let container: TerminalViewContainer
+        if usesSessionSidebar {
+            container = TerminalViewContainer {
+                TerminalSessionRootView(ghostty: ghostty, controller: self)
+            }
+        } else {
+            container = TerminalViewContainer {
+                TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            }
         }
 
         // Set the initial content size on the container so that
         // intrinsicContentSize returns the correct value immediately,
         // without waiting for @FocusedValue to propagate through the
         // SwiftUI focus chain.
-        container.initialContentSize = focusedSurface?.initialSize
+        if var initialContentSize = focusedSurface?.initialSize {
+            if usesSessionSidebar {
+                initialContentSize.width += TerminalSessionRootView.sidebarChromeWidth(
+                    isVisible: sessionSidebarIsVisible
+                )
+                initialContentSize.height += TerminalSessionRootView.terminalMetadataHeight
+            }
+            container.initialContentSize = initialContentSize
+        }
 
         window.contentView = container
 
@@ -1150,6 +1689,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // apply this based on the root config but change it later based on surface
         // config (see focused surface change callback).
         syncAppearance(.init(config))
+        setupSessionSidebarObservation()
     }
 
     /// Setup correct window frame before showing the window
@@ -1179,6 +1719,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         super.showWindow(sender)
 
+        setupSessionSidebarObservation()
         syncAppearance()
     }
 
@@ -1210,8 +1751,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     override func windowWillClose(_ notification: Notification) {
-        super.windowWillClose(notification)
+        // Set this before any superclass/AppKit work. Removing a native tab can
+        // synchronously notify another controller's KVO observer; every merge
+        // and transfer path filters this flag so the closing session cannot be
+        // registered into the surviving workspace again.
         cancelPendingInitialPresentation()
+        stopSessionMetadataRefreshMonitoring()
+        flashSessionTabCoordinator.beginClosing(
+            window: notification.object as? NSWindow
+        )
+        super.windowWillClose(notification)
         self.relabelTabs()
 
         // If we remove a window, we reset the cascade point to the key window so that
@@ -1248,6 +1797,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         super.windowDidBecomeKey(notification)
         self.relabelTabs()
         self.fixTabBar()
+        setupSessionSidebarObservation()
     }
 
     override func windowDidMove(_ notification: Notification) {
@@ -1273,6 +1823,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // Remember our last main
         Self.lastMain = self
+        setupSessionSidebarObservation()
     }
 
     // Called when the window will be encoded. We handle the data encoding here in the
@@ -1451,6 +2002,72 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     // MARK: - Notifications
 
+    /// Moves a native tab with a physical rollback. Only a confirmed native
+    /// attachment updates workspace order; if both attachment attempts fail,
+    /// the selected controller becomes a consistent standalone workspace.
+    private func moveNativeTab(
+        _ selectedWindow: NSWindow,
+        in tabGroup: NSWindowTabGroup,
+        from selectedIndex: Int,
+        to finalIndex: Int,
+        targetWindow: NSWindow,
+        ordered ordering: NSWindow.OrderingMode
+    ) -> NativeTabAttachmentTransaction.Outcome {
+        let originalWindows = tabGroup.windows
+        let rollbackAnchor: NSWindow
+        let rollbackOrdering: NSWindow.OrderingMode
+        if selectedIndex > 0 {
+            rollbackAnchor = originalWindows[selectedIndex - 1]
+            rollbackOrdering = .above
+        } else {
+            rollbackAnchor = originalWindows[selectedIndex + 1]
+            rollbackOrdering = .below
+        }
+
+        tabGroup.removeWindow(selectedWindow)
+        let outcome = NativeTabAttachmentTransaction.perform(
+            attach: {
+                targetWindow.addTabbedWindowSafely(
+                    selectedWindow,
+                    ordered: ordering
+                ) && targetWindow.tabGroup?.windows.contains(where: {
+                    $0 === selectedWindow
+                }) == true
+            },
+            rollback: {
+                rollbackAnchor.addTabbedWindowSafely(
+                    selectedWindow,
+                    ordered: rollbackOrdering
+                ) && rollbackAnchor.tabGroup?.windows.contains(where: {
+                    $0 === selectedWindow
+                }) == true
+            }
+        )
+
+        guard let selectedController = selectedWindow.windowController
+            as? TerminalController else { return outcome }
+        switch outcome {
+        case .attached:
+            if selectedController.usesSessionSidebar {
+                _ = selectedController.sessionWorkspace.moveSession(
+                    selectedController.sessionID,
+                    to: finalIndex
+                )
+            }
+        case .rolledBack:
+            break
+        case .detached:
+            if let currentGroup = selectedWindow.tabGroup,
+               currentGroup.windows.count > 1,
+               currentGroup.windows.contains(where: { $0 === selectedWindow }) {
+                currentGroup.removeWindow(selectedWindow)
+            }
+            selectedController.nativeTabAttachmentDidFail()
+        }
+
+        return outcome
+    }
+
     @objc private func onMoveTab(notification: SwiftUI.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
@@ -1490,8 +2107,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Reproduction: titlebar tabs, create two tabs, "move tab left"
         if #available(macOS 26, *) {
             if window is TitlebarTabsTahoeTerminalWindow {
-                tabGroup.removeWindow(selectedWindow)
-                targetWindow.addTabbedWindowSafely(selectedWindow, ordered: action.amount < 0 ? .below : .above)
+                _ = moveNativeTab(
+                    selectedWindow,
+                    in: tabGroup,
+                    from: selectedIndex,
+                    to: finalIndex,
+                    targetWindow: targetWindow,
+                    ordered: action.amount < 0 ? .below : .above
+                )
                 DispatchQueue.main.async {
                     selectedWindow.makeKey()
                 }
@@ -1504,9 +2127,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         NSAnimationContext.beginGrouping()
         NSAnimationContext.current.duration = 0
 
-        // Remove and re-add the window in the correct position
-        tabGroup.removeWindow(selectedWindow)
-        targetWindow.addTabbedWindowSafely(selectedWindow, ordered: action.amount < 0 ? .below : .above)
+        _ = moveNativeTab(
+            selectedWindow,
+            in: tabGroup,
+            from: selectedIndex,
+            to: finalIndex,
+            targetWindow: targetWindow,
+            ordered: action.amount < 0 ? .below : .above
+        )
 
         // Ensure our window remains selected
         selectedWindow.makeKey()
@@ -1563,7 +2191,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         guard finalIndex >= 0 else { return }
         let targetWindow = tabbedWindows[finalIndex]
-        targetWindow.makeKeyAndOrderFront(nil)
+        if usesSessionSidebar {
+            _ = flashSessionTabCoordinator.selectNativeWindow(targetWindow)
+        } else {
+            targetWindow.makeKeyAndOrderFront(nil)
+        }
     }
 
     @objc private func onCloseTab(notification: SwiftUI.Notification) {
@@ -1646,10 +2278,21 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 extension TerminalController {
     override func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(toggleSessionSidebar):
+            guard usesSessionSidebar else { return false }
+            item.title = sessionSidebarIsVisible ? "Hide Sidebar" : "Show Sidebar"
+            return true
+
         case #selector(closeTabsOnTheRight):
             guard let window, let tabGroup = window.tabGroup else { return false }
             guard let currentIndex = tabGroup.windows.firstIndex(of: window) else { return false }
             return tabGroup.windows.indices.contains { $0 > currentIndex }
+
+        case NSSelectorFromString("moveTabToNewWindow:"):
+            // AppKit exposes no success/failure callback for this action. The
+            // hidden native strip cannot be dragged in sidebar mode, and the
+            // matching responder action is deliberately unavailable as well.
+            return !usesSessionSidebar
 
         case #selector(returnToDefaultSize):
             guard let window else { return false }
