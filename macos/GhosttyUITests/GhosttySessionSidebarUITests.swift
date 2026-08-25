@@ -1,0 +1,230 @@
+import XCTest
+
+final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
+    override func setUp() async throws {
+        try await super.setUp()
+
+        try updateConfig(
+            """
+            title = "GhosttySessionSidebarUITests"
+            working-directory = /private/tmp
+            """
+        )
+    }
+
+    @MainActor
+    func testCleanProductDefaultsExposeSessionSidebar() throws {
+        let app = try isolatedGhosttyApplication(testName: #function)
+        app.launch()
+
+        XCTAssertTrue(app.groups["Terminal pane"].waitForExistence(timeout: 2))
+        XCTAssertTrue(
+            app.groups["terminal-session-sidebar"]
+                .waitForExistence(timeout: 2),
+            "A clean FLASH-Ghostty configuration must expose the session sidebar group"
+        )
+        XCTAssertTrue(waitForSessionCount(1, in: app))
+        XCTAssertEqual(app.windows.firstMatch.title, "FLASH-Ghostty")
+    }
+
+    @MainActor
+    func testSessionRowsSurviveNativeTabSelection() throws {
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let terminal = app.groups["Terminal pane"]
+        XCTAssertTrue(terminal.waitForExistence(timeout: 2))
+        XCTAssertEqual(app.windows.firstMatch.title, "FLASH-Ghostty")
+        XCTAssertTrue(waitForSessionCount(1, in: app))
+
+        XCTAssertTrue(
+            waitForWorkingDirectory("/private/tmp", in: app),
+            "The directory header must leave its loading state after launch"
+        )
+
+        terminal.typeKey("t", modifierFlags: .command)
+        terminal.typeKey("t", modifierFlags: .command)
+        XCTAssertTrue(waitForSessionCount(3, in: app))
+
+        // Exercise the same path as a user clicking a newly created session.
+        // Each native tab owns a separate SwiftUI root, so both the old and
+        // new roots must continue to expose all three rows after selection.
+        let selectors = sessionSelectors(in: app)
+        selectors.element(boundBy: 0).click()
+        XCTAssertTrue(waitForSessionCount(3, in: app))
+        XCTAssertTrue(waitForWorkingDirectory("/private/tmp", in: app))
+        sessionSelectors(in: app).element(boundBy: 2).click()
+        XCTAssertTrue(waitForSessionCount(3, in: app))
+        XCTAssertTrue(waitForWorkingDirectory("/private/tmp", in: app))
+        XCTAssertEqual(app.windows.firstMatch.title, "FLASH-Ghostty")
+
+        for index in [1, 2, 3, 1] {
+            app.typeKey("\(index)", modifierFlags: .command)
+            XCTAssertTrue(
+                waitForSessionCount(3, in: app),
+                "Selecting session \(index) must preserve every sidebar row"
+            )
+        }
+    }
+
+    @MainActor
+    func testSidebarTogglePersistsAcrossNativeTabSelection() async throws {
+        let app = try isolatedGhosttyApplication(testName: #function)
+        app.launch()
+
+        let terminal = app.groups["Terminal pane"]
+        let window = app.windows.firstMatch
+        XCTAssertTrue(terminal.waitForExistence(timeout: 2))
+        XCTAssertTrue(sidebarToggle(in: app).waitForExistence(timeout: 2))
+        XCTAssertTrue(waitForSessionCount(1, in: app))
+
+        terminal.typeKey("t", modifierFlags: .command)
+        XCTAssertTrue(waitForSessionCount(2, in: app))
+
+        let initialWindowFrame = window.frame
+        let initialSidebarWidth = sessionSelectors(in: app).firstMatch.frame.width
+        XCTAssertGreaterThan(initialSidebarWidth, 0)
+
+        sidebarToggle(in: app).click()
+        XCTAssertTrue(waitForSessionCount(0, in: app))
+        XCTAssertTrue(sidebarToggle(in: app).waitForExistence(timeout: 2))
+        XCTAssertTrue(terminal.waitForExistence(timeout: 2))
+        XCTAssertEqual(
+            window.frame,
+            initialWindowFrame,
+            "Hiding the sidebar must give its space to the terminal without resizing the window"
+        )
+
+        // A session created while the sidebar is hidden must inherit the
+        // logical window group's state instead of flashing the sidebar back on.
+        app.groups["Terminal pane"].typeKey("t", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(sessionSelectors(in: app).count, 0)
+        XCTAssertTrue(sidebarToggle(in: app).isHittable)
+
+        // Each session is backed by a separate native tab window. The hidden
+        // state and the titlebar control must follow selection to every one.
+        for index in [1, 2, 3] {
+            app.typeKey("\(index)", modifierFlags: .command)
+            try await Task.sleep(for: .milliseconds(200))
+            XCTAssertEqual(sessionSelectors(in: app).count, 0)
+            XCTAssertTrue(
+                sidebarToggle(in: app).isHittable,
+                "The sidebar toggle must remain available after selecting session \(index)"
+            )
+            XCTAssertTrue(app.groups["Terminal pane"].exists)
+        }
+
+        sidebarToggle(in: app).click()
+        XCTAssertTrue(waitForSessionCount(3, in: app))
+        XCTAssertEqual(
+            sessionSelectors(in: app).firstMatch.frame.width,
+            initialSidebarWidth,
+            accuracy: 1,
+            "Showing the sidebar must restore its previous width"
+        )
+        XCTAssertEqual(window.frame, initialWindowFrame)
+    }
+
+    @MainActor
+    func testViewMenuAndKeyboardShortcutTrackSidebarVisibility() throws {
+        let app = try isolatedGhosttyApplication(testName: #function)
+        app.launch()
+
+        XCTAssertTrue(sidebarToggle(in: app).waitForExistence(timeout: 2))
+        XCTAssertTrue(waitForSessionCount(1, in: app))
+        XCTAssertTrue(openViewMenu(in: app))
+        XCTAssertTrue(app.menuItems["Hide Sidebar"].waitForExistence(timeout: 2))
+        app.typeKey(.escape, modifierFlags: [])
+
+        app.typeKey("s", modifierFlags: [.command, .control])
+        XCTAssertTrue(waitForSessionCount(0, in: app))
+        XCTAssertTrue(sidebarToggle(in: app).exists)
+
+        XCTAssertTrue(openViewMenu(in: app))
+        let showSidebar = app.menuItems["Show Sidebar"]
+        XCTAssertTrue(showSidebar.waitForExistence(timeout: 2))
+        showSidebar.click()
+
+        XCTAssertTrue(waitForSessionCount(1, in: app))
+        XCTAssertTrue(openViewMenu(in: app))
+        XCTAssertTrue(app.menuItems["Hide Sidebar"].waitForExistence(timeout: 2))
+        app.typeKey(.escape, modifierFlags: [])
+    }
+
+    @MainActor
+    private func waitForSessionCount(
+        _ expectedCount: Int,
+        in app: XCUIApplication,
+        timeout: TimeInterval = 2
+    ) -> Bool {
+        let predicate = NSPredicate { _, _ in
+            self.sessionSelectors(in: app).count == expectedCount
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: app)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func waitForWorkingDirectory(
+        _ expectedPath: String,
+        in app: XCUIApplication,
+        timeout: TimeInterval = 5
+    ) -> Bool {
+        // Query the leaf by its unique identifier. A label lookup can still
+        // match the text after SwiftUI has propagated an ancestor identifier,
+        // masking a broken accessibility hierarchy.
+        let element = element(
+            withIdentifier: "terminal-session-working-directory.text",
+            in: app
+        )
+        // The product intentionally displays a standardized file URL. On
+        // macOS, the system alias `/private/tmp` canonicalizes to `/tmp`.
+        let expectedValue = URL(fileURLWithPath: expectedPath)
+            .standardizedFileURL.path
+        let predicate = NSPredicate(format: "value == %@", expectedValue)
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func sessionSelectors(in app: XCUIApplication) -> XCUIElementQuery {
+        app.buttons.matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@ AND identifier ENDSWITH %@",
+                "terminal-session-sidebar.row.",
+                ".select"
+            )
+        )
+    }
+
+    @MainActor
+    private func isolatedGhosttyApplication(testName: String) throws -> XCUIApplication {
+        try ghosttyApplication(
+            defaultsSuite: "\(Self.defaultsSuiteName).\(testName).\(UUID().uuidString)"
+        )
+    }
+
+    @MainActor
+    private func sidebarToggle(in app: XCUIApplication) -> XCUIElement {
+        element(withIdentifier: "terminal-session-sidebar.toggle", in: app)
+    }
+
+    @MainActor
+    private func element(
+        withIdentifier identifier: String,
+        in app: XCUIApplication
+    ) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(identifier: identifier)
+            .firstMatch
+    }
+
+    @MainActor
+    private func openViewMenu(in app: XCUIApplication) -> Bool {
+        let viewMenu = app.menuBars.menuBarItems["View"]
+        guard viewMenu.waitForExistence(timeout: 2) else { return false }
+        viewMenu.click()
+        return true
+    }
+}

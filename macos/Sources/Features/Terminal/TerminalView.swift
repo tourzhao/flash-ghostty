@@ -64,6 +64,14 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
         return URL(fileURLWithPath: surfacePwd)
     }
 
+    private var usesHiddenTitlebar: Bool {
+        if let controller = viewModel as? TerminalController {
+            return controller.windowPresentation.usesHiddenTitlebar
+        }
+
+        return ghostty.config.macosTitlebarStyle == .hidden
+    }
+
     var body: some View {
         switch ghostty.readiness {
         case .loading:
@@ -105,7 +113,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                                idealHeight: lastFocusedSurface?.value?.initialSize?.height)
                 }
                 // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
-                .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
+                .ignoresSafeArea(.container, edges: usesHiddenTitlebar ? .top : [])
 
                 if let surfaceView = lastFocusedSurface?.value {
                     TerminalCommandPaletteView(

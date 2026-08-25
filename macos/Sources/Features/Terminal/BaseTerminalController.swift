@@ -42,7 +42,16 @@ class BaseTerminalController: NSWindowController,
 
     /// The currently focused surface.
     var focusedSurface: Ghostty.SurfaceView? {
-        didSet { syncFocusToSurfaceTree() }
+        didSet {
+            if focusedSurface !== oldValue {
+                invalidateRestorableState()
+            }
+            syncFocusToSurfaceTree()
+            bindSessionMetadata(
+                to: focusedSurface,
+                preserving: oldValue
+            )
+        }
     }
 
     /// The tree of splits within this terminal window.
@@ -61,6 +70,21 @@ class BaseTerminalController: NSWindowController,
 
     /// True when any surface in this controller currently has an active bell.
     @Published private(set) var bell: Bool = false
+
+    /// The effective title shown for this terminal session. This mirrors the
+    /// window title after applying title overrides and bell decoration.
+    @Published private(set) var sessionTitle: String = "👻"
+
+    /// Session metadata has an independent lifecycle and provider layer. These
+    /// forwarding properties keep existing terminal/sidebar call sites small.
+    private let sessionMetadata = TerminalSessionMetadataMonitor()
+    private var sessionMetadataObservation: AnyCancellable?
+    var sessionDynamicTitle: String { sessionMetadata.dynamicTitle }
+    var sessionForegroundProcessName: String? { sessionMetadata.foregroundProcessName }
+    var sessionTool: TerminalSessionTool { sessionMetadata.tool }
+    var sessionActivityStatus: TerminalSessionActivityStatus { sessionMetadata.activityStatus }
+    var sessionLastInstruction: String? { sessionMetadata.lastInstruction }
+    var sessionWorkingDirectory: URL? { sessionMetadata.workingDirectory }
 
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
@@ -91,9 +115,6 @@ class BaseTerminalController: NSWindowController,
     /// Track whether background is forced opaque (true) or using config transparency (false)
     var isBackgroundOpaque: Bool = false
 
-    /// The cancellables related to our focused surface.
-    private var focusedSurfaceCancellables: Set<AnyCancellable> = []
-
     /// Cancellable for aggregating bell state across all surfaces in this controller.
     private var bellStateCancellable: AnyCancellable?
 
@@ -102,7 +123,7 @@ class BaseTerminalController: NSWindowController,
 
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
-    var titleOverride: String? {
+    @Published var titleOverride: String? = nil {
         didSet { applyTitleToWindow() }
     }
 
@@ -147,6 +168,11 @@ class BaseTerminalController: NSWindowController,
         self.derivedConfig = DerivedConfig(ghostty.config)
 
         super.init(window: nil)
+
+        // Relay nested metadata changes through the controller because existing
+        // SwiftUI terminal roots observe the controller itself.
+        sessionMetadataObservation = sessionMetadata.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
 
         // Initialize our initial surface.
         guard let ghostty_app = ghostty.app else { preconditionFailure("app must be loaded") }
@@ -321,13 +347,24 @@ class BaseTerminalController: NSWindowController,
         guard surfaceTree.contains(view) else { return }
 
         // Move focus to the target surface and activate the window/app
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             Ghostty.moveFocus(to: view)
-            view.window?.makeKeyAndOrderFront(nil)
+            _ = focusWindowForPresentation()
             if !NSApp.isActive {
                 NSApp.activate(ignoringOtherApps: true)
             }
         }
+    }
+
+    /// Brings this controller's window forward when an external action focuses
+    /// one of its surfaces. Subclasses with grouped presentation can override
+    /// this rather than treating a group member as a standalone window.
+    @discardableResult
+    func focusWindowForPresentation() -> Bool {
+        guard let window else { return false }
+        window.makeKeyAndOrderFront(nil)
+        return true
     }
 
     /// Called when the surfaceTree variable changed.
@@ -341,6 +378,14 @@ class BaseTerminalController: NSWindowController,
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
             focusedSurface = nil
+        } else {
+            // A split can leave the tree before AppKit/SwiftUI reports the next
+            // focus target. Revalidate the metadata source immediately so an
+            // inactive controller cannot keep publishing a removed surface.
+            bindSessionMetadata(
+                to: focusedSurface,
+                preserving: sessionMetadata.boundSurface
+            )
         }
         syncSurfaceTreeOcclusionState()
     }
@@ -433,7 +478,8 @@ class BaseTerminalController: NSWindowController,
         alert.alertStyle = .informational
 
         let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
-        textField.stringValue = titleOverride ?? window.title
+        let usesSessionSidebar = (self as? TerminalController)?.usesSessionSidebarTitlebar == true
+        textField.stringValue = titleOverride ?? (usesSessionSidebar ? "" : window.title)
         alert.accessoryView = textField
 
         alert.addButton(withTitle: "OK")
@@ -445,13 +491,20 @@ class BaseTerminalController: NSWindowController,
             guard let self else { return }
             guard response == .alertFirstButtonReturn else { return }
 
-            let newTitle = textField.stringValue
-            if newTitle.isEmpty {
-                self.titleOverride = nil
-            } else {
-                self.titleOverride = newTitle
-            }
+            self.updateTitleOverride(textField.stringValue)
         }
+    }
+
+    /// Set a user-defined tab title. Blank input restores the title provided
+    /// by the terminal process, and the normalized value participates in
+    /// normal macOS state restoration.
+    func updateTitleOverride(_ title: String?) {
+        let normalized = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newValue = normalized.flatMap { $0.isEmpty ? nil : $0 }
+        guard titleOverride != newValue else { return }
+
+        titleOverride = newValue
+        invalidateRestorableState()
     }
 
     /// Close a surface from a view.
@@ -749,7 +802,7 @@ class BaseTerminalController: NSWindowController,
 
         // Move focus to our window. Importantly this ensures that if we click the
         // reset zoom button in a tab bar of an unfocused tab that we become focused.
-        window?.makeKeyAndOrderFront(nil)
+        _ = focusWindowForPresentation()
 
         // Ensure focus stays on the target surface. We lose focus when we do
         // this so we need to grab it again.
@@ -795,7 +848,7 @@ class BaseTerminalController: NSWindowController,
         guard surfaceTree.contains(target) else { return }
 
         // Bring the window to front and focus the surface.
-        window?.makeKeyAndOrderFront(nil)
+        _ = focusWindowForPresentation()
 
         // We use a small delay to ensure this runs after any UI cleanup
         // (e.g., command palette restoring focus to its original surface).
@@ -875,28 +928,37 @@ class BaseTerminalController: NSWindowController,
     // MARK: TerminalViewDelegate
 
     func focusedSurfaceDidChange(to: Ghostty.SurfaceView?) {
-        let lastFocusedSurface = focusedSurface
         focusedSurface = to
+    }
 
-        // Important to cancel any prior subscriptions
-        focusedSurfaceCancellables = []
+    /// Follow the controller's logical focus rather than relying on SwiftUI's
+    /// transient FocusedValue callbacks. This also initializes metadata for
+    /// restored and background native tabs before they are first selected.
+    private func bindSessionMetadata(
+        to surface: Ghostty.SurfaceView?,
+        preserving previousSurface: Ghostty.SurfaceView?
+    ) {
+        sessionMetadata.bind(
+            to: surface,
+            preserving: previousSurface,
+            contains: { [weak self] in self?.surfaceTree.contains($0) == true },
+            titleDidChange: { [weak self] title, bell in
+                guard let self else { return }
+                titleDidChange(to: computeTitle(title: title, bell: bell))
+            }
+        )
+    }
 
-        // Setup our title listener. If we have a focused surface we always use that.
-        // Otherwise, we try to use our last focused surface. In either case, we only
-        // want to care if the surface is in the tree so we don't listen to titles of
-        // closed surfaces.
-        if let titleSurface = focusedSurface ?? lastFocusedSurface,
-           surfaceTree.contains(titleSurface) {
-            // If we have a surface, we want to listen for title changes.
-            titleSurface.$title
-                .combineLatest(titleSurface.$bell)
-                .map { [weak self] in self?.computeTitle(title: $0, bell: $1) ?? "" }
-                .sink { [weak self] in self?.titleDidChange(to: $0) }
-                .store(in: &focusedSurfaceCancellables)
-        } else {
-            // There is no surface to listen to titles for.
-            titleDidChange(to: "👻")
-        }
+    func refreshSessionForegroundProcessName() {
+        sessionMetadata.refresh()
+    }
+
+    func startSessionMetadataRefreshMonitoring() {
+        TerminalSessionMetadataRefreshScheduler.shared.register(sessionMetadata)
+    }
+
+    func stopSessionMetadataRefreshMonitoring() {
+        TerminalSessionMetadataRefreshScheduler.shared.unregister(sessionMetadata)
     }
 
     private func computeTitle(title: String, bell: Bool) -> String {
@@ -916,14 +978,27 @@ class BaseTerminalController: NSWindowController,
     private func applyTitleToWindow() {
         guard let window else { return }
 
+        let regularTitle: String
         if let titleOverride {
-            window.title = computeTitle(
+            regularTitle = computeTitle(
                 title: titleOverride,
                 bell: focusedSurface?.bell ?? false)
-            return
+        } else {
+            regularTitle = lastComputedTitle
         }
 
-        window.title = lastComputedTitle
+        // The sidebar is the source of truth for individual session names,
+        // so the shared native window title identifies the application.
+        // Dynamic PTY titles remain available for agent detection.
+        let usesSessionSidebar = (self as? TerminalController)?.usesSessionSidebarTitlebar == true
+        let title = TerminalSessionName.windowTitle(
+            isSidebar: usesSessionSidebar,
+            regularTitle: regularTitle)
+
+        window.title = title
+        if sessionTitle != title {
+            sessionTitle = title
+        }
     }
 
     func pwdDidChange(to: URL?) {
@@ -932,6 +1007,21 @@ class BaseTerminalController: NSWindowController,
         if derivedConfig.macosTitlebarProxyIcon == .visible {
             // Use the 'to' URL directly
             window.representedURL = to
+
+            // In sidebar mode the titlebar identifies the application rather
+            // than the current directory, so pair its fixed title with the
+            // active Ghostty application icon. Keep representedURL pointed at
+            // the directory so the native proxy menu and drag behavior work.
+            if to != nil,
+               let controller = self as? TerminalController,
+               controller.usesSessionSidebarTitlebar,
+               let icon = NSRunningApplication.current.icon ??
+                   NSApp.applicationIconImage ??
+                   NSImage(named: "AppIconImage"),
+               let button = window.standardWindowButton(.documentIconButton) {
+                button.image = icon
+                button.imageScaling = .scaleProportionallyDown
+            }
         } else {
             window.representedURL = nil
         }
@@ -1159,6 +1249,10 @@ class BaseTerminalController: NSWindowController,
 
         // Everything beyond here is setting up the window
         guard let window else { return }
+
+        // Capture titles assigned while the window was loading, such as the
+        // configured static title, before surface updates begin arriving.
+        sessionTitle = window.title
 
         // We always initialize our fullscreen style to native if we can because
         // initialization sets up some state (i.e. observers). If its set already

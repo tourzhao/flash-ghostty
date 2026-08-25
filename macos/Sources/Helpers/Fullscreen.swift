@@ -248,6 +248,7 @@ class NonNativeFullscreen: FullscreenBase, FullscreenStyle {
     func exit() {
         guard isFullscreen else { return }
         guard let savedState else { return }
+        var restoredTabGroup: NSWindowTabGroup?
 
         // Remove all our notifications. We remove them one by one because
         // we don't want to remove the observers that our superclass sets.
@@ -292,17 +293,36 @@ class NonNativeFullscreen: FullscreenBase, FullscreenStyle {
         // fullscreen removes the window from the tab group.
         if let tabGroup = savedState.tabGroup,
            let tabIndex = savedState.tabGroupIndex,
-            !tabGroup.windows.isEmpty {
+           !tabGroup.windows.isEmpty {
+            let attachReportedSuccess: Bool
             if tabIndex == 0 {
                 // We were previously the first tab. Add it before ("below")
                 // the first window in the tab group currently.
-                tabGroup.windows.first!.addTabbedWindowSafely(window, ordered: .below)
+                attachReportedSuccess = tabGroup.windows.first!
+                    .addTabbedWindowSafely(window, ordered: .below)
             } else if tabIndex <= tabGroup.windows.count {
                 // We were somewhere in the middle
-                tabGroup.windows[tabIndex - 1].addTabbedWindowSafely(window, ordered: .above)
+                attachReportedSuccess = tabGroup.windows[tabIndex - 1]
+                    .addTabbedWindowSafely(window, ordered: .above)
             } else {
                 // We were at the end
-                tabGroup.windows.last!.addTabbedWindowSafely(window, ordered: .below)
+                attachReportedSuccess = tabGroup.windows.last!
+                    .addTabbedWindowSafely(window, ordered: .below)
+            }
+
+            let attachmentSucceeded = attachReportedSuccess &&
+                tabGroup.windows.contains(where: { $0 === window })
+            if attachmentSucceeded {
+                restoredTabGroup = tabGroup
+            } else {
+                // An exception can occur after AppKit has partially inserted
+                // the window. Remove that partial membership before splitting
+                // the logical workspace so native and application state agree.
+                if tabGroup.windows.contains(where: { $0 === window }) {
+                    tabGroup.removeWindow(window)
+                }
+                (window.windowController as? TerminalController)?
+                    .nativeTabAttachmentDidFail()
             }
         }
 
@@ -314,7 +334,14 @@ class NonNativeFullscreen: FullscreenBase, FullscreenStyle {
         self.savedState = nil
 
         // Focus window
-        window.makeKeyAndOrderFront(nil)
+        if let controller = window.windowController as? TerminalController {
+            _ = controller.focusSessionWindowSafely(
+                window,
+                in: restoredTabGroup
+            )
+        } else {
+            window.makeKeyAndOrderFront(nil)
+        }
 
         // Notify the delegate
         NotificationCenter.default.post(name: .fullscreenDidExit, object: self)

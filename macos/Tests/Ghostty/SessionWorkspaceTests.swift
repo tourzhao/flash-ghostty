@@ -6,6 +6,29 @@ import Testing
 struct SessionWorkspaceTests {
     typealias SessionID = SessionWorkspace.SessionID
 
+    @Test func newTabsInheritImmutableParentWindowPresentation() {
+        let sidebar = TerminalWindowPresentation(
+            windowDecorations: true,
+            titlebarStyle: .sidebar
+        )
+        let hidden = TerminalWindowPresentation(
+            windowDecorations: true,
+            titlebarStyle: .hidden
+        )
+
+        #expect(sidebar.usesSessionSidebar)
+        #expect(!sidebar.usesHiddenTitlebar)
+        #expect(hidden.usesHiddenTitlebar)
+        #expect(
+            TerminalWindowPresentation.inheritedForNewTab(from: sidebar) == sidebar
+        )
+        #expect(
+            TerminalWindowPresentation.inheritedForNewTab(from: hidden) == hidden
+        )
+        #expect(sidebar.canShareNativeTabGroup(with: sidebar))
+        #expect(!sidebar.canShareNativeTabGroup(with: hidden))
+    }
+
     @Test func initializationNormalizesMembershipAndSelection() {
         let first = SessionID()
         let second = SessionID()

@@ -1809,13 +1809,12 @@ extension Ghostty {
 
             case GHOSTTY_TARGET_SURFACE:
                 guard let title = String(cString: v.title!, encoding: .utf8) else { return false }
-                let titleOverride = title.isEmpty ? nil : title
                 guard let surface = target.target.surface else { return false }
                 guard let surfaceView = self.surfaceView(from: surface) else { return false }
                 guard let window = surfaceView.window,
                       let controller = window.windowController as? BaseTerminalController
                 else { return false }
-                controller.titleOverride = titleOverride
+                controller.updateTitleOverride(title)
                 return true
 
             default:
@@ -2195,11 +2194,11 @@ extension Ghostty {
 
                 let progressReport = Ghostty.Action.ProgressReport(c: v)
                 DispatchQueue.main.async {
-                    if progressReport.state == .remove {
-                        surfaceView.progressReport = nil
-                    } else {
-                        surfaceView.progressReport = progressReport
-                    }
+                    // Preserve the explicit remove event long enough for
+                    // observers such as the session sidebar to latch a
+                    // completed state. SurfaceView already suppresses the
+                    // progress bar for `.remove` and clears reports on a timer.
+                    surfaceView.progressReport = progressReport
                 }
 
             default:

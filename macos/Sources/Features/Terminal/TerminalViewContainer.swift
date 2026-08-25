@@ -23,7 +23,8 @@ class TerminalViewContainer: NSView {
     }
 
     init<Root: View>(@ViewBuilder rootView: () -> Root) {
-        self.terminalView = NSHostingView(rootView: rootView())
+        let hostingView = NSHostingView(rootView: rootView())
+        self.terminalView = hostingView
         super.init(frame: .zero)
         setup()
     }
