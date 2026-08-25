@@ -1,0 +1,97 @@
+name: Weekly Upstream Merge Check
+
+on:
+  schedule:
+    - cron: "23 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-check
+  cancel-in-progress: true
+
+jobs:
+  merge-and-build:
+    if: github.repository == 'tourzhao/flash-ghostty'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      XCODE_XCCONFIG_FILE: ${{ github.workspace }}/macos/Configurations/FlashGhostty.Debug.xcconfig
+    steps:
+      - name: Checkout fork main without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load product manifest
+        run: |
+          set -a
+          source flash/product.env
+          set +a
+          env | grep '^FLASH_GHOSTTY_' >> "$GITHUB_ENV"
+
+      - name: Fetch and merge upstream in the disposable runner
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$FLASH_GHOSTTY_UPSTREAM_URL"
+          git fetch --no-tags upstream "$FLASH_GHOSTTY_UPSTREAM_BRANCH"
+          git config user.name flash-ghostty-upstream-check
+          git config user.email actions@users.noreply.github.com
+          git merge --no-commit --no-ff "upstream/$FLASH_GHOSTTY_UPSTREAM_BRANCH"
+
+          {
+            echo "### Weekly upstream merge check"
+            echo "- Fork: \`$(git rev-parse --short HEAD)\`"
+            echo "- Upstream: \`$(git rev-parse --short "upstream/$FLASH_GHOSTTY_UPSTREAM_BRANCH")\`"
+            echo "- Merge: clean"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify fork product overlay
+        run: flash/verify-product-overlay.sh
+
+      - name: Ensure official workflows contain no fork release logic
+        run: |
+          if grep -En 'FLASH-Ghostty|flash-ghostty|com\.flashghostty' \
+            .github/workflows/release-tag.yml \
+            .github/workflows/release-tip.yml \
+            .github/workflows/publish-tag.yml; then
+            echo "fork release logic leaked into an upstream workflow" >&2
+            exit 1
+          fi
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+
+      - name: Test fork-specific Zig behavior
+        run: zig build test -Dtest-filter=FLASH-Ghostty
+
+      - name: Build GhosttyKit after merge
+        run: zig build -Demit-macos-app=false
+
+      - name: Install Nushell
+        run: brew install nushell
+
+      - name: Build macOS app after merge
+        run: |
+          macos/build.nu \
+            --configuration Debug \
+            --xcconfig "$XCODE_XCCONFIG_FILE" \
+            --action build
+
+      - name: Verify app identity
+        run: |
+          plist="macos/build/Debug/$FLASH_GHOSTTY_APP_BUNDLE/Contents/Info.plist"
+          test "$(defaults read "$PWD/$plist" CFBundleIdentifier)" = "$FLASH_GHOSTTY_DEBUG_BUNDLE_ID"
+          test "$(defaults read "$PWD/$plist" CFBundleDisplayName)" = "$FLASH_GHOSTTY_DISPLAY_NAME"
+
+# This workflow never commits, pushes, opens a PR, or writes repository
+# contents. A clean result is a signal to perform a small reviewed sync.
