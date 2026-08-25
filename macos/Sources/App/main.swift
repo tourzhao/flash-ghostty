@@ -2,6 +2,11 @@ import AppKit
 import Cocoa
 import GhosttyKit
 
+// A `-e` process is a one-shot command window, not a replacement interactive
+// workspace. Install this before AppKit initializes so it neither consumes nor
+// rewrites the previous launch's Saved Application State archive.
+CommandLinePersistencePolicy.installIfNeeded(arguments: CommandLine.arguments)
+
 // Initialize Ghostty global state. We do this once right away because the
 // CLI APIs require it and it lets us ensure it is done immediately for the
 // rest of the app.
@@ -13,7 +18,8 @@ if ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) != GHOSTTY_SUCCE
     case .cli, .zig_run:
         let stderrHandle = FileHandle.standardError
         stderrHandle.write(
-            "Ghostty failed to initialize! If you're executing Ghostty from the command line\n" +
+            "\(FlashGhosttyProductProfile.displayName) failed to initialize! " +
+            "If you're executing \(FlashGhosttyProductProfile.displayName) from the command line\n" +
             "then this is usually because an invalid action or multiple actions were specified.\n" +
             "Actions start with the `+` character.\n\n" +
             "View all available actions by running `ghostty +help`.\n")
