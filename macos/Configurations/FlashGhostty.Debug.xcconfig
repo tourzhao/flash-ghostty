@@ -1,0 +1,3 @@
+#include "FlashGhostty.Shared.xcconfig"
+
+FLASH_GHOSTTY_APP_BUNDLE_IDENTIFIER = com.flashghostty.app.debug

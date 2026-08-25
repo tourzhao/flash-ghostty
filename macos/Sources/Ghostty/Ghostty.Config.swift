@@ -64,6 +64,13 @@ extension Ghostty {
                 return nil
             }
 
+            // Fork-only product defaults are an overlay, not shared Ghostty
+            // defaults. Load them first so explicit user settings below win.
+            guard FlashGhosttyDefaultConfig.load(into: cfg) else {
+                ghostty_config_free(cfg)
+                return nil
+            }
+
             // Load our configuration from files, CLI args, and then any referenced files.
             if let path {
                 ghostty_config_load_file(cfg, path)
@@ -912,7 +919,7 @@ extension Ghostty.Config {
 
     enum MacOSTitlebarStyle: String {
         static let `default` = MacOSTitlebarStyle.transparent
-        case native, transparent, tabs, hidden
+        case native, transparent, tabs, sidebar, hidden
     }
 
     enum DragHandle: String {

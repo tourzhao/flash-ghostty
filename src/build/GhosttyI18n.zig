@@ -6,7 +6,14 @@ const Config = @import("Config.zig");
 const gresource = @import("../apprt/gtk/build/gresource.zig");
 const locales = @import("../os/i18n_locales.zig").locales;
 
-const domain = "com.mitchellh.ghostty";
+/// Runtime gettext domain. This must match `build_config.bundle_id` so the
+/// FLASH application never shares a catalog namespace with official Ghostty.
+const flash_runtime_domain = "com.flashghostty.app";
+const upstream_runtime_domain = "com.mitchellh.ghostty";
+
+/// Keep the source catalog filename stable for translators; this is a
+/// repository artifact rather than a runtime product namespace.
+const source_domain = "com.mitchellh.ghostty";
 
 owner: *std.Build,
 steps: []*std.Build.Step,
@@ -16,7 +23,10 @@ steps: []*std.Build.Step,
 update_step: *std.Build.Step,
 
 pub fn init(b: *std.Build, cfg: *const Config) !GhosttyI18n {
-    _ = cfg;
+    const runtime_domain = if (cfg.target.result.os.tag == .macos)
+        flash_runtime_domain
+    else
+        upstream_runtime_domain;
 
     var steps: std.ArrayList(*std.Build.Step) = .empty;
     defer steps.deinit(b.allocator);
@@ -35,9 +45,9 @@ pub fn init(b: *std.Build, cfg: *const Config) !GhosttyI18n {
 
         try steps.append(b.allocator, &b.addInstallFile(
             msgfmt.captureStdOut(.{}),
-            std.fmt.comptimePrint(
+            b.fmt(
                 "share/locale/{s}/LC_MESSAGES/{s}.mo",
-                .{ target_locale, domain },
+                .{ target_locale, runtime_domain },
             ),
         ).step);
     }
@@ -173,7 +183,7 @@ fn createUpdateStep(b: *std.Build) !*std.Build.Step {
     const xgettext_merge = b.addSystemCommand(&.{
         "xgettext",
         "--add-comments=Translators",
-        "--package-name=" ++ domain,
+        "--package-name=" ++ source_domain,
         "--msgid-bugs-address=m@mitchellh.com",
         "--copyright-holder=\"Mitchell Hashimoto, Ghostty contributors\"",
         "-o",
@@ -186,7 +196,7 @@ fn createUpdateStep(b: *std.Build) !*std.Build.Step {
     const usf = b.addUpdateSourceFiles();
     usf.addCopyFileToSource(
         xgettext_merge.captureStdOut(.{}),
-        "po/" ++ domain ++ ".pot",
+        "po/" ++ source_domain ++ ".pot",
     );
 
     inline for (locales) |locale| {

@@ -4,6 +4,14 @@ const Allocator = std.mem.Allocator;
 const internal_os = @import("../os/main.zig");
 const cli = @import("../cli.zig");
 const global = @import("../global.zig");
+const build_config = @import("../build_config.zig");
+
+fn userThemeSubdir(alloc: Allocator) ![]const u8 {
+    return std.fs.path.join(alloc, &.{
+        build_config.filesystem_namespace,
+        "themes",
+    });
+}
 
 /// Location of possible themes. The order of this enum matters because it
 /// defines the priority of theme search (from top to bottom).
@@ -28,9 +36,8 @@ pub const Location = enum {
         defer environ_map.deinit();
         return switch (self) {
             .user => user: {
-                const subdir = std.fs.path.join(arena_alloc, &.{
-                    "ghostty", "themes",
-                }) catch return error.OutOfMemory;
+                const subdir = userThemeSubdir(arena_alloc) catch
+                    return error.OutOfMemory;
 
                 break :user internal_os.xdg.config(
                     global.io(),
@@ -65,6 +72,27 @@ pub const Location = enum {
         };
     }
 };
+
+test "user theme directory uses the product filesystem namespace" {
+    const testing = std.testing;
+    const subdir = try userThemeSubdir(testing.allocator);
+    defer testing.allocator.free(subdir);
+
+    const expected_namespace = if (builtin.os.tag == .macos)
+        "flash-ghostty"
+    else
+        "ghostty";
+    const expected = try std.fs.path.join(testing.allocator, &.{
+        expected_namespace,
+        "themes",
+    });
+    defer testing.allocator.free(expected);
+
+    try testing.expectEqualStrings(expected, subdir);
+    if (builtin.os.tag == .macos) {
+        try testing.expect(!std.mem.eql(u8, subdir, "ghostty/themes"));
+    }
+}
 
 /// An iterator that returns all possible directories for finding themes in
 /// order of priority.

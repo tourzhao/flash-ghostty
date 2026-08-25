@@ -90,15 +90,32 @@ struct ConfigTests {
 
     // MARK: - Enum Properties
 
-    @Test func macosTitlebarStyleDefaultsToTransparent() throws {
+    @Test func macosTitlebarStyleDefaultsToSidebar() throws {
         let config = try TemporaryConfig("")
+        #expect(config.macosTitlebarStyle == .sidebar)
+    }
+
+    @Test func flashWindowSaveStateDefaultsToAlways() throws {
+        let config = try TemporaryConfig("")
+        #expect(config.windowSaveState == "always")
+    }
+
+    @Test func userConfigOverridesFlashDefaults() throws {
+        let config = try TemporaryConfig("""
+        macos-titlebar-style = transparent
+        window-save-state = never
+        macos-custom-icon = ~/.config/custom-terminal.icns
+        """)
         #expect(config.macosTitlebarStyle == .transparent)
+        #expect(config.windowSaveState == "never")
+        #expect(config.macosCustomIcon.hasSuffix("/.config/custom-terminal.icns"))
     }
 
     @Test(arguments: [
         ("native", Ghostty.Config.MacOSTitlebarStyle.native),
         ("transparent", Ghostty.Config.MacOSTitlebarStyle.transparent),
         ("tabs", Ghostty.Config.MacOSTitlebarStyle.tabs),
+        ("sidebar", Ghostty.Config.MacOSTitlebarStyle.sidebar),
         ("hidden", Ghostty.Config.MacOSTitlebarStyle.hidden),
     ])
     func macosTitlebarStyleValues(raw: String, expected: Ghostty.Config.MacOSTitlebarStyle) throws {
@@ -129,6 +146,16 @@ struct ConfigTests {
     @Test func macosIconDefaultsToOfficial() throws {
         let config = try TemporaryConfig("")
         #expect(config.macosIcon == .official)
+    }
+
+    @Test func macosCustomIconDefaultUsesFlashFilesystemNamespace() throws {
+        let config = try TemporaryConfig("")
+        #expect(
+            config.macosCustomIcon.hasSuffix(
+                "/.config/flash-ghostty/FLASH-Ghostty.icns"
+            )
+        )
+        #expect(!config.macosCustomIcon.contains("/.config/ghostty/"))
     }
 
     @Test func macosIconFrameDefaultsToAluminum() throws {

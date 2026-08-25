@@ -16,6 +16,11 @@ class UpdateController {
         userDriver.viewModel
     }
 
+    var updatesEnabled: Bool {
+        FlashGhosttyProductProfile.supportsSparkleUpdates &&
+            FlashGhosttyProductProfile.sparkleFeedURL != nil
+    }
+
     /// True if we're installing an update triggered manually.
     var shouldTerminateWithoutWarning: Bool {
         viewModel.state.shouldTerminateWithoutWarning
@@ -40,6 +45,12 @@ class UpdateController {
     /// This must be called before the updater can check for updates. If starting fails,
     /// the error will be shown to the user.
     func startUpdater() {
+        guard updatesEnabled else {
+            updater.automaticallyChecksForUpdates = false
+            updater.automaticallyDownloadsUpdates = false
+            return
+        }
+
         do {
             try updater.start()
         } catch {
@@ -60,6 +71,8 @@ class UpdateController {
     ///
     /// This is typically connected to a menu item action.
     func checkForUpdates() {
+        guard updatesEnabled else { return }
+
         // If we're already idle, then just check for updates immediately.
         if viewModel.state == .idle {
             updater.checkForUpdates()

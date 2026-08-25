@@ -186,16 +186,13 @@ fn initThread(gpa: Allocator, environ_map_: std.process.Environ.Map) !void {
 }
 
 fn cacheDir(io: std.Io, alloc: Allocator, environ_map: *const std.process.Environ.Map) ![]const u8 {
-    // On macOS, we prefer to use the NSCachesDirectory value to be
-    // a more idiomatic macOS application. But if XDG env vars are set
-    // we will respect them.
-    if (comptime builtin.os.tag == .macos) macos: {
-        const xdg_cache_home = environ_map.get("XDG_CACHE_HOME") orelse break :macos;
-        if (xdg_cache_home.len > 0) {
-            return try internal_os.macos.cacheDir(
-                alloc,
-                "sentry",
-            );
+    // macOS defaults to its product-scoped NSCachesDirectory. An explicit,
+    // non-empty XDG_CACHE_HOME remains supported, but the subdirectory is
+    // still namespaced so it cannot share official Ghostty's Sentry database.
+    if (comptime builtin.os.tag == .macos) {
+        const xdg_cache_home = environ_map.get("XDG_CACHE_HOME");
+        if (xdg_cache_home == null or xdg_cache_home.?.len == 0) {
+            return try internal_os.macos.cacheDir(alloc, "sentry");
         }
     }
 
@@ -203,8 +200,51 @@ fn cacheDir(io: std.Io, alloc: Allocator, environ_map: *const std.process.Enviro
         io,
         alloc,
         environ_map,
-        .{ .subdir = "ghostty/sentry" },
+        .{ .subdir = build_config.filesystem_namespace ++ "/sentry" },
     );
+}
+
+test "Sentry cache uses the product filesystem namespace" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var environ_map: std.process.Environ.Map = .init(alloc);
+    defer environ_map.deinit();
+    var single_threaded: std.Io.Threaded = .init_single_threaded;
+    defer single_threaded.deinit();
+
+    if (builtin.os.tag == .macos) {
+        const platform_path = try cacheDir(
+            single_threaded.io(),
+            alloc,
+            &environ_map,
+        );
+        defer alloc.free(platform_path);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            platform_path,
+            "com.flashghostty.app/sentry",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            platform_path,
+            "com.mitchellh.ghostty",
+        ) == null);
+    }
+
+    try environ_map.put("XDG_CACHE_HOME", "/private/tmp/flash-sentry-cache-test");
+    const xdg_path = try cacheDir(
+        single_threaded.io(),
+        alloc,
+        &environ_map,
+    );
+    defer alloc.free(xdg_path);
+
+    const expected_namespace = if (builtin.os.tag == .macos)
+        "/flash-ghostty/sentry"
+    else
+        "/ghostty/sentry";
+    try testing.expect(std.mem.endsWith(u8, xdg_path, expected_namespace));
 }
 
 /// Process-wide deinitialization of our Sentry client. This ensures all

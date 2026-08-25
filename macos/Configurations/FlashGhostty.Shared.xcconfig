@@ -1,0 +1,11 @@
+// Fork-only Xcode build settings. The upstream project refers only to the
+// FLASH_GHOSTTY_* indirection points; product identity lives here.
+FLASH_GHOSTTY_APP_DISPLAY_NAME = FLASH-Ghostty
+FLASH_GHOSTTY_APP_BUNDLE_IDENTIFIER = com.flashghostty.app
+FLASH_GHOSTTY_FILESYSTEM_NAMESPACE = flash-ghostty
+FLASH_GHOSTTY_MAIN_NIB = FlashMainMenu
+FLASH_GHOSTTY_UPDATE_ENABLED = NO
+
+// Release publishing is intentionally fail-closed until FLASH-Ghostty owns
+// an update feed and signing key. Do not set SUFeedURL or SUPublicEDKey here.
+INFOPLIST_KEY_SUEnableAutomaticChecks = NO
