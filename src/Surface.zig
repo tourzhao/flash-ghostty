@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const global = @import("global.zig");
 const oni = @import("oniguruma");
+const simd = @import("simd/main.zig");
 const crash = @import("crash/main.zig");
 const unicode = @import("unicode/main.zig");
 const rendererpkg = @import("renderer.zig");
@@ -2194,34 +2195,18 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
         return;
     }
 
-    const dec = std.base64.standard.Decoder;
-
-    // Build buffer
-    const size = dec.calcSizeForSlice(data) catch |err| switch (err) {
-        error.InvalidPadding => {
-            log.info("application sent invalid base64 data for OSC 52", .{});
-            return;
-        },
-
-        // Should not be reachable but don't want to risk it.
-        else => return,
-    };
-    var buf = try self.alloc.allocSentinel(u8, size, 0);
+    // Decode with the SIMD decoder, strict per the Kitty clipboard
+    // spec that also governs OSC 52 base64 handling: a request with
+    // characters outside the base64 alphabet is discarded entirely
+    // (never partially decoded), while a missing-padding tail is
+    // tolerated since OSC 52 has no way to report errors.
+    var buf = try self.alloc.allocSentinel(u8, simd.base64.maxLen(data), 0);
     defer self.alloc.free(buf);
-    buf[buf.len] = 0;
-
-    // Decode
-    dec.decode(buf, data) catch |err| switch (err) {
-        // Ignore this. It is possible to actually have valid data and
-        // get this error, so we allow it.
-        error.InvalidPadding => {},
-
-        else => {
-            log.info("application sent invalid base64 data for OSC 52", .{});
-            return;
-        },
+    const decoded = simd.base64.decodeStrict(data, buf, .optional) catch {
+        log.info("application sent invalid base64 data for OSC 52", .{});
+        return;
     };
-    assert(buf[buf.len] == 0);
+    buf[decoded.len] = 0;
 
     // When clipboard-write is "ask" a prompt is displayed to the user asking
     // them to confirm the clipboard access. Each app runtime handles this
@@ -2229,7 +2214,7 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     const confirm = self.config.clipboard_write == .ask;
     self.rt_surface.setClipboard(loc, &.{.{
         .mime = "text/plain",
-        .data = buf,
+        .data = buf[0..decoded.len :0],
     }}, confirm) catch |err| {
         log.err("error setting clipboard string err={}", .{err});
         return;
