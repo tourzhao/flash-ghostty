@@ -73,6 +73,21 @@ extension NSWindowController {
     }
 }
 
+extension NSWindowTabGroup {
+    /// Selects a native tab through an Objective-C exception boundary. AppKit
+    /// can throw while a window stack is transitioning between tab groups.
+    @discardableResult
+    func selectWindowSafely(_ window: NSWindow) -> Bool {
+        var error: NSError?
+        let success = GhosttySelectTabWindowSafely(self, window, &error)
+        if let error {
+            Ghostty.logger.error("select tab failed: \(error.localizedDescription, privacy: .public)")
+        }
+
+        return success
+    }
+}
+
 /// Native tabbing private API usage. :(
 extension NSWindow {
     var titlebarView: NSView? {
