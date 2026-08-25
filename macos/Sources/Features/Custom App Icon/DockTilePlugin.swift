@@ -7,13 +7,11 @@ class DockTilePlugin: NSObject, NSDockTilePlugIn {
 
     private let pluginBundle = Bundle(for: DockTilePlugin.self)
 
-    // Separate defaults based on debug vs release builds so we can test icons
-    // without messing up releases.
-    #if DEBUG
-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty.debug")
-    #else
-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty")
-    #endif
+    // Read the host app's product-scoped defaults domain. The shared profile
+    // derives it from this plugin's bundle identifier.
+    private let ghosttyUserDefaults = UserDefaults(
+        suiteName: FlashGhosttyProductProfile.defaultsSuiteIdentifier
+    )
 
     private var iconChangeObserver: Any?
 

@@ -3,6 +3,7 @@ const fs = std.fs;
 const Allocator = std.mem.Allocator;
 const args = @import("args.zig");
 const global = @import("../global.zig");
+const build_config = @import("../build_config.zig");
 const Action = @import("ghostty.zig").Action;
 const Duration = @import("../config.zig").Config.Duration;
 const terminfopkg = @import("../terminfo/main.zig");
@@ -136,7 +137,10 @@ pub fn run(alloc_gpa: Allocator) !u8 {
     }
 
     // Setup our disk cache to the standard location
-    const cache_path = DiskCache.defaultPath(alloc, "ghostty") catch |err| {
+    const cache_path = DiskCache.defaultPath(
+        alloc,
+        build_config.filesystem_namespace,
+    ) catch |err| {
         try stderr.print(
             "Error: unable to determine the cache path: {t}\n",
             .{err},
