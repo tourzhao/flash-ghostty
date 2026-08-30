@@ -431,6 +431,16 @@ limits: Limits,
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
 
+/// Monotonic identity for the content addressed by absolute scrollbar rows.
+/// This advances when an operation can make an existing absolute row refer to
+/// different content, such as pruning the oldest history or resetting the
+/// page list. Appending new rows does not change this value because all
+/// existing absolute row identities remain stable.
+///
+/// Like page_serial, wrapping this in practice would take longer than the
+/// useful lifetime of the process, so no special overflow behavior is needed.
+content_generation: u64,
+
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
 
@@ -653,6 +663,7 @@ pub fn init(
         .page_size = page_size,
         .limits = limits,
         .total_rows = rows,
+        .content_generation = 0,
         .tracked_pins = tracked_pins,
         .viewport = .{ .active = {} },
         .viewport_pin = viewport_pin,
@@ -937,6 +948,10 @@ pub fn deinit(self: *PageList) void {
 pub fn reset(self: *PageList) void {
     defer self.assertIntegrity();
 
+    // Every absolute row now identifies freshly initialized content, even if
+    // the scrollbar geometry before and after the reset happens to match.
+    self.advanceContentGeneration();
+
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
 
@@ -1206,6 +1221,7 @@ pub fn clone(
         .cols = self.cols,
         .rows = self.rows,
         .total_rows = total_rows,
+        .content_generation = self.content_generation,
         .tracked_pins = tracked_pins,
         .viewport = .{ .active = {} },
         .viewport_pin = viewport_pin,
@@ -1267,6 +1283,19 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+
+    // A column reflow rebuilds physical rows, so an old absolute scrollbar
+    // offset may identify different content afterward even when the total row
+    // count happens to stay the same. Coalesce this with any prefix pruning
+    // performed by grow/limit enforcement during the same resize.
+    const old_cols = self.cols;
+    const old_content_generation = self.content_generation;
+    defer if (opts.reflow and
+        self.cols != old_cols and
+        self.content_generation == old_content_generation)
+    {
+        self.advanceContentGeneration();
+    };
 
     // Resizing forces all nodes to be decompressed today so we need to
     // reschedule compression.
@@ -3610,6 +3639,13 @@ pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
     self.page_serial += 1;
 }
 
+/// Advance the identity of absolute scrollbar rows after retained content can
+/// move to a different row offset. A single logical operation should call this
+/// once even if it removes multiple pages.
+fn advanceContentGeneration(self: *PageList) void {
+    self.content_generation +%= 1;
+}
+
 /// Compact a page to use the minimum required memory for the contents
 /// it stores. Returns the new node pointer if compaction occurred, or null
 /// if the page was already compact or compaction would not provide any
@@ -3794,19 +3830,39 @@ pub const Scrollbar = struct {
     /// The length of the visible area. This is including the offset row.
     len: usize,
 
+    /// Monotonic identity for content addressed by absolute row offsets.
+    /// A changed value means a previously saved offset may now refer to
+    /// different content even when total, offset, and len are unchanged.
+    content_generation: u64 = 0,
+
+    /// Identity of the screen storage that owns this history. PageList leaves
+    /// this at zero; Terminal fills it before exposing scrollbar state so
+    /// primary/alternate screens and replaced alternate storage cannot alias.
+    screen_identity: u64 = 0,
+
     /// A zero-sized scrollable region.
     pub const zero: Scrollbar = .{
         .total = 0,
         .offset = 0,
         .len = 0,
+        .content_generation = 0,
+        .screen_identity = 0,
     };
 
-    // Sync with: ghostty_action_scrollbar_s
+    // Sync with: ghostty_action_scrollbar_s. Keep this payload geometry-only:
+    // it is embedded by value in the stable application-action union.
     pub const C = extern struct {
         total: u64,
         offset: u64,
         len: u64,
     };
+
+    comptime {
+        assert(@sizeOf(C) == 24);
+        assert(@offsetOf(C, "total") == 0);
+        assert(@offsetOf(C, "offset") == 8);
+        assert(@offsetOf(C, "len") == 16);
+    }
 
     pub fn cval(self: Scrollbar) C {
         return .{
@@ -3816,11 +3872,43 @@ pub const Scrollbar = struct {
         };
     }
 
+    /// Full coherent state for the additive surface snapshot API. Keeping this
+    /// separate from `C` prevents history identity from growing the by-value
+    /// application-action ABI.
+    pub const SnapshotC = extern struct {
+        total: u64,
+        offset: u64,
+        len: u64,
+        content_generation: u64,
+        screen_identity: u64,
+    };
+
+    comptime {
+        assert(@sizeOf(SnapshotC) == 40);
+        assert(@offsetOf(SnapshotC, "total") == 0);
+        assert(@offsetOf(SnapshotC, "offset") == 8);
+        assert(@offsetOf(SnapshotC, "len") == 16);
+        assert(@offsetOf(SnapshotC, "content_generation") == 24);
+        assert(@offsetOf(SnapshotC, "screen_identity") == 32);
+    }
+
+    pub fn snapshotCval(self: Scrollbar) SnapshotC {
+        return .{
+            .total = @intCast(self.total),
+            .offset = @intCast(self.offset),
+            .len = @intCast(self.len),
+            .content_generation = self.content_generation,
+            .screen_identity = self.screen_identity,
+        };
+    }
+
     /// Comparison for scrollbars.
     pub fn eql(self: Scrollbar, other: Scrollbar) bool {
         return self.total == other.total and
             self.offset == other.offset and
-            self.len == other.len;
+            self.len == other.len and
+            self.content_generation == other.content_generation and
+            self.screen_identity == other.screen_identity;
     }
 };
 
@@ -3841,12 +3929,14 @@ pub fn scrollbar(self: *PageList) Scrollbar {
         .total = self.rows,
         .offset = 0,
         .len = self.rows,
+        .content_generation = self.content_generation,
     };
 
     return .{
         .total = self.total_rows,
         .offset = self.viewportRowOffset(),
         .len = self.rows, // Length is always rows
+        .content_generation = self.content_generation,
     };
 }
 
@@ -3975,6 +4065,16 @@ pub fn setMaxLines(self: *PageList, max: ?usize) void {
 pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     defer self.assertIntegrity();
 
+    // Byte and line limits can both prune history in the same grow. Treat
+    // their combined prefix removal as one content identity transition.
+    const old_content_generation = self.content_generation;
+    var removed_prefix = false;
+    defer if (removed_prefix and
+        self.content_generation == old_content_generation)
+    {
+        self.advanceContentGeneration();
+    };
+
     // Growing can move a complete page behind the active boundary.
     self.page_compression.markActivity();
 
@@ -4032,6 +4132,11 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             self.total_rows += first.rows();
             break :prune;
         }
+
+        // Every retained row below the removed prefix now has a different
+        // absolute scrollbar offset. Defer the generation change so line-limit
+        // enforcement below can coalesce with this byte-limit removal.
+        removed_prefix = true;
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4465,6 +4570,12 @@ pub const PageAllocation = struct {
             }
         }
         destination.page_compression.markActivity();
+
+        // Inserting rows above the old first row changes every existing
+        // absolute scrollbar offset. This is especially important for
+        // incremental snapshot restoration, where the terminal is already
+        // interactive between page prepends.
+        destination.advanceContentGeneration();
 
         destination.assertIntegrity();
         self.node = null;
@@ -5121,6 +5232,10 @@ pub fn eraseRow(
     defer self.assertIntegrity();
     const pn = self.pin(pt).?;
 
+    // Removing a history row shifts the absolute identity of every row below
+    // it while leaving scrollbar geometry unchanged.
+    if (pt == .history) self.advanceContentGeneration();
+
     var node = pn.node;
     var page = node.page();
     var rows = page.rows.ptr(page.memory.ptr);
@@ -5240,6 +5355,10 @@ pub fn eraseRowBounded(
     // this function are for where it differs from eraseRow.
 
     const pn = self.pin(pt).?;
+
+    // A bounded history shift can still replace the content addressed by a
+    // saved absolute row, even though total and viewport length do not move.
+    if (pt == .history) self.advanceContentGeneration();
 
     var node: *List.Node = pn.node;
     var page = node.page();
@@ -5559,6 +5678,12 @@ fn eraseRows(
 
     // Update our total row count
     self.total_rows -= erased;
+
+    // eraseHistory always removes a prefix. All retained rows after it move
+    // to new absolute offsets, so invalidate saved scrollbar row identities.
+    if (erased > 0 and tl_pt == .history) {
+        self.advanceContentGeneration();
+    }
 
     // If we deleted active, we need to regrow because one of our invariants
     // is that we always have full active space.
@@ -6997,7 +7122,13 @@ const Limits = struct {
 
         // Reconcile viewport mode and cached row offsets with the combined prefix
         // removal only after every page and pin points into the final list.
-        if (removed > 0) pagelist.fixupViewport(removed);
+        if (removed > 0) {
+            // Treat a multi-page enforcement pass as one history identity
+            // transition. The next scrollbar sample can then detect pruning
+            // even if later appends restore the same geometry.
+            pagelist.advanceContentGeneration();
+            pagelist.fixupViewport(removed);
+        }
     }
 
     /// Returns the minimum valid "max size" for a given number of rows and cols
@@ -7615,6 +7746,7 @@ pub const Builder = struct {
             .page_size = self.page_size,
             .limits = limits,
             .total_rows = total_rows,
+            .content_generation = 0,
             .tracked_pins = tracked_pins,
             .viewport = .{ .active = {} },
             .viewport_pin = viewport_pin,
@@ -7798,6 +7930,7 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
     result.scroll(.{ .row = 1 });
     try testing.expectEqual(Viewport.pin, result.viewport);
     try testing.expectEqual(@as(usize, 1), result.scrollbar().offset);
+    const initial_content_generation = result.scrollbar().content_generation;
 
     // Prepend differently sized historical pages newest-first. Each page is
     // populated while detached and joins the live list only on success.
@@ -7845,6 +7978,10 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
     try testing.expectEqual(@as(usize, 7), scrollbar_state.total);
     try testing.expectEqual(@as(usize, 4), scrollbar_state.offset);
     try testing.expectEqual(@as(usize, 2), scrollbar_state.len);
+    try testing.expectEqual(
+        initial_content_generation +% 2,
+        scrollbar_state.content_generation,
+    );
 
     result.assertIntegrity();
 }
@@ -11461,6 +11598,158 @@ test "PageList grow prune scrollback" {
     }
 }
 
+test "PageList scrollbar content generation detects coalesced prune and growth" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = std_size,
+    });
+    defer s.deinit();
+
+    // Fill exactly two pages. This is the byte-limit steady state immediately
+    // before the next row forces the oldest page to be recycled.
+    const first = s.pages.last.?;
+    for (0..first.capacity().rows - first.rows()) |_| {
+        try testing.expect(try s.grow() == null);
+    }
+    const second = (try s.grow()).?;
+    for (0..second.capacity().rows - second.rows()) |_| {
+        try testing.expect(try s.grow() == null);
+    }
+
+    const before = s.scrollbar();
+
+    // Recycle the oldest page, then append enough rows before the next sample
+    // to restore the exact same total, viewport offset, and viewport length.
+    // Geometry-only observers cannot distinguish these two states even though
+    // every retained row now has a different absolute offset.
+    const recycled = (try s.grow()).?;
+    for (1..recycled.capacity().rows) |_| {
+        try testing.expect(try s.grow() == null);
+    }
+
+    const after = s.scrollbar();
+    try testing.expectEqual(before.total, after.total);
+    try testing.expectEqual(before.offset, after.offset);
+    try testing.expectEqual(before.len, after.len);
+    try testing.expectEqual(
+        before.content_generation +% 1,
+        after.content_generation,
+    );
+    try testing.expect(!before.eql(after));
+    try testing.expectEqual(
+        after.content_generation,
+        after.snapshotCval().content_generation,
+    );
+}
+
+test "PageList scrollbar content generation is stable on append" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = null,
+    });
+    defer s.deinit();
+
+    const before = s.scrollbar();
+    _ = try s.grow();
+    const after = s.scrollbar();
+
+    try testing.expect(after.total > before.total);
+    try testing.expectEqual(
+        before.content_generation,
+        after.content_generation,
+    );
+}
+
+test "PageList scrollbar content generation advances on column reflow" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_size = null,
+    });
+    defer s.deinit();
+
+    // Keep three independent physical rows so the reflow rewrites content but
+    // leaves all observable scrollbar geometry unchanged.
+    for (0..s.rows) |y| {
+        for (0..s.cols) |x| {
+            s.getCell(.{ .active = .{
+                .x = @intCast(x),
+                .y = @intCast(y),
+            } }).?.cell.* = .init('A');
+        }
+    }
+
+    const before = s.scrollbar();
+    try s.resize(.{ .cols = 10, .reflow = true });
+    const after = s.scrollbar();
+
+    try testing.expectEqual(before.total, after.total);
+    try testing.expectEqual(before.offset, after.offset);
+    try testing.expectEqual(before.len, after.len);
+    try testing.expectEqual(
+        before.content_generation +% 1,
+        after.content_generation,
+    );
+    try testing.expect(!before.eql(after));
+}
+
+test "PageList scrollbar content generation coalesces byte and line pruning" {
+    const testing = std.testing;
+    const cols: size.CellCountInt = 80;
+    const page_rows: usize = initialCapacity(cols).rows;
+
+    var s = try init(testing.allocator, .{
+        .cols = cols,
+        .rows = 1,
+        .max_size = null,
+        .max_lines = null,
+    });
+    defer s.deinit();
+
+    // Fill exactly four pages, then stage both limits without enforcing them
+    // independently. The next grow recycles one page for the byte limit and
+    // removes two more through line-limit enforcement.
+    try s.growRows(4 * page_rows - 1);
+    try testing.expectEqual(@as(usize, 4), s.totalPages());
+    s.limits.set(.bytes, PagePool.item_size);
+    s.limits.set(.lines, page_rows);
+
+    const before = s.scrollbar().content_generation;
+    _ = try s.grow();
+
+    try testing.expectEqual(@as(usize, 2), s.totalPages());
+    try testing.expectEqual(
+        before +% 1,
+        s.scrollbar().content_generation,
+    );
+}
+
+test "PageList scrollbar content generation advances on reset" {
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = null,
+    });
+    defer s.deinit();
+
+    const before = s.scrollbar().content_generation;
+    s.reset();
+    try testing.expectEqual(
+        before +% 1,
+        s.scrollbar().content_generation,
+    );
+}
+
 test "PageList grow prune scrollback with viewport pin not in pruned page" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -11558,6 +11847,7 @@ test "PageList eraseRows invalidates viewport offset cache" {
         .total = s.total_rows,
         .offset = pin_y - rows_to_erase,
         .len = s.rows,
+        .content_generation = 1,
     }, s.scrollbar());
 }
 
@@ -11597,6 +11887,7 @@ test "PageList eraseRow invalidates viewport offset cache" {
         .total = s.total_rows,
         .offset = pin_y - 1,
         .len = s.rows,
+        .content_generation = 1,
     }, s.scrollbar());
 }
 
@@ -11637,6 +11928,7 @@ test "PageList eraseRowBounded invalidates viewport offset cache" {
         .total = s.total_rows,
         .offset = pin_y - 1,
         .len = s.rows,
+        .content_generation = 1,
     }, s.scrollbar());
 }
 
@@ -11725,6 +12017,7 @@ test "PageList eraseRowBounded multi-page invalidates viewport offset cache" {
         .total = s.total_rows,
         .offset = pin_y - 1,
         .len = s.rows,
+        .content_generation = 1,
     }, s.scrollbar());
 }
 
@@ -11768,6 +12061,7 @@ test "PageList eraseRowBounded full page shift invalidates viewport offset cache
         .total = s.total_rows,
         .offset = pin_y - 1,
         .len = s.rows,
+        .content_generation = 1,
     }, s.scrollbar());
 }
 
@@ -11813,6 +12107,7 @@ test "PageList eraseRowBounded exhausts pages invalidates viewport offset cache"
         .total = s.total_rows,
         .offset = pin_y - 1,
         .len = s.rows,
+        .content_generation = 1,
     }, s.scrollbar());
 }
 
@@ -16014,6 +16309,7 @@ test "PageList resize reflow invalidates viewport offset cache" {
         .total = s.total_rows,
         .offset = 5,
         .len = s.rows,
+        .content_generation = 1,
     }, s.scrollbar());
 }
 

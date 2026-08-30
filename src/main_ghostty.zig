@@ -83,8 +83,8 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
             \\(i.e. FLASH-Ghostty.app on macOS). This CLI can be used to perform various
             \\actions such as inspecting the version, listing fonts, etc.
             \\
-            \\On macOS, the terminal can also be launched using `open -na FLASH-Ghostty.app`,
-            \\or `open -na FLASH-Ghostty.app --args --foo=bar --baz=qux` to pass arguments.
+            \\On macOS, the terminal can also be launched using `open -a FLASH-Ghostty.app`.
+            \\FLASH-Ghostty uses one application instance so restored sessions have one owner.
             \\
             \\We don't have proper help output yet, sorry! Please refer to the
             \\source code or Discord community for help for now. We'll fix this in time.

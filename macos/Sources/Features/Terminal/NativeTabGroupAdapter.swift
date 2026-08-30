@@ -294,7 +294,8 @@ final class NativeTabGroupAdapter: ObservableObject {
             SessionWorkspace.Snapshot(
                 orderedSessionIDs: group.orderedSessionIDs,
                 selectedSessionID: group.selectedSessionID,
-                isSidebarVisible: workspace.isSidebarVisible
+                isSidebarVisible: workspace.isSidebarVisible,
+                isFileBrowserVisible: workspace.isFileBrowserVisible
             )
         }
     }

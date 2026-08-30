@@ -46,7 +46,10 @@ extension TerminalRestorable {
 
 /// The state stored for terminal window restoration.
 final class TerminalRestorableState: TerminalRestorable {
-    static var version: Int { 8 }
+    // Versions 9 and 10 were used by FLASH development builds while the
+    // file-browser payload was being consolidated. Keep the version monotonic
+    // so those archives reach InternalState's migration decoder.
+    static var version: Int { 11 }
     static var minimumVersion: Int { 5 }
 
     var focusedSurface: String? {
@@ -66,6 +69,12 @@ final class TerminalRestorableState: TerminalRestorable {
     }
     var sessionSidebarIsVisible: Bool {
         internalState.sessionSidebarIsVisible ?? true
+    }
+    var fileBrowserIsVisible: Bool {
+        internalState.fileBrowser?.isVisible ?? true
+    }
+    var fileBrowserSelectedFileTypes: Set<FlashFileBrowserFileType> {
+        Set(internalState.fileBrowser?.selectedFileTypes ?? [])
     }
 
     /// Internal State we use to perform unit tests

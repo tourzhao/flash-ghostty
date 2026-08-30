@@ -29,7 +29,7 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
 
     @MainActor
     func testSessionRowsSurviveNativeTabSelection() throws {
-        let app = try ghosttyApplication()
+        let app = try isolatedGhosttyApplication(testName: #function)
         app.launch()
 
         let terminal = app.groups["Terminal pane"]
@@ -47,22 +47,22 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
         XCTAssertTrue(waitForSessionCount(3, in: app))
 
         // Exercise the same path as a user clicking a newly created session.
-        // Each native tab owns a separate SwiftUI root, so both the old and
-        // new roots must continue to expose all three rows after selection.
+        // Background native-tab roots retain inert sidebar placeholders. The
+        // newly selected root must remount and expose all three live rows.
         let selectors = sessionSelectors(in: app)
         selectors.element(boundBy: 0).click()
-        XCTAssertTrue(waitForSessionCount(3, in: app))
+        XCTAssertTrue(waitForSelectedSession(at: 0, count: 3, in: app))
         XCTAssertTrue(waitForWorkingDirectory("/private/tmp", in: app))
         sessionSelectors(in: app).element(boundBy: 2).click()
-        XCTAssertTrue(waitForSessionCount(3, in: app))
+        XCTAssertTrue(waitForSelectedSession(at: 2, count: 3, in: app))
         XCTAssertTrue(waitForWorkingDirectory("/private/tmp", in: app))
         XCTAssertEqual(app.windows.firstMatch.title, "FLASH-Ghostty")
 
         for index in [1, 2, 3, 1] {
             app.typeKey("\(index)", modifierFlags: .command)
             XCTAssertTrue(
-                waitForSessionCount(3, in: app),
-                "Selecting session \(index) must preserve every sidebar row"
+                waitForSelectedSession(at: index - 1, count: 3, in: app),
+                "Selecting session \(index) must remount every sidebar row"
             )
         }
     }
@@ -156,10 +156,31 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
     private func waitForSessionCount(
         _ expectedCount: Int,
         in app: XCUIApplication,
-        timeout: TimeInterval = 2
+        timeout: TimeInterval = 10
     ) -> Bool {
+        // XCUIElementQuery.count is a cross-process accessibility snapshot.
+        // A debug build with both sidebars visible can take longer than two
+        // seconds to complete the first snapshot, so a shorter waiter cancels
+        // a query that would otherwise return the correct row count.
         let predicate = NSPredicate { _, _ in
             self.sessionSelectors(in: app).count == expectedCount
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: app)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func waitForSelectedSession(
+        at index: Int,
+        count expectedCount: Int,
+        in app: XCUIApplication,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        let predicate = NSPredicate { _, _ in
+            let selectors = self.sessionSelectors(in: app)
+            guard selectors.count == expectedCount else { return false }
+            return (selectors.element(boundBy: index).value as? String)?
+                .contains("Selected") == true
         }
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: app)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed

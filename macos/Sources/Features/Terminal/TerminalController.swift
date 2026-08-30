@@ -64,6 +64,15 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// `flashSessionTabCoordinator`; this value only invalidates existing views.
     @Published private(set) var sessionSidebarRevision: UInt = 0
 
+    /// File-browser state has its own publisher so terminal metadata updates do
+    /// not repeatedly invalidate a large Finder-style list.
+    let fileBrowserSessionState: FlashFileBrowserSessionState
+    private var fileBrowserWorkingDirectoryObservation: AnyCancellable?
+
+    var fileBrowserSelectedFileTypes: Set<FlashFileBrowserFileType> {
+        fileBrowserSessionState.selectedFileTypes
+    }
+
     /// FLASH session composition root. Native-tab state, reconciliation, KVO,
     /// focus policy, and sidebar actions live outside this AppKit controller.
     let flashSessionTabCoordinator: FlashSessionTabCoordinator
@@ -78,6 +87,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
     var sessionSidebarIsVisible: Bool {
         flashSessionTabCoordinator.isSidebarVisible
+    }
+    var fileBrowserIsVisible: Bool {
+        flashSessionTabCoordinator.fileBrowserIsVisible
     }
     private var sessionSidebarIsClosing: Bool {
         flashSessionTabCoordinator.isClosing
@@ -152,15 +164,22 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             sessionID: sessionID,
             usesSidebar: windowPresentation.usesSessionSidebar
         )
+        self.fileBrowserSessionState = FlashFileBrowserSessionState(
+            sessionID: sessionID
+        )
 
         // The window we manage is not restorable if we've specified a command
         // to execute. We do this because the restored window is meaningless at the
         // time of writing this: it'd just restore to a shell in the same directory
         // as the script. We may want to revisit this behavior when we have scrollback
         // restoration.
-        let isExecuteCommandLaunch = (NSApp.delegate as? AppDelegate)?
-            .launchedWithExecuteCommand ?? false
-        self.restorable = (base?.command ?? "") == "" && !isExecuteCommandLaunch
+        let appDelegate = NSApp.delegate as? AppDelegate
+        let isExecuteCommandLaunch = appDelegate?.launchedWithExecuteCommand ?? false
+        let allowsRestorableWindow = appDelegate?
+            .allowsRestorableTerminalWindowCreation ?? true
+        self.restorable = (base?.command ?? "") == "" &&
+            !isExecuteCommandLaunch &&
+            allowsRestorableWindow
 
         // Setup our initial derived config based on the current app config
         self.derivedConfig = DerivedConfig(ghostty.config)
@@ -168,8 +187,23 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         super.init(ghostty, baseConfig: base, surfaceTree: tree)
 
         flashSessionTabCoordinator.attach(to: self)
+        fileBrowserSessionState.synchronizeSelection(
+            sessionWorkspace.selectedSessionID == sessionID
+        )
+        fileBrowserWorkingDirectoryObservation = sessionWorkingDirectoryPublisher
+            .removeDuplicates { lhs, rhs in
+                lhs?.standardizedFileURL.path == rhs?.standardizedFileURL.path
+            }
+            .sink { [weak fileBrowserSessionState] directory in
+                fileBrowserSessionState?
+                    .synchronizeTerminalWorkingDirectory(directory)
+            }
 
         if usesSessionSidebar {
+            updateSessionMetadataRefreshContext(
+                sidebarIsVisible: sessionSidebarIsVisible,
+                sessionIsSelected: sessionWorkspace.selectedSessionID == sessionID
+            )
             startSessionMetadataRefreshMonitoring()
         }
 
@@ -276,6 +310,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     func flashSessionSidebarRevisionDidChange() {
         sessionSidebarRevision &+= 1
+        updateSessionMetadataRefreshContext(
+            sidebarIsVisible: sessionSidebarIsVisible,
+            sessionIsSelected: sessionWorkspace.selectedSessionID == sessionID
+        )
+        fileBrowserSessionState.synchronizeSelection(
+            sessionWorkspace.selectedSessionID == sessionID
+        )
     }
 
     @discardableResult
@@ -293,11 +334,17 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     @discardableResult
     private func becomeIndependentSessionWorkspace(
-        isSidebarVisible: Bool
+        isSidebarVisible: Bool,
+        isFileBrowserVisible: Bool
     ) -> Bool {
-        flashSessionTabCoordinator.becomeIndependent(
-            isSidebarVisible: isSidebarVisible
+        let becameIndependent = flashSessionTabCoordinator.becomeIndependent(
+            isSidebarVisible: isSidebarVisible,
+            isFileBrowserVisible: isFileBrowserVisible
         )
+        if becameIndependent, isWindowLoaded {
+            flashSessionTabCoordinator.setupObservation()
+        }
+        return becameIndependent
     }
 
     func nativeTabAttachmentDidFail() {
@@ -310,6 +357,55 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     @IBAction func toggleSessionSidebar(_ sender: Any?) {
         flashSessionTabCoordinator.toggleSidebar()
+    }
+
+    func toggleFileBrowser() {
+        flashSessionTabCoordinator.toggleFileBrowser()
+    }
+
+    func synchronizeFileBrowserVisibility(_ isVisible: Bool) {
+        flashSessionTabCoordinator.synchronizeFileBrowserVisibility(isVisible)
+    }
+
+    func synchronizeFileBrowserSelectedFileTypes(
+        _ selectedFileTypes: Set<FlashFileBrowserFileType>
+    ) {
+        guard fileBrowserSessionState.synchronizeSelectedFileTypes(
+            selectedFileTypes
+        ) else { return }
+        invalidateRestorableState()
+    }
+
+    func requestRevealInFileBrowser(
+        _ lexicalURL: URL,
+        workingDirectoryURL: URL?
+    ) {
+        guard usesSessionSidebar else { return }
+
+        fileBrowserSessionState.requestReveal(
+            lexicalURL,
+            workingDirectoryURL: workingDirectoryURL
+        )
+        flashSessionTabCoordinator.synchronizeFileBrowserVisibility(true)
+    }
+
+    func acknowledgeFileBrowserRevealRequest(_ requestID: UUID) {
+        fileBrowserSessionState.acknowledgeRevealRequest(requestID)
+    }
+
+    func restoreFileBrowserVisibility(_ isVisible: Bool) {
+        flashSessionTabCoordinator.synchronizeFileBrowserVisibility(
+            isVisible,
+            invalidateSavedState: false
+        )
+    }
+
+    func restoreFileBrowserSelectedFileTypes(
+        _ selectedFileTypes: Set<FlashFileBrowserFileType>
+    ) {
+        _ = fileBrowserSessionState.synchronizeSelectedFileTypes(
+            selectedFileTypes
+        )
     }
 
     func restoreSessionSidebarVisibility(_ isVisible: Bool) {
@@ -415,6 +511,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
         super.surfaceTreeDidChange(from: from, to: to)
 
+        // `surfaceTree` is assigned by `BaseTerminalController.init`, before
+        // restoration has applied controller-owned presentation state. Do not
+        // interact with `NSWindowController` until AppKit has loaded the
+        // window deliberately.
+        guard isWindowLoaded else { return }
+
         // Whenever our surface tree changes in any way (new split, close split, etc.)
         // we want to invalidate our state.
         invalidateRestorableState()
@@ -502,6 +604,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let parent: NSWindow? = explicitParent ?? preferredParent?.window
         if let parentController = parent?.windowController as? TerminalController {
             c.isBackgroundOpaque = parentController.isBackgroundOpaque
+            c.restoreSessionSidebarVisibility(
+                parentController.sessionSidebarIsVisible
+            )
+            c.restoreFileBrowserVisibility(
+                parentController.fileBrowserIsVisible
+            )
         }
 
         if let parent, parent.styleMask.contains(.fullScreen) {
@@ -586,7 +694,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         tree: SplitTree<Ghostty.SurfaceView>,
         position: NSPoint? = nil,
         confirmUndo: Bool = true,
-        inheritBackgroundOpacity: Bool? = nil
+        inheritBackgroundOpacity: Bool? = nil,
+        inheritSessionSidebarVisibility: Bool? = nil,
+        inheritFileBrowserVisibility: Bool? = nil
     ) -> TerminalController {
         // Calculate the target frame based on the tree's view bounds
         // before moving into the new window
@@ -596,6 +706,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if let inheritBackgroundOpacity {
             c.isBackgroundOpaque = inheritBackgroundOpacity
         }
+        if let inheritSessionSidebarVisibility {
+            c.restoreSessionSidebarVisibility(inheritSessionSidebarVisibility)
+        }
+        if let inheritFileBrowserVisibility {
+            c.restoreFileBrowserVisibility(inheritFileBrowserVisibility)
+        }
 
         c.scheduleInitialPresentation {
             c.showWindow(self)
@@ -604,8 +720,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 if let treeSize, treeSize.width > 0, treeSize.height > 0 {
                     var contentSize = treeSize
                     if c.usesSessionSidebar {
-                        contentSize.width += TerminalSessionRootView.configuredSidebarWidth +
-                            TerminalSessionRootView.sidebarDividerWidth
+                        contentSize.width += TerminalSessionRootView.sidebarChromeWidth(
+                            isVisible: c.sessionSidebarIsVisible
+                        )
+                        contentSize.width += TerminalSessionRootView.fileBrowserChromeWidth(
+                            isVisible: c.fileBrowserIsVisible
+                        )
                         contentSize.height += TerminalSessionRootView.terminalMetadataHeight
                     }
                     window.setContentSize(contentSize)
@@ -646,7 +766,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                     _ = TerminalController.newWindow(
                         ghostty,
                         tree: tree,
-                        inheritBackgroundOpacity: inheritBackgroundOpacity
+                        inheritBackgroundOpacity: inheritBackgroundOpacity,
+                        inheritSessionSidebarVisibility: inheritSessionSidebarVisibility,
+                        inheritFileBrowserVisibility: inheritFileBrowserVisibility
                     )
                 }
             }
@@ -690,6 +812,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         )
         controller.isBackgroundOpaque = parentController.isBackgroundOpaque
         let parentSidebarVisibility = parentController.sessionSidebarIsVisible
+        let parentFileBrowserVisibility = parentController.fileBrowserIsVisible
         var sharedWorkspacePrepared = false
 
         // The child must share application-owned state before `controller.window`
@@ -715,7 +838,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard let window = controller.window else {
             if sharedWorkspacePrepared {
                 _ = controller.becomeIndependentSessionWorkspace(
-                    isSidebarVisible: parentSidebarVisibility
+                    isSidebarVisible: parentSidebarVisibility,
+                    isFileBrowserVisible: parentFileBrowserVisibility
                 )
             }
             return controller
@@ -802,7 +926,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         if parentController.usesSessionSidebar && !remainsNativeSidebarTab {
             _ = controller.becomeIndependentSessionWorkspace(
-                isSidebarVisible: parentSidebarVisibility
+                isSidebarVisible: parentSidebarVisibility,
+                isFileBrowserVisible: parentFileBrowserVisibility
             )
         }
 
@@ -1363,7 +1488,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
                 for (controller, undoState) in zip(controllers, undoStates) {
                     _ = controller.becomeIndependentSessionWorkspace(
-                        isSidebarVisible: undoState.sessionSidebarIsVisible
+                        isSidebarVisible: undoState.sessionSidebarIsVisible,
+                        isFileBrowserVisible: undoState.fileBrowserIsVisible
                     )
                 }
             }
@@ -1465,6 +1591,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let tabColor: TerminalTabColor
         let titleOverride: String?
         let sessionSidebarIsVisible: Bool
+        let fileBrowserIsVisible: Bool
+        let fileBrowserSelectedFileTypes: Set<FlashFileBrowserFileType>
         let sessionID: SessionWorkspace.SessionID
         let windowPresentation: TerminalWindowPresentation
     }
@@ -1477,6 +1605,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             windowPresentation: undoState.windowPresentation
         )
         titleOverride = undoState.titleOverride
+        restoreFileBrowserSelectedFileTypes(undoState.fileBrowserSelectedFileTypes)
 
         // A restored tab adopts the live group before loading its SwiftUI root.
         // A whole-window undo has no surviving group and restores its archived
@@ -1491,8 +1620,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 at: undoState.tabIndex,
                 select: true
             )
-        } else {
+        }
+        if !adoptedExistingWorkspace {
             restoreSessionSidebarVisibility(undoState.sessionSidebarIsVisible)
+            restoreFileBrowserVisibility(undoState.fileBrowserIsVisible)
         }
 
         // Show the window and restore its frame
@@ -1500,7 +1631,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard let window else {
             if adoptedExistingWorkspace {
                 _ = becomeIndependentSessionWorkspace(
-                    isSidebarVisible: undoState.sessionSidebarIsVisible
+                    isSidebarVisible: undoState.sessionSidebarIsVisible,
+                    isFileBrowserVisible: undoState.fileBrowserIsVisible
                 )
             }
             return
@@ -1515,7 +1647,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // If we have a tab group and index, restore the tab to its original position
             if let tabGroup = undoState.tabGroup,
                let tabIndex = undoState.tabIndex,
-               (!usesSessionSidebar || adoptedExistingWorkspace) {
+               !usesSessionSidebar || adoptedExistingWorkspace {
                 let attachReportedSuccess: Bool
                 if tabGroup.windows.contains(where: { $0 === window }) {
                     attachReportedSuccess = true
@@ -1538,7 +1670,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                         tabGroup.removeWindow(window)
                     }
                     _ = becomeIndependentSessionWorkspace(
-                        isSidebarVisible: undoState.sessionSidebarIsVisible
+                        isSidebarVisible: undoState.sessionSidebarIsVisible,
+                        isFileBrowserVisible: undoState.fileBrowserIsVisible
                     )
                 }
 
@@ -1578,6 +1711,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             tabColor: (window as? TerminalWindow)?.tabColor ?? .none,
             titleOverride: titleOverride,
             sessionSidebarIsVisible: sessionSidebarIsVisible,
+            fileBrowserIsVisible: fileBrowserIsVisible,
+            fileBrowserSelectedFileTypes: fileBrowserSelectedFileTypes,
             sessionID: sessionID,
             windowPresentation: windowPresentation)
     }
@@ -1636,6 +1771,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             if usesSessionSidebar {
                 initialContentSize.width += TerminalSessionRootView.sidebarChromeWidth(
                     isVisible: sessionSidebarIsVisible
+                )
+                initialContentSize.width += TerminalSessionRootView.fileBrowserChromeWidth(
+                    isVisible: fileBrowserIsVisible
                 )
                 initialContentSize.height += TerminalSessionRootView.terminalMetadataHeight
             }

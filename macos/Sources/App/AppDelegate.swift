@@ -117,7 +117,7 @@ class AppDelegate: NSObject,
     /// facts and app-specific state queries.
     @MainActor private lazy var sessionRestorationCoordinator =
         SessionRestorationCoordinator(
-            archiveStore: UserDefaultsSessionRestorationArchiveStore(),
+            archiveStore: UserDefaultsRestorationArchiveStore(),
             promptPresenter: AppKitSessionRestorationPromptPresenter(),
             didResolveFromPrompt: { [weak self] decision in
                 self?.startupRestorationDidResolve(decision)
@@ -253,7 +253,7 @@ class AppDelegate: NSObject,
         ])
 
         sessionRestorationCoordinator.prepareLaunch(
-            launchedWithExecuteCommand: launchedWithExecuteCommand,
+            outerArchiveIsolation: appKitOuterArchiveIsolation,
             restorationEnabled: ghostty.config.windowSaveState != "never"
         )
     }
@@ -407,6 +407,7 @@ class AppDelegate: NSObject,
         // method has finished. Do not create the fallback terminal until all
         // configuration, menus, notifications, and signal handlers are ready.
         applicationDidFinishLaunchingCompleted = true
+        sessionRestorationCoordinator.applicationLaunchCompleted()
 
         // AppKit documents that the no-window restoration notification occurs
         // before did-finish-launching. Older registration timing could miss
@@ -443,11 +444,9 @@ class AppDelegate: NSObject,
     @MainActor
     @objc private func applicationDidFinishRestoringWindows(_ notification: Notification) {
         applicationDidFinishRestoringWindows = true
+        sessionRestorationCoordinator.restorationMilestoneCompleted()
         if sessionRestorationCoordinator.shouldInvalidateSavedState {
             NSApp.invalidateRestorableState()
-        }
-        if sessionRestorationCoordinator.decision == .restore {
-            updateRestorableSessionsAvailable()
         }
         openInitialWindowAfterRestorationIfNeeded()
     }
@@ -461,14 +460,14 @@ class AppDelegate: NSObject,
               applicationDidFinishRestoringWindows,
               !initialWindowLaunchHandled else { return }
 
-        // No restoration callback means there was no actual saved payload,
-        // even if a stale marker claimed otherwise. Resolve silently so first
-        // launch and stale archives never show a false-positive prompt.
+        // No restoration callback means there was no actual saved payload for
+        // this process. Resolve silently. A pre-isolated process was already
+        // resolved during preparation and remains in preserve-only mode.
         guard sessionRestorationCoordinator.resolveNoPayloadIfPossible() else {
             return
         }
-        if sessionRestorationCoordinator.decision == .startFresh {
-            updateRestorableSessionsAvailable()
+        if sessionRestorationCoordinator.shouldInvalidateSavedState {
+            NSApp.invalidateRestorableState()
         }
 
         initialWindowLaunchHandled = true
@@ -479,6 +478,77 @@ class AppDelegate: NSObject,
         undoManager.disableUndoRegistration()
         _ = TerminalController.newWindow(ghostty)
         undoManager.enableUndoRegistration()
+    }
+
+    /// All external terminal creation enters through these helpers so launch
+    /// requests cannot cross the startup restoration decision. Synchronous
+    /// callers receive nil when their request was queued.
+    @MainActor
+    @discardableResult
+    func requestNewTerminalWindow(
+        baseConfig: Ghostty.SurfaceConfiguration? = nil,
+        parent: NSWindow? = nil
+    ) -> TerminalController? {
+        if sessionRestorationCoordinator.deferTerminalLaunchIfNeeded({ [weak self, weak parent] in
+            guard let self else { return }
+            _ = TerminalController.newWindow(
+                ghostty,
+                withBaseConfig: baseConfig,
+                withParent: parent
+            )
+        }) {
+            return nil
+        }
+
+        return TerminalController.newWindow(
+            ghostty,
+            withBaseConfig: baseConfig,
+            withParent: parent
+        )
+    }
+
+    @MainActor
+    @discardableResult
+    func requestNewTerminalTab(
+        from parent: NSWindow?,
+        baseConfig: Ghostty.SurfaceConfiguration? = nil
+    ) -> TerminalController? {
+        if sessionRestorationCoordinator.deferTerminalLaunchIfNeeded({ [weak self, weak parent] in
+            guard let self else { return }
+            _ = TerminalController.newTab(
+                ghostty,
+                from: parent,
+                withBaseConfig: baseConfig
+            )
+        }) {
+            return nil
+        }
+
+        return TerminalController.newTab(
+            ghostty,
+            from: parent,
+            withBaseConfig: baseConfig
+        )
+    }
+
+    @MainActor
+    var isDeferringTerminalLaunches: Bool {
+        sessionRestorationCoordinator.isTerminalLaunchDeferred
+    }
+
+    @MainActor
+    var allowsRestorableTerminalWindowCreation: Bool {
+        sessionRestorationCoordinator.allowsRestorableWindowCreation
+    }
+
+    @MainActor
+    func requestQuickTerminalToggle() {
+        if sessionRestorationCoordinator.deferTerminalLaunchIfNeeded({ [weak self] in
+            self?.quickController.toggle()
+        }) {
+            return
+        }
+        quickController.toggle()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -537,14 +607,6 @@ class AppDelegate: NSObject,
 
     @MainActor
     func applicationWillTerminate(_ notification: Notification) {
-        // `willEncodeRestorableState` is the evidence that AppKit is actually
-        // persisting a workspace. Never turn the marker true merely because
-        // termination began: doing so could resurrect an older archive if the
-        // new encode fails. We only clear impossible/stale markers here.
-        if ghostty.config.windowSaveState == "never" || !hasRestorableSessions {
-            updateRestorableSessionsAvailable()
-        }
-
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.
@@ -553,7 +615,11 @@ class AppDelegate: NSObject,
 
     /// This is called when the application is already open and someone double-clicks the icon
     /// or clicks the dock icon.
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    @MainActor
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
         // If we have visible windows then we allow macOS to do its default behavior
         // of focusing one of them.
         guard !flag else { return true }
@@ -570,10 +636,11 @@ class AppDelegate: NSObject,
         guard applicationHasBecomeActive else { return true }
 
         // No visible windows, open a new one.
-        _ = TerminalController.newWindow(ghostty)
+        _ = requestNewTerminalWindow()
         return false
     }
 
+    @MainActor
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
         // `-e` makes existing path arguments part of the child command, but
         // AppKit also reports those paths as documents to open. Only consume
@@ -582,6 +649,18 @@ class AppDelegate: NSObject,
             Self.logger.debug("ignoring command argument open-file event path=\(filename, privacy: .public)")
             return true
         }
+
+        if sessionRestorationCoordinator.deferTerminalLaunchIfNeeded({ [weak self] in
+            _ = self?.openFileAfterStartupRestoration(filename)
+        }) {
+            return true
+        }
+
+        return openFileAfterStartupRestoration(filename)
+    }
+
+    @MainActor
+    private func openFileAfterStartupRestoration(_ filename: String) -> Bool {
 
         // Ghostty will validate as well but we can avoid creating an entirely new
         // surface by doing our own validation here. We can also show a useful error
@@ -646,12 +725,12 @@ class AppDelegate: NSObject,
 
         switch ghostty.config.macosDockDropBehavior {
         case .new_tab:
-            _ = TerminalController.newTab(
-                ghostty,
+            _ = requestNewTerminalTab(
                 from: TerminalController.preferredParent?.window,
-                withBaseConfig: config
+                baseConfig: config
             )
-        case .new_window: _ = TerminalController.newWindow(ghostty, withBaseConfig: config)
+        case .new_window:
+            _ = requestNewTerminalWindow(baseConfig: config)
         }
 
         return true
@@ -858,12 +937,14 @@ class AppDelegate: NSObject,
         }
     }
 
+    @MainActor
     @objc private func ghosttyNewWindow(_ notification: Notification) {
         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
         let config = configAny as? Ghostty.SurfaceConfiguration
-        _ = TerminalController.newWindow(ghostty, withBaseConfig: config)
+        _ = requestNewTerminalWindow(baseConfig: config)
     }
 
+    @MainActor
     @objc private func ghosttyNewTab(_ notification: Notification) {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard let window = surfaceView.window else { return }
@@ -875,7 +956,7 @@ class AppDelegate: NSObject,
         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
         let config = configAny as? Ghostty.SurfaceConfiguration
 
-        _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: config)
+        _ = requestNewTerminalTab(from: window, baseConfig: config)
     }
 
     private func setDockBadge() {
@@ -1029,8 +1110,8 @@ class AppDelegate: NSObject,
            sessionRestorationCoordinator.shouldInvalidateSavedState {
             NSApp.invalidateRestorableState()
         }
-        if decision == .restore {
-            updateRestorableSessionsAvailable()
+        if applicationDidFinishRestoringWindows {
+            sessionRestorationCoordinator.restorationMilestoneCompleted()
         }
         openInitialWindowAfterRestorationIfNeeded()
     }
@@ -1070,7 +1151,7 @@ class AppDelegate: NSObject,
         // must not replace the application-level portion of the previous
         // interactive archive. In the latter case the current workspace is
         // empty only because materialization is intentionally gated.
-        guard !sessionRestorationCoordinator.preservesExistingArchive else {
+        guard sessionRestorationCoordinator.mayEncodeCurrentArchive() else {
             return
         }
 
@@ -1148,6 +1229,12 @@ class AppDelegate: NSObject,
             }
         }
 
+        if case .initialized(let controller) = quickTerminalControllerState {
+            for view in controller.surfaceTree where view.id == uuid {
+                return view
+            }
+        }
+
         return nil
     }
 
@@ -1184,13 +1271,14 @@ class AppDelegate: NSObject,
         // UpdateSimulator.happyPath.simulate(with: updateViewModel)
     }
 
+    @MainActor
     @IBAction func newWindow(_ sender: Any?) {
-        _ = TerminalController.newWindow(ghostty)
+        _ = requestNewTerminalWindow()
     }
 
+    @MainActor
     @IBAction func newTab(_ sender: Any?) {
-        _ = TerminalController.newTab(
-            ghostty,
+        _ = requestNewTerminalTab(
             from: TerminalController.preferredParent?.window
         )
     }
@@ -1213,8 +1301,9 @@ class AppDelegate: NSObject,
         setSecureInput(.toggle)
     }
 
+    @MainActor
     @IBAction func toggleQuickTerminal(_ sender: Any) {
-        quickController.toggle()
+        requestQuickTerminalToggle()
     }
 
     /// Toggles visibility of all Ghosty Terminal windows. When hidden, activates Ghostty as the frontmost application
@@ -1507,8 +1596,14 @@ extension AppDelegate {
 // MARK: NSMenuItemValidation
 
 extension AppDelegate: NSMenuItemValidation {
+    @MainActor
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(newWindow(_:)),
+            #selector(newTab(_:)),
+            #selector(toggleQuickTerminal(_:)):
+            return !isDeferringTerminalLaunches
+
         case #selector(checkForUpdates(_:)):
             return updateController.updatesEnabled
 

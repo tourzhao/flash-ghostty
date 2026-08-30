@@ -5,6 +5,7 @@
 //  Created by Lukas on 26.02.2026.
 //
 
+import Combine
 import SwiftUI
 import Testing
 @testable import Ghostty
@@ -18,6 +19,37 @@ class MockTerminalViewContainer: TerminalViewContainer {
     override var windowCornerRadius: CGFloat? {
         _windowCornerRadius
     }
+}
+
+@MainActor
+@Suite
+struct SessionMetadataObservationIsolationTests {
+    @Test func metadataInvalidationDoesNotInvalidateTheTerminalController() {
+        let app = Ghostty.App(configPath: "/dev/null")
+        let controller = MetadataObservationProbeController(
+            app,
+            surfaceTree: .init()
+        )
+        var controllerChangeCount = 0
+        var metadataChangeCount = 0
+        let controllerObservation = controller.objectWillChange.sink {
+            controllerChangeCount += 1
+        }
+        let metadataObservation = controller.sessionMetadata.objectWillChange.sink {
+            metadataChangeCount += 1
+        }
+
+        controller.sessionMetadata.objectWillChange.send()
+
+        #expect(metadataChangeCount == 1)
+        #expect(controllerChangeCount == 0)
+        withExtendedLifetime((controllerObservation, metadataObservation)) {}
+    }
+}
+
+@MainActor
+private final class MetadataObservationProbeController: BaseTerminalController {
+    override var undoManager: ExpiringUndoManager? { nil }
 }
 
 class MockConfig: Ghostty.Config {
@@ -192,6 +224,12 @@ struct TerminalSessionToolTests {
                     "/Users/example/.local/share/claude/versions/2.1.241"
             ) == .claudeCode
         )
+        #expect(
+            TerminalSessionTool.detect(
+                fromDynamicTitle: "✳ Claude Code",
+                foregroundProcessName: "/Users/claude/projects/node"
+            ) == .claudeCode
+        )
     }
 
     @Test func leavesOrdinaryShellTitlesAsTerminalSessions() {
@@ -218,6 +256,216 @@ struct TerminalSessionToolTests {
             ) == .terminal
         )
         #expect(TerminalSessionTool.detect(fromDynamicTitle: "") == .terminal)
+        #expect(
+            TerminalSessionTool.detect(
+                fromDynamicTitle: "",
+                foregroundProcessName: "/Users/claude/projects/node"
+            ) == .terminal
+        )
+        #expect(
+            TerminalSessionTool.detect(
+                fromDynamicTitle: "",
+                foregroundProcessName: "/tmp/codex-worktree/bin/zsh"
+            ) == .terminal
+        )
+    }
+}
+
+struct SessionMetadataRefreshThrottleTests {
+    @Test func resolvesVisibilityAndSelectionToPollingModes() {
+        #expect(
+            SessionMetadataPollingMode.resolve(
+                sidebarIsVisible: true,
+                sessionIsSelected: true
+            ) == .selected
+        )
+        #expect(
+            SessionMetadataPollingMode.resolve(
+                sidebarIsVisible: true,
+                sessionIsSelected: false
+            ) == .background
+        )
+        #expect(
+            SessionMetadataPollingMode.resolve(
+                sidebarIsVisible: false,
+                sessionIsSelected: true
+            ) == .suspended
+        )
+        #expect(SessionMetadataPollingMode.selected.allowsVisibleContentsReads)
+        #expect(SessionMetadataPollingMode.background.allowsVisibleContentsReads)
+        #expect(!SessionMetadataPollingMode.suspended.allowsVisibleContentsReads)
+    }
+
+    @Test func selectedBackgroundAndHiddenCadencesAreBounded() {
+        var selected = SessionMetadataRefreshThrottle(mode: .selected)
+        let firstSelectedTick = selected.consumeTick()
+        let secondSelectedTick = selected.consumeTick()
+        #expect(firstSelectedTick)
+        #expect(secondSelectedTick)
+
+        var background = SessionMetadataRefreshThrottle(mode: .background)
+        for _ in 1..<SessionMetadataRefreshThrottle.backgroundIntervalTicks {
+            let shouldRefresh = background.consumeTick()
+            #expect(!shouldRefresh)
+        }
+        let backgroundRefresh = background.consumeTick()
+        let nextBackgroundTick = background.consumeTick()
+        #expect(backgroundRefresh)
+        #expect(!nextBackgroundTick)
+
+        var hidden = SessionMetadataRefreshThrottle(mode: .suspended)
+        for _ in 0..<10 {
+            let shouldRefresh = hidden.consumeTick()
+            #expect(!shouldRefresh)
+        }
+    }
+
+    @Test func becomingVisibleOrSelectedRequestsAnImmediateRefresh() {
+        var throttle = SessionMetadataRefreshThrottle(mode: .suspended)
+        let becameVisible = throttle.update(mode: .background)
+        let unchangedBackground = throttle.update(mode: .background)
+        let becameSelected = throttle.update(mode: .selected)
+        let becameBackground = throttle.update(mode: .background)
+        let becameHidden = throttle.update(mode: .suspended)
+        let selectedAfterHidden = throttle.update(mode: .selected)
+
+        #expect(becameVisible)
+        #expect(!unchangedBackground)
+        #expect(becameSelected)
+        #expect(!becameBackground)
+        #expect(!becameHidden)
+        #expect(selectedAfterHidden)
+    }
+}
+
+struct SessionProcessLookupRequestTests {
+    @Test func acceptsOnlyTheBoundSurfaceGenerationAndCurrentProcess() {
+        let surfaceID = UUID()
+        let request = SessionProcessLookupRequest(
+            generation: 4,
+            surfaceID: surfaceID,
+            processID: 101
+        )
+
+        #expect(request.matchesBinding(generation: 4, surfaceID: surfaceID))
+        #expect(!request.matchesBinding(generation: 5, surfaceID: surfaceID))
+        #expect(!request.matchesBinding(generation: 4, surfaceID: UUID()))
+        #expect(request.matchesProcess(101))
+        #expect(!request.matchesProcess(202))
+        #expect(!request.matchesProcess(nil))
+
+        #expect(
+            request.disposition(
+                currentGeneration: 4,
+                currentSurfaceID: surfaceID,
+                currentProcessID: 101
+            ) == .accept
+        )
+        #expect(
+            request.disposition(
+                currentGeneration: 5,
+                currentSurfaceID: surfaceID,
+                currentProcessID: 101
+            ) == .discard
+        )
+        #expect(
+            request.disposition(
+                currentGeneration: 4,
+                currentSurfaceID: surfaceID,
+                currentProcessID: 202
+            ) == .retryCurrentProcess
+        )
+        #expect(
+            request.disposition(
+                currentGeneration: 4,
+                currentSurfaceID: surfaceID,
+                currentProcessID: nil
+            ) == .retryCurrentProcess
+        )
+    }
+}
+
+struct SessionProcessLookupThrottleTests {
+    @Test func stableProcessIsRevalidatedAtTheBoundedCadence() {
+        var throttle = SessionProcessLookupThrottle()
+
+        #expect(throttle.shouldLookup(processID: 101, now: 10))
+        throttle.accept(processID: 101, now: 10)
+        #expect(!throttle.shouldLookup(processID: 101, now: 12.99))
+        #expect(throttle.shouldLookup(processID: 101, now: 13))
+    }
+
+    @Test func processChangesAndLifecycleResetBypassTheStableCadence() {
+        var throttle = SessionProcessLookupThrottle()
+        throttle.accept(processID: 101, now: 10)
+
+        #expect(throttle.shouldLookup(processID: 202, now: 10.1))
+        throttle.reset()
+        #expect(throttle.shouldLookup(processID: 101, now: 10.1))
+    }
+}
+
+struct SessionInstructionStoreTests {
+    @Test func instructionsAreScopedToBothSurfaceAndProvider() {
+        let firstSurface = UUID()
+        let secondSurface = UUID()
+        var store = SessionInstructionStore()
+
+        store.store("codex task", surfaceID: firstSurface, tool: .codex)
+        store.store("claude task", surfaceID: firstSurface, tool: .claudeCode)
+        store.store("other surface", surfaceID: secondSurface, tool: .codex)
+        store.store("shell input", surfaceID: firstSurface, tool: .terminal)
+
+        #expect(
+            store.instruction(surfaceID: firstSurface, tool: .codex) ==
+                "codex task"
+        )
+        #expect(
+            store.instruction(surfaceID: firstSurface, tool: .claudeCode) ==
+                "claude task"
+        )
+        #expect(
+            store.instruction(surfaceID: secondSurface, tool: .codex) ==
+                "other surface"
+        )
+        #expect(store.instruction(surfaceID: firstSurface, tool: .terminal) == nil)
+    }
+
+    @Test func evictsTheLeastRecentlyUsedKeyAtCapacity() {
+        let surfaceIDs = (0...SessionInstructionStore.capacity).map { _ in UUID() }
+        var store = SessionInstructionStore()
+
+        for index in 0..<SessionInstructionStore.capacity {
+            store.store(
+                "instruction \(index)",
+                surfaceID: surfaceIDs[index],
+                tool: .codex
+            )
+        }
+
+        store.store(
+            "updated",
+            surfaceID: surfaceIDs[0],
+            tool: .codex
+        )
+        store.store(
+            "newest",
+            surfaceID: surfaceIDs[SessionInstructionStore.capacity],
+            tool: .claudeCode
+        )
+
+        #expect(store.count == SessionInstructionStore.capacity)
+        #expect(
+            store.instruction(surfaceID: surfaceIDs[0], tool: .codex) ==
+                "updated"
+        )
+        #expect(store.instruction(surfaceID: surfaceIDs[1], tool: .codex) == nil)
+        #expect(
+            store.instruction(
+                surfaceID: surfaceIDs[SessionInstructionStore.capacity],
+                tool: .claudeCode
+            ) == "newest"
+        )
     }
 }
 
@@ -316,6 +564,474 @@ struct TerminalSessionActivityClassifierTests {
             progressReport: progressReport,
             visibleContents: visibleContents,
             previous: previous
+        )
+    }
+}
+
+struct SessionContentsRefreshPolicyTests {
+    @Test func defersReadsDuringScrollCooldown() {
+        #expect(
+            SessionContentsRefreshPolicy.decision(
+                now: 10,
+                lastScrollInput: 9.8,
+                lastRefresh: 9.9,
+                allowsSnapshotReuse: true
+            ) == .deferUntilScrollingStops
+        )
+        #expect(
+            SessionContentsRefreshPolicy.decision(
+                now: 10.4,
+                lastScrollInput: 10,
+                lastRefresh: nil,
+                allowsSnapshotReuse: true
+            ) == .refreshSnapshot
+        )
+        #expect(
+            SessionContentsRefreshPolicy.decision(
+                now: 20,
+                lastScrollInput: nil,
+                lastRefresh: 19.9,
+                allowsSnapshotReuse: true,
+                defersSnapshotRefresh: true
+            ) == .deferUntilScrollingStops
+        )
+    }
+
+    @Test func reusesRecentSnapshotsAndRefreshesExpiredOnes() {
+        #expect(
+            SessionContentsRefreshPolicy.decision(
+                now: 10,
+                lastScrollInput: nil,
+                lastRefresh: 8.5,
+                allowsSnapshotReuse: true
+            ) == .reuseSnapshot
+        )
+        #expect(
+            SessionContentsRefreshPolicy.decision(
+                now: 10,
+                lastScrollInput: nil,
+                lastRefresh: 8,
+                allowsSnapshotReuse: true
+            ) == .refreshSnapshot
+        )
+        #expect(
+            SessionContentsRefreshPolicy.decision(
+                now: 10,
+                lastScrollInput: nil,
+                lastRefresh: 9.5,
+                allowsSnapshotReuse: false
+            ) == .refreshSnapshot
+        )
+    }
+
+    @Test func statusSnapshotsAreRequestedOnlyForClaudeFallback() {
+        #expect(
+            !SessionContentsRefreshPolicy.requiresSnapshot(
+                forStatusFallback: true,
+                contentIndependentStatus: .active
+            )
+        )
+        #expect(
+            SessionContentsRefreshPolicy.requiresSnapshot(
+                forStatusFallback: true,
+                contentIndependentStatus: nil
+            )
+        )
+    }
+}
+
+struct SessionContentsAnalyzerTests {
+    @Test func scrolledUpPermissionPromptCannotOverrideActiveBottomState() {
+        let historicalViewport = TerminalSessionVisibleContentsAnalyzer.analyze(
+            tool: .claudeCode,
+            visibleContents: """
+
+            ❯ earlier instruction
+
+            Claude needs your permission
+            ❯ 1. Yes
+              2. No
+            Esc to cancel
+            """
+        )
+        let activeBottom = TerminalSessionVisibleContentsAnalyzer.analyze(
+            tool: .claudeCode,
+            visibleContents: """
+
+            ❯ latest instruction
+
+            ⏺ Finished the current turn.
+
+            """
+        )
+
+        // The old viewport demonstrates the exact false-positive that a
+        // scrolled-up surface used to produce. Sidebar classification receives
+        // the active-bottom snapshot instead, independent of viewport scroll.
+        #expect(historicalViewport.requiresUserInput)
+        #expect(!activeBottom.requiresUserInput)
+        #expect(activeBottom.lastInstruction == "latest instruction")
+        #expect(
+            TerminalSessionActivityClassifier.status(
+                tool: .claudeCode,
+                dynamicTitle: "✳ Claude Code",
+                progressReport: nil,
+                visibleContentsAnalysis: activeBottom,
+                previous: .active
+            ) == .completed
+        )
+    }
+
+    @Test func extractsClaudePromptFactsOffTheMainActor() {
+        let analysis = TerminalSessionVisibleContentsAnalyzer.analyze(
+            tool: .claudeCode,
+            visibleContents: """
+
+            ❯ update the sidebar
+
+            Claude needs your permission
+            ❯ 1. Yes
+              2. No
+            Esc to cancel
+            """
+        )
+
+        #expect(analysis.requiresUserInput)
+        #expect(analysis.lastInstruction == "update the sidebar")
+    }
+
+    @Test func preParsedFactsPreserveProviderPrecedence() {
+        let permissionPrompt = TerminalSessionVisibleContentsAnalysis(
+            requiresUserInput: true,
+            lastInstruction: nil
+        )
+        let spinnerStatus = TerminalSessionActivityClassifier.status(
+            tool: .claudeCode,
+            dynamicTitle: "⠸ Claude Code",
+            progressReport: nil,
+            visibleContentsAnalysis: permissionPrompt,
+            previous: .completed
+        )
+        #expect(spinnerStatus == .active)
+
+        let pausedStatus = TerminalSessionActivityClassifier.status(
+            tool: .claudeCode,
+            dynamicTitle: "✳ Claude Code",
+            progressReport: nil,
+            visibleContentsAnalysis: permissionPrompt,
+            previous: .active
+        )
+        #expect(pausedStatus == .paused)
+
+        let completed = Ghostty.Action.ProgressReport(state: .remove, progress: nil)
+        let completedStatus = TerminalSessionActivityClassifier.status(
+            tool: .claudeCode,
+            dynamicTitle: "✳ Claude Code",
+            progressReport: completed,
+            visibleContentsAnalysis: permissionPrompt,
+            previous: .active
+        )
+        #expect(completedStatus == .completed)
+    }
+}
+
+struct DeferredInstructionCaptureStateTests {
+    @Test func onlyMatchingReadConsumesPendingCapture() {
+        var state = DeferredInstructionCaptureState()
+        #expect(state.pendingID == nil)
+
+        let captureID = state.markDeferred()
+        #expect(state.isPending)
+        #expect(state.markDeferred() == captureID)
+        let consumedWrongID = state.consume(id: captureID &+ 1)
+        #expect(!consumedWrongID)
+        #expect(state.isPending)
+        let consumedCapture = state.consume(id: captureID)
+        #expect(consumedCapture)
+        #expect(!state.isPending)
+        let consumedTwice = state.consume(id: captureID)
+        #expect(!consumedTwice)
+    }
+
+    @Test func scrollDefersButDoesNotDiscardPendingCapture() {
+        var state = DeferredInstructionCaptureState()
+        let captureID = state.markDeferred()
+
+        #expect(
+            !InstructionCaptureRetryPolicy.shouldRetry(
+                hasPendingCapture: state.isPending,
+                defersVisibleContentsRefresh: true
+            )
+        )
+        #expect(state.pendingID == captureID)
+        #expect(
+            InstructionCaptureRetryPolicy.shouldRetry(
+                hasPendingCapture: state.isPending,
+                defersVisibleContentsRefresh: false
+            )
+        )
+    }
+}
+
+struct SessionContentsRequestStateTests {
+    @Test func freshStatusRequestDuringReadCreatesOneFollowUp() {
+        var state = SessionContentsRequestState(minimumInterval: 0)
+        guard case .start(let oldRequest) = state.request(.status) else {
+            Issue.record("Expected the old status read to start")
+            return
+        }
+
+        #expect(
+            state.request(
+                .status,
+                requiresFreshResultIfBusy: true
+            ) == .coalesced
+        )
+        #expect(
+            state.request(
+                .status,
+                requiresFreshResultIfBusy: true
+            ) == .coalesced
+        )
+        let completion = state.complete(requestID: oldRequest.id)
+        #expect(completion.followUpPurpose == .status)
+
+        guard case .start(let followUp) = state.request(.status) else {
+            Issue.record("Expected exactly one fresh status follow-up")
+            return
+        }
+        #expect(state.complete(requestID: followUp.id).followUpPurpose == nil)
+    }
+
+    @Test func freshCaptureDuringStatusReadCreatesOneFollowUp() {
+        var state = SessionContentsRequestState(minimumInterval: 0)
+        guard case .start(let statusRequest) = state.request(.status) else {
+            Issue.record("Expected the first status read to start")
+            return
+        }
+
+        #expect(state.request(.instructionCapture(1)) == .coalesced)
+        #expect(state.request(.instructionCapture(1)) == .coalesced)
+        let statusCompletion = state.complete(requestID: statusRequest.id)
+        #expect(statusCompletion.acceptsResult)
+        #expect(statusCompletion.fulfilledCaptureID == nil)
+        #expect(statusCompletion.requiresFollowUp)
+        #expect(statusCompletion.followUpPurpose == .instructionCapture(1))
+
+        guard case .start(let captureRequest) =
+                state.request(.instructionCapture(1)) else {
+            Issue.record("Expected one capture follow-up")
+            return
+        }
+        let captureCompletion = state.complete(requestID: captureRequest.id)
+        #expect(captureCompletion.fulfilledCaptureID == 1)
+        #expect(!captureCompletion.requiresFollowUp)
+    }
+
+    @Test func oldCaptureCannotConsumeNewPendingCapture() {
+        var state = SessionContentsRequestState(minimumInterval: 0)
+        guard case .start(let oldRequest) =
+                state.request(.instructionCapture(1)) else {
+            Issue.record("Expected the old capture to start")
+            return
+        }
+
+        #expect(state.request(.instructionCapture(2)) == .coalesced)
+        let oldCompletion = state.complete(requestID: oldRequest.id)
+        #expect(oldCompletion.fulfilledCaptureID == nil)
+        #expect(oldCompletion.requiresFollowUp)
+        #expect(oldCompletion.followUpPurpose == .instructionCapture(2))
+
+        guard case .start(let newRequest) =
+                state.request(.instructionCapture(2)) else {
+            Issue.record("Expected the newer capture to start")
+            return
+        }
+        #expect(!state.complete(requestID: oldRequest.id).acceptsResult)
+        #expect(state.complete(requestID: newRequest.id).fulfilledCaptureID == 2)
+    }
+
+    @Test func repeatedSameCaptureSharesItsInFlightRead() {
+        var state = SessionContentsRequestState(minimumInterval: 0)
+        guard case .start(let request) =
+                state.request(.instructionCapture(7)) else {
+            Issue.record("Expected the capture to start")
+            return
+        }
+
+        #expect(state.request(.instructionCapture(7)) == .coalesced)
+        let completion = state.complete(requestID: request.id)
+        #expect(completion.fulfilledCaptureID == 7)
+        #expect(!completion.requiresFollowUp)
+    }
+
+    @Test func hundredEventBurstStartsOneReadAndOneTrailingRead() {
+        var state = SessionContentsRequestState(minimumInterval: 0.5)
+        var rendererReadCount = 0
+
+        guard case .start(let activeRequest) = state.request(
+            .status,
+            now: 10,
+            requiresFreshResultIfBusy: true
+        ) else {
+            Issue.record("Expected the burst's leading read to start")
+            return
+        }
+        rendererReadCount += 1
+
+        for _ in 1..<100 {
+            #expect(
+                state.request(
+                    .status,
+                    now: 10.01,
+                    requiresFreshResultIfBusy: true
+                ) == .coalesced
+            )
+        }
+        #expect(state.isInFlight)
+        #expect(!state.hasScheduledTrailingRefresh)
+
+        let completion = state.complete(requestID: activeRequest.id, now: 10.1)
+        guard let trailingPurpose = completion.followUpPurpose,
+              case .scheduleTrailing(let trailingRefresh) = state.request(
+                trailingPurpose,
+                now: 10.1
+              ) else {
+            Issue.record("Expected one rate-limited trailing read")
+            return
+        }
+        #expect(!state.isInFlight)
+        #expect(state.hasScheduledTrailingRefresh)
+        #expect(abs(trailingRefresh.delay - 0.5) < 0.000_001)
+
+        guard let trailingRequest = state.beginTrailingRefresh(
+            id: trailingRefresh.id,
+            now: 10.600_001
+        ) else {
+            Issue.record("Expected the newest trailing token to start")
+            return
+        }
+        rendererReadCount += 1
+        #expect(state.isInFlight)
+        #expect(!state.hasScheduledTrailingRefresh)
+        #expect(rendererReadCount == 2)
+        #expect(
+            state.beginTrailingRefresh(
+                id: trailingRefresh.id,
+                now: 10.600_001
+            ) == nil
+        )
+        #expect(
+            state.complete(requestID: trailingRequest.id, now: 10.7)
+                .followUpPurpose == nil
+        )
+    }
+
+    @Test func replacementAndSuspensionInvalidateOlderTrailingTokens() {
+        var state = SessionContentsRequestState(minimumInterval: 0.5)
+        guard case .start(let request) = state.request(.status, now: 20) else {
+            Issue.record("Expected the leading read to start")
+            return
+        }
+        _ = state.complete(requestID: request.id, now: 20.1)
+
+        guard case .scheduleTrailing(let first) = state.request(
+            .status,
+            now: 20.2
+        ), case .scheduleTrailing(let replacement) = state.request(
+            .instructionCapture(7),
+            now: 20.25
+        ) else {
+            Issue.record("Expected a replaceable trailing refresh")
+            return
+        }
+        #expect(first.id != replacement.id)
+
+        var replacementProbe = state
+        #expect(
+            replacementProbe.beginTrailingRefresh(
+                id: first.id,
+                now: 20.600_001
+            ) == nil
+        )
+        #expect(
+            replacementProbe.beginTrailingRefresh(
+                id: replacement.id,
+                now: 20.600_001
+            )?.purpose == .instructionCapture(7)
+        )
+
+        // `invalidateVisibleContentsReads` calls this reset when the monitor is
+        // suspended, in addition to cancelling its DispatchWorkItem.
+        state.reset()
+        #expect(!state.hasScheduledTrailingRefresh)
+        #expect(
+            state.beginTrailingRefresh(
+                id: replacement.id,
+                now: 20.600_001
+            ) == nil
+        )
+    }
+}
+
+struct ActivityWithoutSessionContentsTests {
+    @Test func structuredProgressRemainsDefinitiveWhileScrolling() {
+        let paused = Ghostty.Action.ProgressReport(state: .pause, progress: nil)
+        #expect(
+            TerminalSessionActivityClassifier.statusWithoutVisibleContentsIfDefinitive(
+                tool: .claudeCode,
+                dynamicTitle: "✳ Claude Code",
+                progressReport: paused,
+                previous: .active
+            ) == .paused
+        )
+        #expect(
+            TerminalSessionActivityClassifier.statusWithoutVisibleContentsIfDefinitive(
+                tool: .claudeCode,
+                dynamicTitle: "⠸ Claude Code",
+                progressReport: nil,
+                previous: .completed
+            ) == .active
+        )
+        #expect(
+            TerminalSessionActivityClassifier.statusWithoutVisibleContentsIfDefinitive(
+                tool: .claudeCode,
+                dynamicTitle: "✳ Claude Code",
+                progressReport: nil,
+                previous: .active
+            ) == nil
+        )
+    }
+
+    @Test func onlyLatchedStructuredReportsNeedClaudeFallbackText() {
+        let active = Ghostty.Action.ProgressReport(state: .indeterminate, progress: nil)
+        let paused = Ghostty.Action.ProgressReport(state: .pause, progress: nil)
+        let completed = Ghostty.Action.ProgressReport(state: .remove, progress: nil)
+        let failed = Ghostty.Action.ProgressReport(state: .error, progress: nil)
+
+        #expect(
+            !TerminalSessionActivityClassifier.requiresVisibleContentsFallback(
+                tool: .claudeCode,
+                progressReport: active
+            )
+        )
+        #expect(
+            !TerminalSessionActivityClassifier.requiresVisibleContentsFallback(
+                tool: .claudeCode,
+                progressReport: paused
+            )
+        )
+        #expect(
+            TerminalSessionActivityClassifier.requiresVisibleContentsFallback(
+                tool: .claudeCode,
+                progressReport: completed
+            )
+        )
+        #expect(
+            TerminalSessionActivityClassifier.requiresVisibleContentsFallback(
+                tool: .claudeCode,
+                progressReport: failed
+            )
         )
     }
 }

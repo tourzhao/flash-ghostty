@@ -6,6 +6,67 @@ import UserNotifications
 import GhosttyKit
 
 extension Ghostty {
+    /// The passive Codable payload for one restored terminal surface.
+    ///
+    /// Decoding a `SurfaceView` starts its PTY, so keeping the archived fields
+    /// and configuration mapping in this value makes that boundary explicit
+    /// and lets restoration validate the payload before creating live state.
+    struct SurfaceViewRestorationState: Codable {
+        let workingDirectory: String?
+        let uuidString: String
+        let title: String?
+        let isUserSetTitle: Bool
+
+        var uuid: UUID? { UUID(uuidString: uuidString) }
+
+        var surfaceConfiguration: SurfaceConfiguration {
+            var configuration = SurfaceConfiguration()
+            configuration.workingDirectory = workingDirectory
+            return configuration
+        }
+
+        init(
+            workingDirectory: String?,
+            uuid: UUID,
+            title: String?,
+            isUserSetTitle: Bool
+        ) {
+            self.workingDirectory = workingDirectory
+            self.uuidString = uuid.uuidString
+            self.title = title
+            self.isUserSetTitle = isUserSetTitle
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case workingDirectory = "pwd"
+            case uuidString = "uuid"
+            case title
+            case isUserSetTitle
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            workingDirectory = try container.decode(
+                String?.self,
+                forKey: .workingDirectory
+            )
+            uuidString = try container.decode(String.self, forKey: .uuidString)
+            title = try container.decodeIfPresent(String.self, forKey: .title)
+            isUserSetTitle = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .isUserSetTitle
+            ) ?? false
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(workingDirectory, forKey: .workingDirectory)
+            try container.encode(uuidString, forKey: .uuidString)
+            try container.encodeIfPresent(title, forKey: .title)
+            try container.encode(isUserSetTitle, forKey: .isUserSetTitle)
+        }
+    }
+
     /// The NSView implementation for a terminal surface.
     class SurfaceView: OSSurfaceView, Codable, Identifiable {
         // The current title of the surface as defined by the pty. This can be
@@ -188,6 +249,10 @@ extension Ghostty {
         /// of the SwiftUI view hierarchy, for example when changing splits
         var scrollbar: Ghostty.Action.Scrollbar?
 
+        /// Monotonic timestamp of the latest wheel or trackpad input. FLASH uses
+        /// this to keep optional metadata reads out of an active scroll gesture.
+        private(set) var lastScrollInputUptime: TimeInterval?
+
         // Notification identifiers associated with this surface
         var notificationIdentifiers: Set<String> = []
 
@@ -222,6 +287,11 @@ extension Ghostty {
         // The cached contents of the screen.
         private(set) var cachedScreenContents: CachedValue<String>
         private(set) var cachedVisibleContents: CachedValue<String>
+        /// The terminal-owned active screen at the bottom of scrollback.
+        /// Unlike `cachedVisibleContents`, this does not move when the user
+        /// scrolls through history, so background session metadata remains
+        /// tied to the provider's current UI.
+        private(set) var cachedActiveScreenContents: CachedValue<String>
 
         /// Event monitor (see individual events for why)
         private var eventMonitor: Any?
@@ -244,29 +314,23 @@ extension Ghostty {
             // fix at some point.
             self.cachedScreenContents = .init(duration: .milliseconds(500)) { "" }
             self.cachedVisibleContents = self.cachedScreenContents
+            self.cachedActiveScreenContents = self.cachedScreenContents
 
             // Initialize with some default frame size. The important thing is that this
             // is non-zero so that our layer bounds are non-zero so that our renderer
             // can do SOMETHING.
-            super.init(id: uuid, frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+            super.init(
+                id: uuid,
+                frame: NSRect(x: 0, y: 0, width: 800, height: 600),
+                initialWorkingDirectory: baseConfig?.workingDirectory
+            )
 
             // Our cache of screen data
             cachedScreenContents = .init(duration: .milliseconds(500)) { [weak self] in
                 guard let self else { return "" }
                 guard let surface = self.surface else { return "" }
                 var text = ghostty_text_s()
-                let sel = ghostty_selection_s(
-                    top_left: ghostty_point_s(
-                        tag: GHOSTTY_POINT_SCREEN,
-                        coord: GHOSTTY_POINT_COORD_TOP_LEFT,
-                        x: 0,
-                        y: 0),
-                    bottom_right: ghostty_point_s(
-                        tag: GHOSTTY_POINT_SCREEN,
-                        coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
-                        x: 0,
-                        y: 0),
-                    rectangle: false)
+                let sel = Self.fullTextSelection(tag: GHOSTTY_POINT_SCREEN)
                 guard ghostty_surface_read_text(surface, sel, &text) else { return "" }
                 defer { ghostty_surface_free_text(surface, &text) }
                 return String(cString: text.text)
@@ -275,23 +339,11 @@ extension Ghostty {
                 guard let self else { return "" }
                 guard let surface = self.surface else { return "" }
                 var text = ghostty_text_s()
-                let sel = ghostty_selection_s(
-                    top_left: ghostty_point_s(
-                        tag: GHOSTTY_POINT_VIEWPORT,
-                        coord: GHOSTTY_POINT_COORD_TOP_LEFT,
-                        x: 0,
-                        y: 0),
-                    bottom_right: ghostty_point_s(
-                        tag: GHOSTTY_POINT_VIEWPORT,
-                        coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
-                        x: 0,
-                        y: 0),
-                    rectangle: false)
+                let sel = Self.fullTextSelection(tag: GHOSTTY_POINT_VIEWPORT)
                 guard ghostty_surface_read_text(surface, sel, &text) else { return "" }
                 defer { ghostty_surface_free_text(surface, &text) }
                 return String(cString: text.text)
             }
-
             // Set a timer to show the ghost emoji after 500ms if no title is set
             titleFallbackTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
                 if let self = self, self.title.isEmpty {
@@ -392,7 +444,25 @@ extension Ghostty {
                 self.error = Ghostty.Error.apiFailed
                 return
             }
-            self.surfaceModel = Ghostty.Surface(cSurface: surface)
+            let surfaceModel = Ghostty.Surface(cSurface: surface)
+            self.surfaceModel = surfaceModel
+
+            // This cache is consumed from the metadata queue. Capturing the
+            // Sendable surface model avoids reading an AppKit view property on
+            // that queue. The metadata read source retains this view through
+            // main-actor completion, keeping libghostty's userdata valid too.
+            let metadataSelection = Self.sessionMetadataTextSelection
+            cachedActiveScreenContents = .init(duration: .milliseconds(500)) {
+                let surface = surfaceModel.unsafeCValue
+                var text = ghostty_text_s()
+                guard ghostty_surface_read_text(
+                    surface,
+                    metadataSelection,
+                    &text
+                ) else { return "" }
+                defer { ghostty_surface_free_text(surface, &text) }
+                return String(cString: text.text)
+            }
 
             // Setup our tracking area so we get mouse moved events
             updateTrackingAreas()
@@ -477,6 +547,30 @@ extension Ghostty {
                     self.notificationIdentifiers = []
                 }
             }
+        }
+
+        /// The fixed terminal region consumed by session metadata analysis.
+        /// This is intentionally independent of the user-controlled viewport.
+        static var sessionMetadataTextSelection: ghostty_selection_s {
+            fullTextSelection(tag: GHOSTTY_POINT_ACTIVE)
+        }
+
+        /// A whole-region selection used by the cached terminal text readers.
+        private static func fullTextSelection(
+            tag: ghostty_point_tag_e
+        ) -> ghostty_selection_s {
+            ghostty_selection_s(
+                top_left: ghostty_point_s(
+                    tag: tag,
+                    coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                    x: 0,
+                    y: 0),
+                bottom_right: ghostty_point_s(
+                    tag: tag,
+                    coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                    x: 0,
+                    y: 0),
+                rectangle: false)
         }
 
         override func sizeDidChange(_ size: CGSize) {
@@ -1057,6 +1151,8 @@ extension Ghostty {
 
         override func scrollWheel(with event: NSEvent) {
             guard let surfaceModel else { return }
+
+            lastScrollInputUptime = ProcessInfo.processInfo.systemUptime
 
             var x = event.scrollingDeltaX
             var y = event.scrollingDeltaY
@@ -1864,13 +1960,6 @@ extension Ghostty {
 
         // MARK: - Codable
 
-        enum CodingKeys: String, CodingKey {
-            case pwd
-            case uuid
-            case title
-            case isUserSetTitle
-        }
-
         required convenience init(from decoder: Decoder) throws {
             // Decoding uses the global Ghostty app
             guard let del = NSApplication.shared.delegate,
@@ -1879,31 +1968,31 @@ extension Ghostty {
                 throw TerminalRestoreError.delegateInvalid
             }
 
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            let uuid = UUID(uuidString: try container.decode(String.self, forKey: .uuid))
-            var config = Ghostty.SurfaceConfiguration()
-            config.workingDirectory = try container.decode(String?.self, forKey: .pwd)
-            let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
-            let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
+            let restored = try SurfaceViewRestorationState(from: decoder)
 
-            self.init(app, baseConfig: config, uuid: uuid)
+            self.init(
+                app,
+                baseConfig: restored.surfaceConfiguration,
+                uuid: restored.uuid
+            )
 
             // Restore the saved title after initialization
-            if let title = savedTitle {
+            if let title = restored.title {
                 self.title = title
                 // If this was a user-set title, we need to prevent it from being overwritten
-                if isUserSetTitle {
+                if restored.isUserSetTitle {
                     self.titleFromTerminal = title
                 }
             }
         }
 
         func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(pwd, forKey: .pwd)
-            try container.encode(id.uuidString, forKey: .uuid)
-            try container.encode(title, forKey: .title)
-            try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
+            try SurfaceViewRestorationState(
+                workingDirectory: lastKnownWorkingDirectory,
+                uuid: id,
+                title: title,
+                isUserSetTitle: titleFromTerminal != nil
+            ).encode(to: encoder)
         }
     }
 }

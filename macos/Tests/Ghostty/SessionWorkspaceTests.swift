@@ -6,6 +6,46 @@ import Testing
 struct SessionWorkspaceTests {
     typealias SessionID = SessionWorkspace.SessionID
 
+    @Test func sessionRootMinimumWidthPreservesTerminalAndVisibleSidebars() {
+        #expect(
+            TerminalSessionRootView.minimumContentWidth(
+                isSidebarVisible: true,
+                isFileBrowserVisible: true,
+                sidebarWidth: 260,
+                fileBrowserWidth: 300
+            ) == 814
+        )
+        #expect(
+            TerminalSessionRootView.minimumContentWidth(
+                isSidebarVisible: false,
+                isFileBrowserVisible: true,
+                sidebarWidth: 260,
+                fileBrowserWidth: 300
+            ) == 547
+        )
+        #expect(
+            TerminalSessionRootView.minimumContentWidth(
+                isSidebarVisible: false,
+                isFileBrowserVisible: false,
+                sidebarWidth: 260,
+                fileBrowserWidth: 300
+            ) == TerminalSessionRootView.minimumTerminalContentWidth
+        )
+
+        #expect(
+            TerminalSessionRootView.constrainedMinimumContentWidth(
+                814,
+                visibleFrameWidth: 1_440
+            ) == 720
+        )
+        #expect(
+            TerminalSessionRootView.constrainedMinimumContentWidth(
+                814,
+                visibleFrameWidth: 2_000
+            ) == 814
+        )
+    }
+
     @Test func newTabsInheritImmutableParentWindowPresentation() {
         let sidebar = TerminalWindowPresentation(
             windowDecorations: true,
@@ -120,6 +160,109 @@ struct SessionWorkspaceTests {
         #expect(workspace.isSidebarVisible)
     }
 
+    @Test func fileBrowserVisibilityDefaultsToVisible() {
+        let workspace = SessionWorkspace(sessionIDs: [SessionID()])
+
+        #expect(workspace.isFileBrowserVisible)
+        #expect(workspace.snapshot.isFileBrowserVisible)
+    }
+
+    @Test func sidebarAndFileBrowserVisibilityToggleIndependently() {
+        let workspace = SessionWorkspace(sessionIDs: [SessionID()])
+
+        workspace.setSidebarVisible(false)
+        #expect(!workspace.isSidebarVisible)
+        #expect(workspace.isFileBrowserVisible)
+
+        workspace.setFileBrowserVisible(false)
+        #expect(!workspace.isSidebarVisible)
+        #expect(!workspace.isFileBrowserVisible)
+
+        workspace.toggleFileBrowserVisibility()
+        #expect(!workspace.isSidebarVisible)
+        #expect(workspace.isFileBrowserVisible)
+
+        workspace.toggleSidebarVisibility()
+        #expect(workspace.isSidebarVisible)
+        #expect(workspace.isFileBrowserVisible)
+    }
+
+    @Test func completeMergeSampleUsesSelectedSessionPresentation() throws {
+        let first = SessionID()
+        let selected = SessionID()
+        let candidates = [
+            SessionWorkspacePresentationMergePolicy.Candidate(
+                sessionID: first,
+                isSidebarVisible: true,
+                isFileBrowserVisible: false
+            ),
+            SessionWorkspacePresentationMergePolicy.Candidate(
+                sessionID: selected,
+                isSidebarVisible: false,
+                isFileBrowserVisible: true
+            ),
+        ]
+
+        let resolved = try #require(
+            SessionWorkspacePresentationMergePolicy.resolve(
+                selectedSessionID: selected,
+                candidates: candidates
+            )
+        )
+        let reordered = try #require(
+            SessionWorkspacePresentationMergePolicy.resolve(
+                selectedSessionID: selected,
+                candidates: Array(candidates.reversed())
+            )
+        )
+
+        #expect(resolved == candidates[1])
+        #expect(reordered == resolved)
+    }
+
+    @Test func invalidPresentationMergeCandidatesAreRejected() {
+        let sessionID = SessionID()
+        let candidate = SessionWorkspacePresentationMergePolicy.Candidate(
+            sessionID: sessionID,
+            isSidebarVisible: true,
+            isFileBrowserVisible: true
+        )
+
+        #expect(SessionWorkspacePresentationMergePolicy.resolve(
+            selectedSessionID: SessionID(),
+            candidates: [candidate]
+        ) == nil)
+        #expect(SessionWorkspacePresentationMergePolicy.resolve(
+            selectedSessionID: sessionID,
+            candidates: [candidate, candidate]
+        ) == nil)
+    }
+
+    @Test func snapshotWithoutFileBrowserVisibilityDecodesAsVisible() throws {
+        let sessionID = SessionID()
+        let snapshot = SessionWorkspace.Snapshot(
+            orderedSessionIDs: [sessionID],
+            selectedSessionID: sessionID,
+            isSidebarVisible: false,
+            isFileBrowserVisible: false
+        )
+        let encoded = try JSONEncoder().encode(snapshot)
+        var legacyObject = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        legacyObject.removeValue(forKey: "isFileBrowserVisible")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+
+        let decoded = try JSONDecoder().decode(
+            SessionWorkspace.Snapshot.self,
+            from: legacyData
+        )
+        #expect(decoded.orderedSessionIDs == [sessionID])
+        #expect(decoded.selectedSessionID == sessionID)
+        #expect(!decoded.isSidebarVisible)
+        #expect(decoded.isFileBrowserVisible)
+    }
+
     @Test func adapterIgnoresTransientPartialNativeState() {
         let first = SessionID()
         let second = SessionID()
@@ -178,6 +321,32 @@ struct SessionWorkspaceTests {
         #expect(adapter.window(for: sessionID) === window)
         #expect(adapter.bindingRevision == 1)
         #expect(workspace.snapshot == workspaceSnapshot)
+    }
+
+    @Test func unloadedSessionTransfersBeforeItsNativeWindowBinds() {
+        let sessionID = SessionID()
+        let source = NativeTabGroupAdapter(
+            workspace: SessionWorkspace(sessionIDs: [sessionID])
+        )
+        let destination = NativeTabGroupAdapter(
+            workspace: SessionWorkspace()
+        )
+
+        #expect(source.transferSession(
+            sessionID,
+            window: nil,
+            to: destination,
+            select: true
+        ))
+        #expect(source.workspace.orderedSessionIDs.isEmpty)
+        #expect(destination.workspace.orderedSessionIDs == [sessionID])
+        #expect(destination.workspace.selectedSessionID == sessionID)
+        #expect(destination.window(for: sessionID) == nil)
+
+        let loadedWindow = NSWindow()
+        #expect(destination.register(loadedWindow, as: sessionID))
+        #expect(destination.window(for: sessionID) === loadedWindow)
+        #expect(destination.workspace.orderedSessionIDs == [sessionID])
     }
 
     @Test func adapterRejectsDuplicateOrMissingNativeSelection() {
@@ -285,7 +454,8 @@ struct SessionWorkspaceTests {
             workspace: SessionWorkspace(
                 sessionIDs: [first, second, third],
                 selectedSessionID: second,
-                isSidebarVisible: false
+                isSidebarVisible: false,
+                isFileBrowserVisible: false
             )
         )
         let topology = NativeTabGroupAdapter.NativeTopology(groups: [
@@ -306,6 +476,7 @@ struct SessionWorkspaceTests {
         #expect(snapshots?[1].orderedSessionIDs == [second, third])
         #expect(snapshots?[1].selectedSessionID == third)
         #expect(snapshots?.allSatisfy { !$0.isSidebarVisible } == true)
+        #expect(snapshots?.allSatisfy { !$0.isFileBrowserVisible } == true)
     }
 
     @Test func partialOrOverlappingDetachTopologyIsRejected() {
@@ -452,6 +623,33 @@ struct SessionWorkspaceTests {
         )
         await nextMainQueueTurn()
         #expect(appliedTopologies == [detached])
+    }
+
+    @Test func bindingMutationCancelsPendingPermanentDetach() async {
+        let first = SessionID()
+        let second = SessionID()
+        let adapter = NativeTabGroupAdapter(
+            workspace: SessionWorkspace(sessionIDs: [first, second])
+        )
+        let detached = NativeTabGroupAdapter.NativeTopology(groups: [
+            .init(orderedSessionIDs: [first], selectedSessionID: first),
+            .init(orderedSessionIDs: [second], selectedSessionID: second),
+        ])
+        var appliedTopologies: [NativeTabGroupAdapter.NativeTopology] = []
+
+        adapter.schedulePartitionReconciliation(
+            detached,
+            resample: { detached },
+            apply: { appliedTopologies.append($0) }
+        )
+
+        // A newly materialized native binding invalidates the topology sample
+        // before its next-main-queue confirmation can partition the workspace.
+        #expect(adapter.register(NSWindow(), as: first))
+        await nextMainQueueTurn()
+
+        #expect(appliedTopologies.isEmpty)
+        #expect(adapter.workspace.orderedSessionIDs == [first, second])
     }
 
     private func nextMainQueueTurn() async {

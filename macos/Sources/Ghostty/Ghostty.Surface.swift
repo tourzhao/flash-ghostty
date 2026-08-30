@@ -10,6 +10,25 @@ extension Ghostty {
     ///
     /// Wraps a `ghostty_surface_t`
     final class Surface: Sendable {
+        /// A coherent, renderer-locked sample used by history bookmarks.
+        /// Normal scrollbar presentation must use the geometry already
+        /// carried by `ghostty_action_scrollbar_s` instead of calling this.
+        struct ScrollbarSnapshot: Equatable, Sendable {
+            let total: UInt64
+            let offset: UInt64
+            let len: UInt64
+            let contentGeneration: UInt64
+            let screenIdentity: UInt64
+
+            fileprivate init(c: ghostty_surface_scrollbar_s) {
+                total = c.total
+                offset = c.offset
+                len = c.len
+                contentGeneration = c.content_generation
+                screenIdentity = c.screen_identity
+            }
+        }
+
         /// A surface is sendable because it is just a reference type. Using the surface in parameters
         /// may be unsafe but the value itself is safe to send across threads.
         nonisolated(unsafe) private let surface: ghostty_surface_t
@@ -178,6 +197,30 @@ extension Ghostty {
             return action.withCString { cString in
                 ghostty_surface_binding_action(surface, cString, UInt(len - 1))
             }
+        }
+
+        /// Read geometry and history identity atomically for Pin creation or
+        /// active-bookmark validation. This enters the renderer mutex and is
+        /// intentionally absent from the ordinary pinless scrollbar path.
+        @MainActor
+        func scrollbarSnapshot() -> ScrollbarSnapshot {
+            ScrollbarSnapshot(c: ghostty_surface_scrollbar(surface))
+        }
+
+        /// Scroll to a saved history row only if pruning, reflow, and active
+        /// screen identity still match the snapshot that created the pin.
+        @MainActor
+        func scrollToHistoryRow(
+            _ row: UInt64,
+            contentGeneration: UInt64,
+            screenIdentity: UInt64
+        ) -> Bool {
+            ghostty_surface_scroll_to_row_if_history_matches(
+                surface,
+                row,
+                contentGeneration,
+                screenIdentity
+            )
         }
     }
 }

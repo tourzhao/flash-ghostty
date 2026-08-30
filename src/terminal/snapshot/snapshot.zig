@@ -1729,6 +1729,7 @@ test "incremental decode restores a renderable terminal at READY" {
     const primary = restored.screens.get(.primary).?;
     const alternate = restored.screens.get(.alternate).?;
     try testing.expectEqual(3, primary.pages.scrollbar().total);
+    const initial_content_generation = primary.pages.scrollbar().content_generation;
     try testing.expectEqual(4, decoded.history_rows.get(.primary).?);
     try testing.expectEqual(
         alternate.pages.scrollbar().total - restored.rows,
@@ -1743,6 +1744,10 @@ test "incremental decode restores a renderable terminal at READY" {
         .remaining = 1,
     }, first);
     try testing.expectEqual(5, primary.pages.scrollbar().total);
+    try testing.expectEqual(
+        initial_content_generation +% 1,
+        primary.pages.scrollbar().content_generation,
+    );
     try testing.expectEqual(@as(u21, 'B'), testTopLeftCodepoint(primary));
 
     const second = (try decoder.next(testing.allocator, &restored)).?;
@@ -1752,6 +1757,10 @@ test "incremental decode restores a renderable terminal at READY" {
         .remaining = 0,
     }, second);
     try testing.expectEqual(7, primary.pages.scrollbar().total);
+    try testing.expectEqual(
+        initial_content_generation +% 2,
+        primary.pages.scrollbar().content_generation,
+    );
     try testing.expectEqual(@as(u21, 'A'), testTopLeftCodepoint(primary));
 
     // The alternate screen's empty sequence produces no event: the next

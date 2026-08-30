@@ -4005,7 +4005,7 @@ pub fn default(alloc_gpa: Allocator) Allocator.Error!Config {
 
     // Add our default link for URL detection
     try result.link.links.append(alloc, .{
-        .regex = url.regex,
+        .regex = if (builtin.os.tag == .macos) url.macos_regex else url.regex,
         .action = .{ .open = {} },
         .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
     });

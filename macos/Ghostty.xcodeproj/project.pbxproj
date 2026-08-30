@@ -595,6 +595,7 @@
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "A program running within $(FLASH_GHOSTTY_APP_DISPLAY_NAME) would like to use speech recognition.";
 				INFOPLIST_KEY_NSSystemAdministrationUsageDescription = "A program running within $(FLASH_GHOSTTY_APP_DISPLAY_NAME) requires elevated privileges.";
 				INFOPLIST_PREPROCESS = YES;
+				INFOPLIST_PREPROCESSOR_DEFINITIONS = "FLASH_GHOSTTY_PROHIBIT_MULTIPLE_INSTANCES=1";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -1051,6 +1052,7 @@
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "A program running within $(FLASH_GHOSTTY_APP_DISPLAY_NAME) would like to use speech recognition.";
 				INFOPLIST_KEY_NSSystemAdministrationUsageDescription = "A program running within $(FLASH_GHOSTTY_APP_DISPLAY_NAME) requires elevated privileges.";
 				INFOPLIST_PREPROCESS = YES;
+				INFOPLIST_PREPROCESSOR_DEFINITIONS = "FLASH_GHOSTTY_PROHIBIT_MULTIPLE_INSTANCES=1";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

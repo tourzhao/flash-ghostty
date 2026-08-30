@@ -121,4 +121,41 @@ struct TransferablePasteboardTests {
             #expect(String(data: plainData, encoding: .utf8) == "shared content")
         }
     }
+
+    @Test func multipleCompletionsCanReturnAsynchronouslyOnTheLoadingQueue() {
+        let loadingQueue = DispatchQueue(
+            label: "com.mitchellh.ghostty.tests.transferable-data-provider"
+        )
+        let loadingQueueKey = DispatchSpecificKey<Void>()
+        loadingQueue.setSpecific(key: loadingQueueKey, value: ())
+
+        let dataType = NSPasteboard.PasteboardType(UTType.data.identifier)
+        let textType = NSPasteboard.PasteboardType(UTType.plainText.identifier)
+        let expectedData = [
+            dataType.rawValue: Data("deferred data".utf8),
+            textType.rawValue: Data("deferred text".utf8),
+        ]
+        let provider = TransferableDataProvider(loadingQueue: loadingQueue) { type, completion in
+            #expect(DispatchQueue.getSpecific(key: loadingQueueKey) != nil)
+
+            // CoreTransferable may deliver asynchronously on the executor that
+            // initiated the load. The loading queue must be free before the
+            // synchronous pasteboard callback starts waiting for this block.
+            loadingQueue.async {
+                completion(expectedData[type])
+            }
+        }
+        let item = NSPasteboardItem()
+        let finished = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            provider.pasteboard(nil, item: item, provideDataForType: dataType)
+            provider.pasteboard(nil, item: item, provideDataForType: textType)
+            finished.signal()
+        }
+
+        #expect(finished.wait(timeout: .now() + 2) == .success)
+        #expect(item.data(forType: dataType) == expectedData[dataType.rawValue])
+        #expect(item.data(forType: textType) == expectedData[textType.rawValue])
+    }
 }

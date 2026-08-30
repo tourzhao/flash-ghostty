@@ -1,6 +1,32 @@
 import Cocoa
 import Combine
 
+/// Resolves one complete native-group sample independently of controller
+/// iteration order: the selected session owns shared presentation state.
+/// Candidate history across incremental AppKit group assembly is a separate
+/// lifecycle concern and must already be intact when this policy is called.
+enum SessionWorkspacePresentationMergePolicy {
+    /// The workspace-level presentation redundantly archived by each native-tab
+    /// controller. A complete native group can contain conflicting values after
+    /// an interrupted write or when migrating a development build.
+    struct Candidate: Equatable, Sendable {
+        let sessionID: SessionWorkspace.SessionID
+        let isSidebarVisible: Bool
+        let isFileBrowserVisible: Bool
+    }
+
+    static func resolve(
+        selectedSessionID: SessionWorkspace.SessionID,
+        candidates: [Candidate]
+    ) -> Candidate? {
+        guard Set(candidates.map(\.sessionID)).count == candidates.count else {
+            return nil
+        }
+
+        return candidates.first { $0.sessionID == selectedSessionID }
+    }
+}
+
 /// Owns FLASH-Ghostty's application-level session workspace and keeps it in
 /// sync with AppKit's native tab presentation.
 ///
@@ -18,6 +44,7 @@ final class FlashSessionTabCoordinator {
 
     var workspace: SessionWorkspace { adapter.workspace }
     var isSidebarVisible: Bool { workspace.isSidebarVisible }
+    var fileBrowserIsVisible: Bool { workspace.isFileBrowserVisible }
     private(set) var isClosing = false
 
     private weak var observedTabGroup: NSWindowTabGroup?
@@ -26,6 +53,7 @@ final class FlashSessionTabCoordinator {
     private var workspaceObservation: AnyCancellable?
     private var adapterObservation: AnyCancellable?
     private var lastSidebarVisibility: Bool?
+    private var lastFileBrowserVisibility: Bool?
 
     init(sessionID: SessionID, usesSidebar: Bool) {
         self.sessionID = sessionID
@@ -81,12 +109,18 @@ final class FlashSessionTabCoordinator {
 
                 let visibilityChanged = lastSidebarVisibility != nil &&
                     lastSidebarVisibility != snapshot.isSidebarVisible
+                let fileBrowserVisibilityChanged = lastFileBrowserVisibility != nil &&
+                    lastFileBrowserVisibility != snapshot.isFileBrowserVisible
                 lastSidebarVisibility = snapshot.isSidebarVisible
+                lastFileBrowserVisibility = snapshot.isFileBrowserVisible
                 owner.flashSessionSidebarRevisionDidChange()
 
-                guard visibilityChanged else { return }
-                updateInitialContentSize(isVisible: snapshot.isSidebarVisible)
-                (owner.window as? TerminalWindow)?.sessionSidebarVisibilityDidChange()
+                guard visibilityChanged || fileBrowserVisibilityChanged else { return }
+                guard owner.isWindowLoaded else { return }
+                updateInitialContentSize()
+                if visibilityChanged {
+                    (owner.window as? TerminalWindow)?.sessionSidebarVisibilityDidChange()
+                }
             }
 
         adapterObservation = adapter.$bindingRevision
@@ -113,10 +147,16 @@ final class FlashSessionTabCoordinator {
         guard let owner, !isClosing else { return false }
 
         let previousVisibility = isSidebarVisible
+        let previousFileBrowserVisibility = fileBrowserIsVisible
         let source = adapter
+        // NSWindowController.window is lazy. New tabs and undo restorations
+        // intentionally adopt their logical workspace before loading the
+        // SwiftUI root; forcing the window here briefly materializes a
+        // singleton sidebar and can leave that stale list on screen.
+        let loadedWindow = owner.isWindowLoaded ? owner.window : nil
         guard source.transferSession(
             sessionID,
-            window: owner.window,
+            window: loadedWindow,
             to: destination,
             at: index,
             select: select,
@@ -127,15 +167,22 @@ final class FlashSessionTabCoordinator {
 
         adapter = destination
         lastSidebarVisibility = previousVisibility
+        lastFileBrowserVisibility = previousFileBrowserVisibility
         bindWorkspaceObservation()
         return true
     }
 
     @discardableResult
-    func becomeIndependent(isSidebarVisible: Bool) -> Bool {
+    func becomeIndependent(
+        isSidebarVisible: Bool,
+        isFileBrowserVisible: Bool
+    ) -> Bool {
         adoptWorkspace(
             NativeTabGroupAdapter(
-                workspace: SessionWorkspace(isSidebarVisible: isSidebarVisible)
+                workspace: SessionWorkspace(
+                    isSidebarVisible: isSidebarVisible,
+                    isFileBrowserVisible: isFileBrowserVisible
+                )
             ),
             select: true
         )
@@ -200,12 +247,20 @@ final class FlashSessionTabCoordinator {
             return true
         }
 
-        let presentationController = controllers.first {
-            $0.sessionID == selectedSessionID
-        } ?? controllers[0]
+        guard let presentation = SessionWorkspacePresentationMergePolicy.resolve(
+            selectedSessionID: selectedSessionID,
+            candidates: controllers.map {
+                SessionWorkspacePresentationMergePolicy.Candidate(
+                    sessionID: $0.sessionID,
+                    isSidebarVisible: $0.sessionSidebarIsVisible,
+                    isFileBrowserVisible: $0.fileBrowserIsVisible
+                )
+            }
+        ) else { return false }
         let mergedAdapter = NativeTabGroupAdapter(
             workspace: SessionWorkspace(
-                isSidebarVisible: presentationController.sessionSidebarIsVisible
+                isSidebarVisible: presentation.isSidebarVisible,
+                isFileBrowserVisible: presentation.isFileBrowserVisible
             )
         )
         let memberships = controllers.compactMap { controller -> WorkspaceMembership? in
@@ -392,7 +447,8 @@ final class FlashSessionTabCoordinator {
         for (group, snapshot) in zip(sample.groups, snapshots) {
             let partitionAdapter = NativeTabGroupAdapter(
                 workspace: SessionWorkspace(
-                    isSidebarVisible: snapshot.isSidebarVisible
+                    isSidebarVisible: snapshot.isSidebarVisible,
+                    isFileBrowserVisible: snapshot.isFileBrowserVisible
                 )
             )
             for (index, controller) in group.controllers.enumerated() {
@@ -424,7 +480,11 @@ final class FlashSessionTabCoordinator {
     func nativeAttachmentDidFail() {
         guard usesSidebar, !isClosing, let owner else { return }
         let visibility = isSidebarVisible
-        if becomeIndependent(isSidebarVisible: visibility) {
+        let fileBrowserVisibility = fileBrowserIsVisible
+        if becomeIndependent(
+            isSidebarVisible: visibility,
+            isFileBrowserVisible: fileBrowserVisibility
+        ) {
             setupObservation()
             owner.invalidateRestorableState()
         }
@@ -453,14 +513,41 @@ final class FlashSessionTabCoordinator {
         }
     }
 
-    private func updateInitialContentSize(isVisible: Bool) {
+    func toggleFileBrowser() {
+        guard usesSidebar else { return }
+        synchronizeFileBrowserVisibility(!fileBrowserIsVisible)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.restoreTerminalFocusAfterToggle()
+        }
+    }
+
+    func synchronizeFileBrowserVisibility(
+        _ isVisible: Bool,
+        invalidateSavedState: Bool = true
+    ) {
+        guard fileBrowserIsVisible != isVisible else { return }
+
+        workspace.setFileBrowserVisible(isVisible)
+        if invalidateSavedState {
+            for controller in controllers {
+                controller.invalidateRestorableState()
+            }
+        }
+    }
+
+    private func updateInitialContentSize() {
         guard usesSidebar,
               let owner,
+              owner.isWindowLoaded,
               let container = owner.terminalViewContainer,
               var initialContentSize = owner.focusedSurface?.initialSize else { return }
 
         initialContentSize.width += TerminalSessionRootView.sidebarChromeWidth(
-            isVisible: isVisible
+            isVisible: isSidebarVisible
+        )
+        initialContentSize.width += TerminalSessionRootView.fileBrowserChromeWidth(
+            isVisible: fileBrowserIsVisible
         )
         initialContentSize.height += TerminalSessionRootView.terminalMetadataHeight
         container.initialContentSize = initialContentSize
@@ -622,16 +709,14 @@ final class FlashSessionTabCoordinator {
         selectedWindowObservation = nil
         observedTabGroup = tabGroup
 
-        windowsObservation = tabGroup?.observe(\.windows, options: [.new]) {
-            [weak self] _, _ in
+        windowsObservation = tabGroup?.observe(\.windows, options: [.new]) { [weak self] _, _ in
             MainActor.assumeIsolated {
                 guard let self, !self.isClosing else { return }
                 self.updateObservation()
             }
         }
 
-        selectedWindowObservation = tabGroup?.observe(\.selectedWindow, options: [.new]) {
-            [weak self] _, _ in
+        selectedWindowObservation = tabGroup?.observe(\.selectedWindow, options: [.new]) { [weak self] _, _ in
             MainActor.assumeIsolated {
                 guard let self, !self.isClosing else { return }
                 self.updateObservation()
@@ -678,6 +763,10 @@ final class FlashSessionTabCoordinator {
     /// native group, preventing synchronous KVO from re-adopting it.
     func beginClosing(window: NSWindow?) {
         isClosing = true
+        workspaceObservation?.cancel()
+        workspaceObservation = nil
+        adapterObservation?.cancel()
+        adapterObservation = nil
         windowsObservation?.invalidate()
         windowsObservation = nil
         selectedWindowObservation?.invalidate()

@@ -57,6 +57,10 @@
 		<key>GHOSTTY_MAC_LAUNCH_SOURCE</key>
 		<string>app</string>
 	</dict>
+#if FLASH_GHOSTTY_PROHIBIT_MULTIPLE_INSTANCES
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+#endif
 	<key>MDItemKeywords</key>
 	<string>Terminal</string>
 	<key>NSAppleScriptEnabled</key>

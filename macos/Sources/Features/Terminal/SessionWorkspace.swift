@@ -27,15 +27,45 @@ final class SessionWorkspace: ObservableObject {
         var orderedSessionIDs: [SessionID]
         var selectedSessionID: SessionID?
         var isSidebarVisible: Bool
+        var isFileBrowserVisible: Bool
 
         init(
             orderedSessionIDs: [SessionID] = [],
             selectedSessionID: SessionID? = nil,
-            isSidebarVisible: Bool = true
+            isSidebarVisible: Bool = true,
+            isFileBrowserVisible: Bool = true
         ) {
             self.orderedSessionIDs = orderedSessionIDs
             self.selectedSessionID = selectedSessionID
             self.isSidebarVisible = isSidebarVisible
+            self.isFileBrowserVisible = isFileBrowserVisible
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case orderedSessionIDs
+            case selectedSessionID
+            case isSidebarVisible
+            case isFileBrowserVisible
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            orderedSessionIDs = try container.decode(
+                [SessionID].self,
+                forKey: .orderedSessionIDs
+            )
+            selectedSessionID = try container.decodeIfPresent(
+                SessionID.self,
+                forKey: .selectedSessionID
+            )
+            isSidebarVisible = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .isSidebarVisible
+            ) ?? true
+            isFileBrowserVisible = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .isFileBrowserVisible
+            ) ?? true
         }
     }
 
@@ -44,18 +74,21 @@ final class SessionWorkspace: ObservableObject {
     var orderedSessionIDs: [SessionID] { snapshot.orderedSessionIDs }
     var selectedSessionID: SessionID? { snapshot.selectedSessionID }
     var isSidebarVisible: Bool { snapshot.isSidebarVisible }
+    var isFileBrowserVisible: Bool { snapshot.isFileBrowserVisible }
     var sessionCount: Int { snapshot.orderedSessionIDs.count }
 
     init(
         sessionIDs: [SessionID] = [],
         selectedSessionID: SessionID? = nil,
-        isSidebarVisible: Bool = true
+        isSidebarVisible: Bool = true,
+        isFileBrowserVisible: Bool = true
     ) {
         self.snapshot = Self.normalized(
             Snapshot(
                 orderedSessionIDs: sessionIDs,
                 selectedSessionID: selectedSessionID,
-                isSidebarVisible: isSidebarVisible
+                isSidebarVisible: isSidebarVisible,
+                isFileBrowserVisible: isFileBrowserVisible
             )
         )
     }
@@ -64,7 +97,8 @@ final class SessionWorkspace: ObservableObject {
         self.init(
             sessionIDs: snapshot.orderedSessionIDs,
             selectedSessionID: snapshot.selectedSessionID,
-            isSidebarVisible: snapshot.isSidebarVisible
+            isSidebarVisible: snapshot.isSidebarVisible,
+            isFileBrowserVisible: snapshot.isFileBrowserVisible
         )
     }
 
@@ -194,6 +228,18 @@ final class SessionWorkspace: ObservableObject {
         setSidebarVisible(!snapshot.isSidebarVisible)
     }
 
+    func setFileBrowserVisible(_ isVisible: Bool) {
+        guard snapshot.isFileBrowserVisible != isVisible else { return }
+
+        var next = snapshot
+        next.isFileBrowserVisible = isVisible
+        publish(next)
+    }
+
+    func toggleFileBrowserVisibility() {
+        setFileBrowserVisible(!snapshot.isFileBrowserVisible)
+    }
+
     private func publish(_ next: Snapshot) {
         let next = Self.normalized(next)
         guard next != snapshot else { return }
@@ -223,7 +269,8 @@ final class SessionWorkspace: ObservableObject {
         return Snapshot(
             orderedSessionIDs: orderedSessionIDs,
             selectedSessionID: selectedSessionID,
-            isSidebarVisible: candidate.isSidebarVisible
+            isSidebarVisible: candidate.isSidebarVisible,
+            isFileBrowserVisible: candidate.isFileBrowserVisible
         )
     }
 }

@@ -2,53 +2,44 @@ import Combine
 import Foundation
 import GhosttyKit
 
-/// One app-wide clock refreshes weakly held session monitors. This avoids a
-/// separate run-loop timer for every native tab while preserving one-second
-/// prompt/activity responsiveness.
-@MainActor
-final class TerminalSessionMetadataRefreshScheduler {
-    static let shared = TerminalSessionMetadataRefreshScheduler()
+/// `CachedValue` protects its fetch/cache state with an `NSLock`, and the
+/// underlying Ghostty text API protects renderer state with its own mutex.
+/// This narrow wrapper also keeps the AppKit view (and therefore libghostty's
+/// unretained userdata) alive until the read is handed back to the main actor.
+private final class TerminalSessionVisibleContentsSource: @unchecked Sendable {
+    private let owner: Ghostty.SurfaceView
+    private let value: CachedValue<String>
 
-    private let monitors = NSHashTable<TerminalSessionMetadataMonitor>.weakObjects()
-    private var timer: AnyCancellable?
-
-    private init() {}
-
-    private func startTimerIfNeeded() {
-        guard timer == nil else { return }
-
-        timer = Timer.publish(every: 1, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                self?.refreshRegisteredMonitors()
-            }
+    init(_ owner: Ghostty.SurfaceView) {
+        self.owner = owner
+        self.value = owner.cachedActiveScreenContents
     }
 
-    func register(_ monitor: TerminalSessionMetadataMonitor) {
-        monitors.add(monitor)
-        startTimerIfNeeded()
-        monitor.refresh()
-    }
-
-    func unregister(_ monitor: TerminalSessionMetadataMonitor) {
-        monitors.remove(monitor)
-        stopTimerIfIdle()
-    }
-
-    private func refreshRegisteredMonitors() {
-        let registeredMonitors = monitors.allObjects
-        guard !registeredMonitors.isEmpty else {
-            stopTimerIfIdle()
-            return
+    func read() -> String {
+        withExtendedLifetime(owner) {
+            value.get()
         }
+    }
+}
 
-        registeredMonitors.forEach { $0.refresh() }
+/// Lets a surface/tool generation invalidate a queued read before it reaches
+/// the renderer lock. A cancellation that races after `isCancelled` is checked
+/// can still enter `read`; the result is rejected again on the main actor.
+private final class TerminalSessionVisibleContentsReadTicket: @unchecked Sendable {
+    let requestID: UInt
+    private let lock = NSLock()
+    private var cancelled = false
+
+    init(requestID: UInt) {
+        self.requestID = requestID
     }
 
-    private func stopTimerIfIdle() {
-        guard monitors.allObjects.isEmpty else { return }
-        timer?.cancel()
-        timer = nil
+    var isCancelled: Bool {
+        lock.withLock { cancelled }
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
     }
 }
 
@@ -69,16 +60,38 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         qos: .utility,
         attributes: .concurrent
     )
+    /// Renderer-backed active-screen reads and their string scans are deliberately
+    /// serialized away from the main actor. Serializing also prevents one
+    /// scheduler tick from making every session contend for renderer locks at
+    /// the same time.
+    private static let visibleContentsQueue = DispatchQueue(
+        label: "com.flashghostty.session-metadata.visible-contents",
+        qos: .utility
+    )
 
     private weak var surface: Ghostty.SurfaceView?
     private var surfaceCancellables: Set<AnyCancellable> = []
     private var progressReport: Ghostty.Action.ProgressReport?
-    private var lastInstructions: [UUID: String] = [:]
+    private var lastInstructions = SessionInstructionStore()
     private var instructionCaptureGeneration: UInt = 0
     private var processLookupGeneration: UInt = 0
     private var processLookupIsInFlight = false
+    private var processLookupThrottle = SessionProcessLookupThrottle()
+    private var claudeVisibleContentsAnalysis: TerminalSessionVisibleContentsAnalysis?
+    private var lastClaudeVisibleContentsRefreshUptime: TimeInterval?
+    private var visibleContentsReadGeneration: UInt = 0
+    private var claudeRequestState = SessionContentsRequestState()
+    private var codexRequestState = SessionContentsRequestState()
+    private var claudeReadTicket: TerminalSessionVisibleContentsReadTicket?
+    private var codexReadTicket: TerminalSessionVisibleContentsReadTicket?
+    private var visibleContentsTrailingRefresh: DispatchWorkItem?
+    private var deferredInstructionCapture = DeferredInstructionCaptureState()
+    private var refreshThrottle = SessionMetadataRefreshThrottle()
 
     var boundSurface: Ghostty.SurfaceView? { surface }
+    var requiresPeriodicRefresh: Bool {
+        refreshThrottle.mode != .suspended
+    }
 
     /// Bind to the best live surface from the controller's logical split tree.
     /// Transient focus loss preserves the previous valid source; removal from
@@ -102,17 +115,24 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         instructionCaptureGeneration &+= 1
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
+        processLookupThrottle.reset()
         progressReport = nil
         activityStatus = .ready
-        lastInstruction = lastInstructions[nextSurface.id]
+        tool = .terminal
+        lastInstruction = nil
         foregroundProcessName = nil
+        invalidateVisibleContentsReads()
+        deferredInstructionCapture.reset()
 
         nextSurface.$title
-            .combineLatest(nextSurface.$bell)
+            .removeDuplicates()
+            .combineLatest(nextSurface.$bell.removeDuplicates())
             .sink { [weak self] title, bell in
                 guard let self else { return }
-                dynamicTitle = title
-                refreshActivityStatus()
+                if dynamicTitle != title {
+                    dynamicTitle = title
+                    refreshActivityStatus()
+                }
                 titleDidChange(title, bell)
             }
             .store(in: &surfaceCancellables)
@@ -133,10 +153,12 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             .store(in: &surfaceCancellables)
 
         nextSurface.$pwd
+            .removeDuplicates()
             .map { path -> URL? in
                 guard let path, !path.isEmpty else { return nil }
                 return URL(fileURLWithPath: path)
             }
+            .removeDuplicates()
             .sink { [weak self] in self?.workingDirectory = $0 }
             .store(in: &surfaceCancellables)
 
@@ -147,36 +169,145 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     /// resolution off the main thread. Repeated timer ticks coalesce while a
     /// lookup is already in flight.
     func refresh() {
-        refreshActivityStatus()
+        refresh(allowClaudeSnapshotReuse: false)
+    }
+
+    func updateRefreshContext(
+        sidebarIsVisible: Bool,
+        sessionIsSelected: Bool
+    ) {
+        let nextMode = SessionMetadataPollingMode.resolve(
+            sidebarIsVisible: sidebarIsVisible,
+            sessionIsSelected: sessionIsSelected
+        )
+        guard nextMode != refreshThrottle.mode else { return }
+
+        let wasSuspended = refreshThrottle.mode == .suspended
+        let shouldRefreshImmediately = refreshThrottle.update(mode: nextMode)
+        TerminalSessionMetadataRefreshScheduler.shared.refreshContextDidChange()
+        if nextMode == .suspended {
+            // A hidden sidebar has no consumer for renderer-backed metadata.
+            // Cancel queued reads before they enter the renderer lock and reject
+            // a read that is already running. Reopening starts from a fresh
+            // snapshot because invalidation also clears its refresh timestamp.
+            invalidateVisibleContentsReads()
+            return
+        }
+        guard shouldRefreshImmediately else { return }
+        if wasSuspended {
+            // Reopening the sidebar must not reuse a snapshot retained while
+            // reads were suspended; the immediate refresh below fetches fresh
+            // terminal contents instead.
+            lastClaudeVisibleContentsRefreshUptime = nil
+        }
+        refreshPeriodicMetadata()
+    }
+
+    /// Invalidate every asynchronous result owned by the monitoring lifecycle.
+    /// Window close can leave a controller alive briefly for AppKit teardown, so
+    /// unregistering it from the scheduler alone is not sufficient cancellation.
+    func stopMonitoring() {
+        instructionCaptureGeneration &+= 1
+        processLookupGeneration &+= 1
+        processLookupIsInFlight = false
+        processLookupThrottle.reset()
+        _ = refreshThrottle.update(mode: .suspended)
+        invalidateVisibleContentsReads()
+        deferredInstructionCapture.reset()
+    }
+
+    func refreshWhenRegistered() {
+        guard refreshThrottle.mode != .suspended else { return }
+        refreshPeriodicMetadata()
+    }
+
+    func refreshPeriodically() {
+        guard refreshThrottle.consumeTick() else { return }
+        refreshPeriodicMetadata()
+    }
+
+    private func refreshPeriodicMetadata() {
+        let defersVisibleContentsRefresh = hasRecentScrollInput(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        refresh(
+            allowClaudeSnapshotReuse: true,
+            defersVisibleContentsRefresh: defersVisibleContentsRefresh
+        )
+        retryPendingInstructionCapture(
+            defersVisibleContentsRefresh: defersVisibleContentsRefresh
+        )
+    }
+
+    private func refresh(
+        allowClaudeSnapshotReuse: Bool,
+        defersVisibleContentsRefresh: Bool = false
+    ) {
+        refreshActivityStatus(
+            allowClaudeSnapshotReuse: allowClaudeSnapshotReuse,
+            defersVisibleContentsRefresh: defersVisibleContentsRefresh
+        )
 
         guard !processLookupIsInFlight,
               let surface,
               let pid = surface.surfaceModel?.foregroundPID,
               let processID = Int32(exactly: pid) else { return }
 
+        let lookupUptime = ProcessInfo.processInfo.systemUptime
+        guard processLookupThrottle.shouldLookup(
+            processID: processID,
+            now: lookupUptime
+        ) else { return }
+
         processLookupIsInFlight = true
-        let generation = processLookupGeneration
-        let surfaceID = surface.id
+        let request = SessionProcessLookupRequest(
+            generation: processLookupGeneration,
+            surfaceID: surface.id,
+            processID: processID
+        )
 
         Self.processLookupQueue.async { [weak self] in
             let processName = TerminalSessionProcessResolver.foregroundProcessName(
-                startingAt: processID
+                startingAt: request.processID
             )
 
             DispatchQueue.main.async { [weak self] in
-                guard let self,
-                      processLookupGeneration == generation,
-                      self.surface?.id == surfaceID else { return }
+                guard let self else { return }
+                let currentProcessID = self.surface?.surfaceModel?.foregroundPID
+                    .flatMap { Int32(exactly: $0) }
 
-                processLookupIsInFlight = false
+                switch request.disposition(
+                    currentGeneration: processLookupGeneration,
+                    currentSurfaceID: self.surface?.id,
+                    currentProcessID: currentProcessID
+                ) {
+                case .discard:
+                    return
+                case .retryCurrentProcess:
+                    processLookupIsInFlight = false
+                    // The surface stayed bound while its foreground process
+                    // changed. Reject the old ancestry result and immediately
+                    // start resolving the current PID instead of waiting for
+                    // the next scheduler tick.
+                    refresh()
+                    return
+                case .accept:
+                    processLookupIsInFlight = false
+                }
 
                 // A transient proc_pidinfo failure must not erase otherwise
                 // stable provider identity. A real exit yields the parent shell
                 // on a later successful poll.
-                if let processName, foregroundProcessName != processName {
-                    foregroundProcessName = processName
+                if let processName {
+                    processLookupThrottle.accept(
+                        processID: request.processID,
+                        now: ProcessInfo.processInfo.systemUptime
+                    )
+                    if foregroundProcessName != processName {
+                        foregroundProcessName = processName
+                        refreshActivityStatus(allowClaudeSnapshotReuse: false)
+                    }
                 }
-                refreshActivityStatus()
             }
         }
     }
@@ -187,6 +318,7 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         instructionCaptureGeneration &+= 1
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
+        processLookupThrottle.reset()
         surfaceCancellables = []
         surface = nil
         dynamicTitle = ""
@@ -196,25 +328,374 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         activityStatus = .ready
         lastInstruction = nil
         workingDirectory = nil
+        invalidateVisibleContentsReads()
+        deferredInstructionCapture.reset()
         titleDidChange("👻", false)
     }
 
+    private func invalidateVisibleContentsReads() {
+        visibleContentsReadGeneration &+= 1
+        visibleContentsTrailingRefresh?.cancel()
+        visibleContentsTrailingRefresh = nil
+        claudeReadTicket?.cancel()
+        codexReadTicket?.cancel()
+        claudeReadTicket = nil
+        codexReadTicket = nil
+        claudeRequestState.reset()
+        codexRequestState.reset()
+        claudeVisibleContentsAnalysis = nil
+        lastClaudeVisibleContentsRefreshUptime = nil
+    }
+
+    func hasRecentScrollInput(now: TimeInterval) -> Bool {
+        guard let lastScrollInput = surface?.lastScrollInputUptime else { return false }
+        return now - lastScrollInput < SessionContentsRefreshPolicy.scrollCooldown
+    }
+
+    private func claudeAnalysis(
+        allowSnapshotReuse: Bool,
+        defersSnapshotRefresh: Bool
+    ) -> TerminalSessionVisibleContentsAnalysis? {
+        guard let surface else {
+            return TerminalSessionVisibleContentsAnalysis(
+                requiresUserInput: false,
+                lastInstruction: nil
+            )
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let decision = SessionContentsRefreshPolicy.decision(
+            now: now,
+            lastScrollInput: surface.lastScrollInputUptime,
+            lastRefresh: lastClaudeVisibleContentsRefreshUptime,
+            allowsSnapshotReuse: allowSnapshotReuse,
+            defersSnapshotRefresh: defersSnapshotRefresh
+        )
+
+        switch decision {
+        case .deferUntilScrollingStops:
+            return nil
+        case .reuseSnapshot:
+            if let claudeVisibleContentsAnalysis {
+                return claudeVisibleContentsAnalysis
+            }
+            scheduleClaudeAnalysisRead(from: surface, purpose: .status)
+            return nil
+        case .refreshSnapshot:
+            scheduleClaudeAnalysisRead(
+                from: surface,
+                purpose: .status,
+                requiresFreshResultIfBusy: true
+            )
+            return nil
+        }
+    }
+
+    private func scheduleClaudeAnalysisRead(
+        from surface: Ghostty.SurfaceView,
+        purpose: SessionContentsRequestState.Purpose,
+        requiresFreshResultIfBusy: Bool = false
+    ) {
+        guard refreshThrottle.mode.allowsVisibleContentsReads else { return }
+        let action = claudeRequestState.request(
+            purpose,
+            now: ProcessInfo.processInfo.systemUptime,
+            requiresFreshResultIfBusy: requiresFreshResultIfBusy
+        )
+        switch action {
+        case .start(let request):
+            visibleContentsTrailingRefresh?.cancel()
+            visibleContentsTrailingRefresh = nil
+            enqueueClaudeAnalysisRead(from: surface, request: request)
+        case .scheduleTrailing(let trailingRefresh):
+            replaceClaudeTrailingRefresh(trailingRefresh)
+        case .coalesced:
+            break
+        }
+    }
+
+    private func replaceClaudeTrailingRefresh(
+        _ trailingRefresh: SessionContentsRequestState.TrailingRefresh
+    ) {
+        visibleContentsTrailingRefresh?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self,
+                      let request = self.claudeRequestState.beginTrailingRefresh(
+                        id: trailingRefresh.id
+                      ) else { return }
+                self.visibleContentsTrailingRefresh = nil
+                guard self.refreshThrottle.mode.allowsVisibleContentsReads,
+                      let surface = self.surface,
+                      TerminalSessionTool.detect(
+                        fromDynamicTitle: self.dynamicTitle,
+                        foregroundProcessName: self.foregroundProcessName
+                      ) == .claudeCode else {
+                    self.claudeRequestState.reset()
+                    return
+                }
+                self.enqueueClaudeAnalysisRead(from: surface, request: request)
+            }
+        }
+        visibleContentsTrailingRefresh = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + trailingRefresh.delay,
+            execute: workItem
+        )
+    }
+
+    private func enqueueClaudeAnalysisRead(
+        from surface: Ghostty.SurfaceView,
+        request: SessionContentsRequestState.Request
+    ) {
+        let source = TerminalSessionVisibleContentsSource(surface)
+        let surfaceID = surface.id
+        let generation = visibleContentsReadGeneration
+        let ticket = TerminalSessionVisibleContentsReadTicket(requestID: request.id)
+        claudeReadTicket = ticket
+
+        Self.visibleContentsQueue.async {
+            // Coalesced requests never enqueue a job. Generation invalidation
+            // cancels queued jobs before this last pre-lock check. Cancellation
+            // can still race immediately after the check; the main-actor
+            // generation/request validation rejects that result.
+            let analysis: TerminalSessionVisibleContentsAnalysis?
+            if ticket.isCancelled {
+                analysis = nil
+            } else {
+                let candidate = TerminalSessionVisibleContentsAnalyzer.analyze(
+                    tool: .claudeCode,
+                    visibleContents: source.read()
+                )
+                analysis = ticket.isCancelled ? nil : candidate
+            }
+
+            DispatchQueue.main.async { [weak self, source] in
+                // Ensure a surface removed while the queue was reading is
+                // released on AppKit's actor, never on the utility queue.
+                defer { withExtendedLifetime(source) {} }
+                guard let self,
+                      let analysis,
+                      visibleContentsReadGeneration == generation,
+                      self.surface?.id == surfaceID else { return }
+
+                let completionUptime = ProcessInfo.processInfo.systemUptime
+                let completion = claudeRequestState.complete(
+                    requestID: request.id,
+                    now: completionUptime
+                )
+                guard completion.acceptsResult else { return }
+                if claudeReadTicket?.requestID == request.id {
+                    claudeReadTicket = nil
+                }
+
+                // A superseded request must not briefly apply stale permission
+                // or title facts. Keep only the follow-up requirement and let
+                // the next read produce the state that reaches the sidebar.
+                if let followUpPurpose = completion.followUpPurpose {
+                    let defersVisibleContentsRefresh = hasRecentScrollInput(
+                        now: ProcessInfo.processInfo.systemUptime
+                    )
+                    switch followUpPurpose {
+                    case .status:
+                        lastClaudeVisibleContentsRefreshUptime = nil
+                        if !defersVisibleContentsRefresh,
+                           let currentSurface = self.surface,
+                           currentSurface.id == surfaceID,
+                           TerminalSessionTool.detect(
+                            fromDynamicTitle: dynamicTitle,
+                            foregroundProcessName: foregroundProcessName
+                           ) == .claudeCode {
+                            scheduleClaudeAnalysisRead(
+                                from: currentSurface,
+                                purpose: .status
+                            )
+                        }
+                    case .instructionCapture:
+                        retryPendingInstructionCapture(
+                            defersVisibleContentsRefresh:
+                                defersVisibleContentsRefresh
+                        )
+                    }
+                    return
+                }
+
+                claudeVisibleContentsAnalysis = analysis
+                lastClaudeVisibleContentsRefreshUptime = completionUptime
+                if let captureID = completion.fulfilledCaptureID,
+                   deferredInstructionCapture.consume(id: captureID) {
+                    storeLastInstruction(analysis.lastInstruction)
+                }
+                refreshActivityStatus(
+                    allowClaudeSnapshotReuse: true,
+                    providedClaudeAnalysis: analysis
+                )
+                if deferredInstructionCapture.isPending {
+                    retryPendingInstructionCapture(
+                        defersVisibleContentsRefresh: hasRecentScrollInput(
+                            now: ProcessInfo.processInfo.systemUptime
+                        )
+                    )
+                }
+            }
+        }
+    }
+
     private func captureLastInstruction() {
-        let tool = TerminalSessionTool.detect(
+        let detectedTool = TerminalSessionTool.detect(
             fromDynamicTitle: dynamicTitle,
             foregroundProcessName: foregroundProcessName
         )
-        guard tool != .terminal else { return }
+        guard detectedTool != .terminal, surface != nil else { return }
 
-        let visibleContents = surface?.cachedVisibleContents.get() ?? ""
-        guard let instruction = TerminalSessionInstructionExtractor.lastInstruction(
-            tool: tool,
-            visibleContents: visibleContents
+        deferredInstructionCapture.markDeferred()
+        retryPendingInstructionCapture(
+            defersVisibleContentsRefresh: hasRecentScrollInput(
+                now: ProcessInfo.processInfo.systemUptime
+            )
+        )
+    }
+
+    private func retryPendingInstructionCapture(
+        defersVisibleContentsRefresh: Bool
+    ) {
+        guard refreshThrottle.mode.allowsVisibleContentsReads else { return }
+        guard InstructionCaptureRetryPolicy.shouldRetry(
+            hasPendingCapture: deferredInstructionCapture.isPending,
+            defersVisibleContentsRefresh: defersVisibleContentsRefresh
         ) else { return }
+        guard let captureID = deferredInstructionCapture.pendingID,
+              let surface else { return }
 
-        if let surfaceID = surface?.id {
-            lastInstructions[surfaceID] = instruction
+        let detectedTool = TerminalSessionTool.detect(
+            fromDynamicTitle: dynamicTitle,
+            foregroundProcessName: foregroundProcessName
+        )
+        let purpose = SessionContentsRequestState.Purpose
+            .instructionCapture(captureID)
+        switch detectedTool {
+        case .claudeCode:
+            scheduleClaudeAnalysisRead(from: surface, purpose: purpose)
+        case .codex:
+            scheduleCodexInstructionRead(from: surface, purpose: purpose)
+        case .terminal:
+            deferredInstructionCapture.reset()
         }
+    }
+
+    private func scheduleCodexInstructionRead(
+        from surface: Ghostty.SurfaceView,
+        purpose: SessionContentsRequestState.Purpose
+    ) {
+        guard refreshThrottle.mode.allowsVisibleContentsReads else { return }
+        let action = codexRequestState.request(
+            purpose,
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        switch action {
+        case .start(let request):
+            visibleContentsTrailingRefresh?.cancel()
+            visibleContentsTrailingRefresh = nil
+            enqueueCodexInstructionRead(from: surface, request: request)
+        case .scheduleTrailing(let trailingRefresh):
+            replaceCodexTrailingRefresh(trailingRefresh)
+        case .coalesced:
+            break
+        }
+    }
+
+    private func replaceCodexTrailingRefresh(
+        _ trailingRefresh: SessionContentsRequestState.TrailingRefresh
+    ) {
+        visibleContentsTrailingRefresh?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self,
+                      let request = self.codexRequestState.beginTrailingRefresh(
+                        id: trailingRefresh.id
+                      ) else { return }
+                self.visibleContentsTrailingRefresh = nil
+                guard self.refreshThrottle.mode.allowsVisibleContentsReads,
+                      let surface = self.surface,
+                      TerminalSessionTool.detect(
+                        fromDynamicTitle: self.dynamicTitle,
+                        foregroundProcessName: self.foregroundProcessName
+                      ) == .codex else {
+                    self.codexRequestState.reset()
+                    return
+                }
+                self.enqueueCodexInstructionRead(from: surface, request: request)
+            }
+        }
+        visibleContentsTrailingRefresh = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + trailingRefresh.delay,
+            execute: workItem
+        )
+    }
+
+    private func enqueueCodexInstructionRead(
+        from surface: Ghostty.SurfaceView,
+        request: SessionContentsRequestState.Request
+    ) {
+        let source = TerminalSessionVisibleContentsSource(surface)
+        let surfaceID = surface.id
+        let sourceGeneration = visibleContentsReadGeneration
+        let ticket = TerminalSessionVisibleContentsReadTicket(requestID: request.id)
+        codexReadTicket = ticket
+
+        Self.visibleContentsQueue.async {
+            let analysis: TerminalSessionVisibleContentsAnalysis?
+            if ticket.isCancelled {
+                analysis = nil
+            } else {
+                let candidate = TerminalSessionVisibleContentsAnalyzer.analyze(
+                    tool: .codex,
+                    visibleContents: source.read()
+                )
+                analysis = ticket.isCancelled ? nil : candidate
+            }
+
+            DispatchQueue.main.async { [weak self, source] in
+                defer { withExtendedLifetime(source) {} }
+                guard let self,
+                      let analysis,
+                      visibleContentsReadGeneration == sourceGeneration,
+                      self.surface?.id == surfaceID,
+                      TerminalSessionTool.detect(
+                        fromDynamicTitle: dynamicTitle,
+                        foregroundProcessName: foregroundProcessName
+                      ) == .codex else { return }
+
+                let completion = codexRequestState.complete(
+                    requestID: request.id,
+                    now: ProcessInfo.processInfo.systemUptime
+                )
+                guard completion.acceptsResult else { return }
+                if codexReadTicket?.requestID == request.id {
+                    codexReadTicket = nil
+                }
+                if let captureID = completion.fulfilledCaptureID,
+                   deferredInstructionCapture.consume(id: captureID) {
+                    storeLastInstruction(analysis.lastInstruction)
+                }
+                if completion.requiresFollowUp || deferredInstructionCapture.isPending {
+                    retryPendingInstructionCapture(
+                        defersVisibleContentsRefresh: hasRecentScrollInput(
+                            now: ProcessInfo.processInfo.systemUptime
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private func storeLastInstruction(_ instruction: String?) {
+        guard let instruction,
+              let surfaceID = surface?.id,
+              tool != .terminal else { return }
+
+        lastInstructions.store(instruction, surfaceID: surfaceID, tool: tool)
         if lastInstruction != instruction {
             lastInstruction = instruction
         }
@@ -222,10 +703,11 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
 
     private func scheduleLastInstructionCapture() {
         instructionCaptureGeneration &+= 1
+        deferredInstructionCapture.reset()
         let generation = instructionCaptureGeneration
         let surfaceID = surface?.id
 
-        // Agent TUIs update their title and viewport in neighboring render
+        // Agent TUIs update their title and active screen in neighboring render
         // passes. Bounded retries cross the visible-content cache interval.
         for delay in [0.0, 0.6, 1.2] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -237,7 +719,11 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         }
     }
 
-    private func refreshActivityStatus() {
+    private func refreshActivityStatus(
+        allowClaudeSnapshotReuse: Bool = false,
+        defersVisibleContentsRefresh: Bool = false,
+        providedClaudeAnalysis: TerminalSessionVisibleContentsAnalysis? = nil
+    ) {
         let detectedTool = TerminalSessionTool.detect(
             fromDynamicTitle: dynamicTitle,
             foregroundProcessName: foregroundProcessName
@@ -246,14 +732,62 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             // Structured reports are scoped to the provider process that
             // emitted them. Do not carry a crashed/exited agent's last report
             // into the shell or a subsequently launched provider.
+            instructionCaptureGeneration &+= 1
             progressReport = nil
             activityStatus = .ready
+            invalidateVisibleContentsReads()
+            deferredInstructionCapture.reset()
             tool = detectedTool
+            if let surfaceID = surface?.id {
+                lastInstruction = lastInstructions.instruction(
+                    surfaceID: surfaceID,
+                    tool: detectedTool
+                )
+            } else {
+                lastInstruction = nil
+            }
         }
 
-        let visibleContents = detectedTool == .claudeCode ?
-            surface?.cachedVisibleContents.get() ?? "" : ""
         var currentProgressReport = progressReport
+        var currentAnalysis = providedClaudeAnalysis
+        let contentIndependentStatus =
+            TerminalSessionActivityClassifier.statusWithoutVisibleContentsIfDefinitive(
+                tool: detectedTool,
+                dynamicTitle: dynamicTitle,
+                progressReport: currentProgressReport,
+                previous: activityStatus
+            )
+        let requiresVisibleContents =
+            TerminalSessionActivityClassifier.requiresVisibleContentsFallback(
+                tool: detectedTool,
+                progressReport: currentProgressReport
+            )
+        let requiresSnapshot = SessionContentsRefreshPolicy.requiresSnapshot(
+            forStatusFallback: requiresVisibleContents,
+            contentIndependentStatus: contentIndependentStatus
+        )
+
+        if requiresSnapshot {
+            if currentAnalysis == nil {
+                currentAnalysis = claudeAnalysis(
+                    allowSnapshotReuse: allowClaudeSnapshotReuse,
+                    defersSnapshotRefresh: defersVisibleContentsRefresh
+                )
+            }
+            if currentAnalysis == nil {
+                // A deferred event-driven refresh must not let the next timer
+                // reuse the snapshot that predates the scroll gesture.
+                lastClaudeVisibleContentsRefreshUptime = nil
+                // Structured progress and active spinner titles remain
+                // authoritative even while active-screen reads are deferred.
+                guard contentIndependentStatus != nil else { return }
+            }
+        }
+
+        let analysis = currentAnalysis ?? TerminalSessionVisibleContentsAnalysis(
+            requiresUserInput: false,
+            lastInstruction: nil
+        )
 
         // Completed and failed are latched structured events. A later explicit
         // provider signal starts a new turn even if the surface still retains
@@ -264,7 +798,7 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
                 tool: detectedTool,
                 dynamicTitle: dynamicTitle,
                 progressReport: nil,
-                visibleContents: visibleContents,
+                visibleContentsAnalysis: analysis,
                 previous: activityStatus
             )
             if providerStatus == .active || providerStatus == .paused {
@@ -277,7 +811,7 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             tool: detectedTool,
             dynamicTitle: dynamicTitle,
             progressReport: currentProgressReport,
-            visibleContents: visibleContents,
+            visibleContentsAnalysis: analysis,
             previous: activityStatus
         )
         let previousStatus = activityStatus

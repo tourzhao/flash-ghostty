@@ -19,6 +19,9 @@ struct QuickTerminalIntent: AppIntent {
         guard let delegate = NSApp.delegate as? AppDelegate else {
             throw GhosttyIntentError.appUnavailable
         }
+        guard !delegate.isDeferringTerminalLaunches else {
+            throw GhosttyIntentError.startupRestorationPending
+        }
 
         let wasInitialized = delegate.quickControllerInitialized
 

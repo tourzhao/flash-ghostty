@@ -479,6 +479,21 @@ pub fn setScrollbackMaxLines(self: *Terminal, max: ?usize) void {
     primary.pages.setMaxLines(max);
 }
 
+/// Return scrollbar geometry together with identities for both the PageList
+/// content epoch and the active screen storage. The latter prevents equal
+/// primary/alternate geometries from making a saved absolute row cross screens.
+pub fn scrollbar(self: *Terminal) PageList.Scrollbar {
+    var result = self.screens.active.pages.scrollbar();
+    result.screen_identity = switch (self.screens.active_key) {
+        .primary => 0,
+        .alternate => @as(
+            u64,
+            @intCast(self.screens.generation(.alternate)),
+        ) +% 1,
+    };
+    return result;
+}
+
 /// Print UTF-8 encoded string to the terminal.
 pub fn printString(self: *Terminal, str: []const u8) !void {
     const view = try std.unicode.Utf8View.init(str);
@@ -2781,6 +2796,33 @@ pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
     });
 }
 
+/// Scroll to an absolute history row only while it still identifies the same
+/// content and active screen observed by the caller. Callers that share this
+/// terminal across threads must hold the terminal/render-state mutex across
+/// this complete operation.
+pub fn scrollViewportIfHistoryMatches(
+    self: *Terminal,
+    row: usize,
+    content_generation: u64,
+    screen_identity: u64,
+) bool {
+    const current = self.scrollbar();
+    if (current.content_generation != content_generation or
+        current.screen_identity != screen_identity or
+        current.len == 0 or
+        current.total <= current.len or
+        // The active-area top row can still be rewritten in place without an
+        // absolute-history epoch change. Pins therefore address retained
+        // scrollback strictly above the live screen, never its first row.
+        row >= current.total - current.len)
+    {
+        return false;
+    }
+
+    self.scrollViewport(.{ .row = row });
+    return true;
+}
+
 /// Return the current compression activity value.
 ///
 /// Callers should schedule a `compress` call whenever this value changes. The
@@ -4326,6 +4368,72 @@ test "Terminal setScrollback only affects primary screen" {
     );
     try testing.expect(alternate.no_scrollback);
     try testing.expectEqual(alternate, t.screens.active);
+}
+
+test "Terminal scrollbar identity separates equal primary and alternate screens" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(testing.allocator);
+
+    const primary = t.scrollbar();
+    _ = try t.switchScreen(.alternate);
+    const alternate = t.scrollbar();
+
+    try testing.expectEqual(primary.total, alternate.total);
+    try testing.expectEqual(primary.offset, alternate.offset);
+    try testing.expectEqual(primary.len, alternate.len);
+    try testing.expectEqual(
+        primary.content_generation,
+        alternate.content_generation,
+    );
+    try testing.expect(primary.screen_identity != alternate.screen_identity);
+    try testing.expect(!primary.eql(alternate));
+
+    _ = try t.switchScreen(.primary);
+    try testing.expect(primary.eql(t.scrollbar()));
+}
+
+test "Terminal conditional history scroll rejects stale identities" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+    });
+    defer t.deinit(testing.allocator);
+
+    for (0..12) |_| try t.linefeed();
+    const primary = t.scrollbar();
+    try testing.expect(primary.total > primary.len);
+    try testing.expect(t.scrollViewportIfHistoryMatches(
+        1,
+        primary.content_generation,
+        primary.screen_identity,
+    ));
+    try testing.expectEqual(@as(usize, 1), t.scrollbar().offset);
+
+    try testing.expect(!t.scrollViewportIfHistoryMatches(
+        primary.total - primary.len,
+        primary.content_generation,
+        primary.screen_identity,
+    ));
+    try testing.expectEqual(@as(usize, 1), t.scrollbar().offset);
+
+    try testing.expect(!t.scrollViewportIfHistoryMatches(
+        0,
+        primary.content_generation +% 1,
+        primary.screen_identity,
+    ));
+    try testing.expectEqual(@as(usize, 1), t.scrollbar().offset);
+
+    _ = try t.switchScreen(.alternate);
+    const alternate = t.scrollbar();
+    try testing.expect(!t.scrollViewportIfHistoryMatches(
+        0,
+        primary.content_generation,
+        primary.screen_identity,
+    ));
+    try testing.expectEqual(alternate.offset, t.scrollbar().offset);
 }
 
 test "Terminal: resize resets synchronized output" {

@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 
+@MainActor
 class ServiceProvider: NSObject {
     static private let errorNoString = NSString(string: "Could not load any text from the clipboard.")
 
@@ -63,13 +64,12 @@ class ServiceProvider: NSObject {
 
             switch target {
             case .window:
-                _ = TerminalController.newWindow(delegate.ghostty, withBaseConfig: config)
+                _ = delegate.requestNewTerminalWindow(baseConfig: config)
 
             case .tab:
-                _ = TerminalController.newTab(
-                    delegate.ghostty,
+                _ = delegate.requestNewTerminalTab(
                     from: TerminalController.preferredParent?.window,
-                    withBaseConfig: config)
+                    baseConfig: config)
             }
         }
 

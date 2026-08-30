@@ -109,9 +109,14 @@ struct UntrustedURL: Equatable {
             // including symlink resolution. Keep non-file URLs byte-for-byte
             // equivalent because repeated separators can be meaningful to a
             // web or custom-scheme handler.
-            normalized = url.isFileURL
-                ? url.standardizedFileURL.resolvingSymlinksInPath().path
-                : string
+            if url.isFileURL, url.path.hasPrefix("/") {
+                normalized = url.standardizedFileURL.resolvingSymlinksInPath().path
+            } else {
+                // A relative `file:` URL is denied and must not be resolved
+                // against FLASH-Ghostty's process working directory merely to
+                // render the blocked-target message.
+                normalized = string
+            }
         } else {
             // Scheme-less values are never allowed to open, but they still
             // appear in the blocked-target UI. Standardizing them prevents
@@ -140,7 +145,12 @@ private extension UntrustedURL {
         // Only local file URLs are meaningful here. Queries and fragments do
         // not identify part of a filesystem object and may be interpreted
         // inconsistently by Launch Services handlers.
-        guard url.isFileURL, url.query == nil, url.fragment == nil else {
+        guard
+            url.isFileURL,
+            url.query == nil,
+            url.fragment == nil,
+            url.path.hasPrefix("/")
+        else {
             return .deny(.malformedURL)
         }
 
@@ -162,6 +172,7 @@ private extension UntrustedURL {
             // canonical target exists and is accessible.
             resourceValues = try canonicalURL.resourceValues(forKeys: [
                 .contentTypeKey,
+                .isAliasFileKey,
                 .isDirectoryKey,
                 .isExecutableKey,
                 .isRegularFileKey,
@@ -187,6 +198,14 @@ private extension UntrustedURL {
         _ url: URL,
         resourceValues: URLResourceValues
     ) -> Bool {
+        // Finder aliases are bookmark containers whose extension and POSIX
+        // permissions describe the alias file, not the object Launch Services
+        // will ultimately open. Keep them reveal-only because their target can
+        // be executable and can change independently of this validation.
+        if resourceValues.isAliasFile == true {
+            return true
+        }
+
         // Launch Services uses extensions when choosing a handler. Block known
         // executable containers even when their POSIX executable bit is clear.
         if unsafePathExtensions.contains(url.pathExtension.lowercased()) {
