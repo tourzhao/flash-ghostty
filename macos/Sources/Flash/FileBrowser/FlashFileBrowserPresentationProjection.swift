@@ -183,7 +183,7 @@ struct FlashFileBrowserProjectionGeneration: Sendable {
 actor FlashFileBrowserPresentationWorker {
     typealias Projector = @Sendable (
         FlashFileBrowserPresentationInput
-    ) -> FlashFileBrowserPresentationProjection
+    ) async -> FlashFileBrowserPresentationProjection
 
     private let projector: Projector
 
@@ -197,9 +197,9 @@ actor FlashFileBrowserPresentationWorker {
 
     fileprivate func project(
         _ input: FlashFileBrowserPresentationInput
-    ) -> FlashFileBrowserPresentationProjection? {
+    ) async -> FlashFileBrowserPresentationProjection? {
         guard !Task.isCancelled else { return nil }
-        let projection = projector(input)
+        let projection = await projector(input)
         guard !Task.isCancelled else { return nil }
         return projection
     }

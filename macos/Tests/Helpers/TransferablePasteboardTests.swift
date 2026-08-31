@@ -122,7 +122,7 @@ struct TransferablePasteboardTests {
         }
     }
 
-    @Test func multipleCompletionsCanReturnAsynchronouslyOnTheLoadingQueue() {
+    @Test func multipleCompletionsCanReturnAsynchronouslyOnTheLoadingQueue() async throws {
         let loadingQueue = DispatchQueue(
             label: "com.mitchellh.ghostty.tests.transferable-data-provider"
         )
@@ -146,16 +146,79 @@ struct TransferablePasteboardTests {
             }
         }
         let item = NSPasteboardItem()
-        let finished = DispatchSemaphore(value: 0)
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            provider.pasteboard(nil, item: item, provideDataForType: dataType)
-            provider.pasteboard(nil, item: item, provideDataForType: textType)
-            finished.signal()
+        let invocation = TransferablePasteboardInvocation(
+            provider: provider,
+            item: item
+        )
+        let providedDataResult = await withCheckedContinuation { continuation in
+            let completion = TransferablePasteboardCompletion(continuation)
+            DispatchQueue.global(qos: .userInitiated).async {
+                completion.resume(
+                    returning: invocation.provide(dataType, textType)
+                )
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + 2
+            ) {
+                completion.resume(returning: nil)
+            }
         }
+        let providedData = try #require(providedDataResult)
 
-        #expect(finished.wait(timeout: .now() + 2) == .success)
-        #expect(item.data(forType: dataType) == expectedData[dataType.rawValue])
-        #expect(item.data(forType: textType) == expectedData[textType.rawValue])
+        #expect(providedData.first == expectedData[dataType.rawValue])
+        #expect(providedData.second == expectedData[textType.rawValue])
+    }
+}
+
+private final class TransferablePasteboardInvocation: @unchecked Sendable {
+    private let provider: TransferableDataProvider
+    private let item: NSPasteboardItem
+
+    init(provider: TransferableDataProvider, item: NSPasteboardItem) {
+        self.provider = provider
+        self.item = item
+    }
+
+    func provide(
+        _ firstType: NSPasteboard.PasteboardType,
+        _ secondType: NSPasteboard.PasteboardType
+    ) -> TransferablePasteboardProvidedData {
+        provider.pasteboard(nil, item: item, provideDataForType: firstType)
+        provider.pasteboard(nil, item: item, provideDataForType: secondType)
+        return TransferablePasteboardProvidedData(
+            first: item.data(forType: firstType),
+            second: item.data(forType: secondType)
+        )
+    }
+}
+
+private struct TransferablePasteboardProvidedData: Sendable {
+    let first: Data?
+    let second: Data?
+}
+
+private final class TransferablePasteboardCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<
+        TransferablePasteboardProvidedData?,
+        Never
+    >?
+
+    init(
+        _ continuation: CheckedContinuation<
+            TransferablePasteboardProvidedData?,
+            Never
+        >
+    ) {
+        self.continuation = continuation
+    }
+
+    func resume(returning result: TransferablePasteboardProvidedData?) {
+        let continuation = lock.withLock {
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume(returning: result)
     }
 }

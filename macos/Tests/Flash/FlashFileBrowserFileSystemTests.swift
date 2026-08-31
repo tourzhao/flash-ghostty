@@ -1575,28 +1575,25 @@ struct FlashFileBrowserFileSystemTests {
         }
         let source = try makeDirectory(named: "Sources", in: outside)
         _ = try makeFile(named: "payload.txt", contents: "payload", in: source)
-        let barrier = CopyMutationBarrier()
-        defer { barrier.resumeCopy() }
         let fileSystem = LocalFlashFileBrowserFileSystem(
             mutationHook: { checkpoint, copiedSource in
                 guard case .copyEntryCopied = checkpoint,
                       copiedSource.lastPathComponent == "payload.txt" else {
                     return
                 }
-                barrier.pauseCopy()
+                // Cancel the child operation at the exact post-copy
+                // checkpoint without blocking a Swift concurrency worker.
+                // Semaphore barriers here can exhaust the cooperative thread
+                // pool when Swift Testing runs cancellation tests in parallel.
+                withUnsafeCurrentTask { task in
+                    task?.cancel()
+                }
             }
         )
 
         let copyTask = Task {
             try await fileSystem.copyItem(source, to: root, allowedRoot: root)
         }
-        let copyPaused = await Task.detached {
-            barrier.waitUntilCopyPauses()
-        }.value
-        #expect(copyPaused)
-
-        copyTask.cancel()
-        barrier.resumeCopy()
 
         do {
             _ = try await copyTask.value
@@ -2360,14 +2357,17 @@ struct FlashFileBrowserFileSystemTests {
         let second = try makeFile(named: "second.txt", contents: "second", in: root)
         let third = try makeFile(named: "third.txt", contents: "third", in: root)
         let recorder = LockedURLRecorder()
-        let barrier = TrashCancellationBarrier()
-        defer { barrier.resumeTrash() }
         let fileSystem = LocalFlashFileBrowserFileSystem(
             trashHandler: { url in
                 recorder.append(url)
                 try FileManager.default.removeItem(at: url)
                 if url.standardizedFileURL == first.standardizedFileURL {
-                    barrier.pauseAfterTrash()
+                    // The first mutation has committed. Cancel this child task
+                    // before the batch loop can start the next item, without
+                    // occupying a cooperative executor thread while waiting.
+                    withUnsafeCurrentTask { task in
+                        task?.cancel()
+                    }
                 }
             }
         )
@@ -2385,13 +2385,6 @@ struct FlashFileBrowserFileSystemTests {
                 allowedRoot: root
             )
         }
-        let trashPaused = await Task.detached {
-            barrier.waitUntilTrashPauses()
-        }.value
-        #expect(trashPaused)
-
-        trashTask.cancel()
-        barrier.resumeTrash()
 
         do {
             try await trashTask.value
@@ -3028,41 +3021,5 @@ private final class LockedBoolRecorder: @unchecked Sendable {
         lock.lock()
         storage = value
         lock.unlock()
-    }
-}
-
-private final class CopyMutationBarrier: @unchecked Sendable {
-    private let copyPaused = DispatchSemaphore(value: 0)
-    private let copyMayResume = DispatchSemaphore(value: 0)
-
-    func pauseCopy() {
-        copyPaused.signal()
-        _ = copyMayResume.wait(timeout: .now() + 30)
-    }
-
-    func waitUntilCopyPauses() -> Bool {
-        copyPaused.wait(timeout: .now() + 5) == .success
-    }
-
-    func resumeCopy() {
-        copyMayResume.signal()
-    }
-}
-
-private final class TrashCancellationBarrier: @unchecked Sendable {
-    private let trashPaused = DispatchSemaphore(value: 0)
-    private let trashMayResume = DispatchSemaphore(value: 0)
-
-    func pauseAfterTrash() {
-        trashPaused.signal()
-        _ = trashMayResume.wait(timeout: .now() + 30)
-    }
-
-    func waitUntilTrashPauses() -> Bool {
-        trashPaused.wait(timeout: .now() + 5) == .success
-    }
-
-    func resumeTrash() {
-        trashMayResume.signal()
     }
 }

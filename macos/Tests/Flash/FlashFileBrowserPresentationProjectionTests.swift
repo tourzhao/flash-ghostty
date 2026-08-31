@@ -264,68 +264,117 @@ struct FileBrowserProjectionTests {
     }
 }
 
-private final class BlockingProjectionProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private let projectionStarted = DispatchSemaphore(value: 0)
-    private let projectionFinished = DispatchSemaphore(value: 0)
-    private let releaseFirst = DispatchSemaphore(value: 0)
+private actor AsyncProjectionProbe {
+    private let projectionStarts: AsyncStream<Void>
+    private let projectionStartContinuation: AsyncStream<Void>.Continuation
+    private let projectionFinishes: AsyncStream<Void>
+    private let projectionFinishContinuation: AsyncStream<Void>.Continuation
+    private var releaseFirstWasRequested = false
+    private var releaseFirstContinuation: CheckedContinuation<Void, Never>?
     private var activeProjectionCount = 0
     private var maximumActiveProjectionCount = 0
     private var queries: [String] = []
     private var firstItemNames: [String?] = []
 
+    init() {
+        let starts = AsyncStream<Void>.makeStream(bufferingPolicy: .unbounded)
+        projectionStarts = starts.stream
+        projectionStartContinuation = starts.continuation
+        let finishes = AsyncStream<Void>.makeStream(bufferingPolicy: .unbounded)
+        projectionFinishes = finishes.stream
+        projectionFinishContinuation = finishes.continuation
+    }
+
     var startedQueries: [String] {
-        lock.withLock { queries }
+        queries
     }
 
     var maximumConcurrentProjectionCount: Int {
-        lock.withLock { maximumActiveProjectionCount }
+        maximumActiveProjectionCount
     }
 
     var startedFirstItemNames: [String?] {
-        lock.withLock { firstItemNames }
+        firstItemNames
     }
 
-    func waitForProjectionStart() -> Bool {
-        projectionStarted.wait(timeout: .now() + 5) == .success
+    func waitForProjectionStart() async -> Bool {
+        await waitForNextEvent(in: projectionStarts)
     }
 
-    func waitForProjectionFinish() -> Bool {
-        projectionFinished.wait(timeout: .now() + 5) == .success
+    func waitForProjectionFinish() async -> Bool {
+        await waitForNextEvent(in: projectionFinishes)
     }
 
     func releaseFirstProjection() {
-        releaseFirst.signal()
+        guard let releaseFirstContinuation else {
+            releaseFirstWasRequested = true
+            return
+        }
+        self.releaseFirstContinuation = nil
+        releaseFirstContinuation.resume()
     }
 
     func project(
         _ input: FlashFileBrowserPresentationInput
-    ) -> FlashFileBrowserPresentationProjection {
-        let isFirstProjection = lock.withLock {
-            activeProjectionCount += 1
-            maximumActiveProjectionCount = max(
-                maximumActiveProjectionCount,
-                activeProjectionCount
-            )
-            queries.append(input.query)
-            firstItemNames.append(input.items.first?.name)
-            return queries.count == 1
-        }
-        projectionStarted.signal()
+    ) async -> FlashFileBrowserPresentationProjection {
+        activeProjectionCount += 1
+        maximumActiveProjectionCount = max(
+            maximumActiveProjectionCount,
+            activeProjectionCount
+        )
+        queries.append(input.query)
+        firstItemNames.append(input.items.first?.name)
+        let isFirstProjection = queries.count == 1
+        projectionStartContinuation.yield()
         defer {
-            lock.withLock {
-                activeProjectionCount -= 1
-            }
-            projectionFinished.signal()
+            activeProjectionCount -= 1
+            projectionFinishContinuation.yield()
         }
 
         if isFirstProjection {
-            _ = releaseFirst.wait(timeout: .now() + 30)
+            await withTaskCancellationHandler {
+                await waitForFirstRelease()
+            } onCancel: {
+                Task { await self.releaseFirstProjection() }
+            }
         }
         return .init(
             snapshot: .empty,
             sourceVisitCount: input.items.count
         )
+    }
+
+    private func waitForFirstRelease() async {
+        if releaseFirstWasRequested {
+            releaseFirstWasRequested = false
+            return
+        }
+        await withCheckedContinuation { continuation in
+            precondition(releaseFirstContinuation == nil)
+            releaseFirstContinuation = continuation
+        }
+    }
+
+    private func waitForNextEvent(
+        in events: AsyncStream<Void>
+    ) async -> Bool {
+        await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+            group.addTask {
+                var iterator = events.makeAsyncIterator()
+                return await iterator.next() != nil
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: .seconds(5))
+                    return false
+                } catch {
+                    return false
+                }
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
     }
 }
 
@@ -334,9 +383,9 @@ struct FileBrowserPresentationStoreTests {
     @Test
     func largeSourceChurnKeepsOnlyTheLatestPendingProjection() async {
         let directory = URL(fileURLWithPath: "/tmp/Projection-Churn")
-        let probe = BlockingProjectionProbe()
+        let probe = AsyncProjectionProbe()
         let store = FlashFileBrowserPresentationStore(
-            worker: .init { probe.project($0) }
+            worker: .init { await probe.project($0) }
         )
 
         store.setSource(
@@ -348,9 +397,7 @@ struct FileBrowserPresentationStoreTests {
             ),
             directory: directory
         )
-        let firstStarted = await Task.detached {
-            probe.waitForProjectionStart()
-        }.value
+        let firstStarted = await probe.waitForProjectionStart()
         #expect(firstStarted)
 
         for refresh in 1...8 {
@@ -368,16 +415,17 @@ struct FileBrowserPresentationStoreTests {
         #expect(store.projectionStartCount == 1)
         #expect(store.pendingProjectionCount == 1)
 
-        probe.releaseFirstProjection()
-        let latestStarted = await Task.detached {
-            probe.waitForProjectionStart()
-        }.value
+        await probe.releaseFirstProjection()
+        let latestStarted = await probe.waitForProjectionStart()
         #expect(latestStarted)
-        #expect(probe.startedFirstItemNames == [
+        let startedFirstItemNames = await probe.startedFirstItemNames
+        #expect(startedFirstItemNames == [
             "refresh-0-0",
             "refresh-8-0",
         ])
-        #expect(probe.maximumConcurrentProjectionCount == 1)
+        let maximumConcurrentProjectionCount = await probe
+            .maximumConcurrentProjectionCount
+        #expect(maximumConcurrentProjectionCount == 1)
         #expect(store.projectionStartCount == 2)
         #expect(store.pendingProjectionCount == 0)
     }
@@ -385,10 +433,10 @@ struct FileBrowserPresentationStoreTests {
     @Test
     func cancelledDebouncesOnlyProjectTheLatestQuery() async {
         let directory = URL(fileURLWithPath: "/tmp/Projection-Debounce")
-        let probe = BlockingProjectionProbe()
+        let probe = AsyncProjectionProbe()
         let store = FlashFileBrowserPresentationStore(
             searchDebounceDuration: .zero,
-            worker: .init { probe.project($0) }
+            worker: .init { await probe.project($0) }
         )
 
         store.setSource(
@@ -400,9 +448,7 @@ struct FileBrowserPresentationStoreTests {
             ),
             directory: directory
         )
-        let firstStarted = await Task.detached {
-            probe.waitForProjectionStart()
-        }.value
+        let firstStarted = await probe.waitForProjectionStart()
         #expect(firstStarted)
 
         for queryIndex in 0..<100 {
@@ -412,22 +458,23 @@ struct FileBrowserPresentationStoreTests {
         #expect(latestBecamePending)
         #expect(store.projectionStartCount == 1)
 
-        probe.releaseFirstProjection()
-        let latestStarted = await Task.detached {
-            probe.waitForProjectionStart()
-        }.value
+        await probe.releaseFirstProjection()
+        let latestStarted = await probe.waitForProjectionStart()
         #expect(latestStarted)
-        #expect(probe.startedQueries == ["", "query-99"])
-        #expect(probe.maximumConcurrentProjectionCount == 1)
+        let startedQueries = await probe.startedQueries
+        #expect(startedQueries == ["", "query-99"])
+        let maximumConcurrentProjectionCount = await probe
+            .maximumConcurrentProjectionCount
+        #expect(maximumConcurrentProjectionCount == 1)
         #expect(store.projectionStartCount == 2)
     }
 
     @Test
     func cancellingAPendingRevealDropsItWithoutStartingAnotherProjection() async {
         let directory = URL(fileURLWithPath: "/tmp/Projection-Cancel")
-        let probe = BlockingProjectionProbe()
+        let probe = AsyncProjectionProbe()
         let store = FlashFileBrowserPresentationStore(
-            worker: .init { probe.project($0) }
+            worker: .init { await probe.project($0) }
         )
         let blockingItem = makeItem(
             "blocking.swift",
@@ -435,9 +482,7 @@ struct FileBrowserPresentationStoreTests {
             directory: directory
         )
         store.setSource(items: [blockingItem], directory: directory)
-        let firstStarted = await Task.detached {
-            probe.waitForProjectionStart()
-        }.value
+        let firstStarted = await probe.waitForProjectionStart()
         #expect(firstStarted)
 
         let revealTarget = makeItem(
@@ -460,22 +505,21 @@ struct FileBrowserPresentationStoreTests {
         #expect(revealResult == nil)
         #expect(store.pendingProjectionCount == 0)
 
-        probe.releaseFirstProjection()
-        let firstFinished = await Task.detached {
-            probe.waitForProjectionFinish()
-        }.value
+        await probe.releaseFirstProjection()
+        let firstFinished = await probe.waitForProjectionFinish()
         #expect(firstFinished)
         await Task.yield()
-        #expect(probe.startedFirstItemNames == ["blocking.swift"])
+        let startedFirstItemNames = await probe.startedFirstItemNames
+        #expect(startedFirstItemNames == ["blocking.swift"])
         #expect(store.projectionStartCount == 1)
     }
 
     @Test
     func newerSourceSupersedesAPendingRevealAndResumesItsCaller() async {
         let directory = URL(fileURLWithPath: "/tmp/Projection-Supersede")
-        let probe = BlockingProjectionProbe()
+        let probe = AsyncProjectionProbe()
         let store = FlashFileBrowserPresentationStore(
-            worker: .init { probe.project($0) }
+            worker: .init { await probe.project($0) }
         )
         let blockingItem = makeItem(
             "blocking.swift",
@@ -483,9 +527,7 @@ struct FileBrowserPresentationStoreTests {
             directory: directory
         )
         store.setSource(items: [blockingItem], directory: directory)
-        let firstStarted = await Task.detached {
-            probe.waitForProjectionStart()
-        }.value
+        let firstStarted = await probe.waitForProjectionStart()
         #expect(firstStarted)
 
         let revealTarget = makeItem(
@@ -513,12 +555,11 @@ struct FileBrowserPresentationStoreTests {
         #expect(revealResult == nil)
         #expect(store.pendingProjectionCount == 1)
 
-        probe.releaseFirstProjection()
-        let latestStarted = await Task.detached {
-            probe.waitForProjectionStart()
-        }.value
+        await probe.releaseFirstProjection()
+        let latestStarted = await probe.waitForProjectionStart()
         #expect(latestStarted)
-        #expect(probe.startedFirstItemNames == [
+        let startedFirstItemNames = await probe.startedFirstItemNames
+        #expect(startedFirstItemNames == [
             "blocking.swift",
             "latest.swift",
         ])
