@@ -7,6 +7,7 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
         try updateConfig(
             """
             title = "GhosttySessionSidebarUITests"
+            command = /bin/zsh
             working-directory = /private/tmp
             """
         )

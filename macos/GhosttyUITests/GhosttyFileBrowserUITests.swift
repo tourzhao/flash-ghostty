@@ -21,6 +21,7 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         try updateConfig(
             """
             title = "GhosttyFileBrowserUITests"
+            command = /bin/zsh
             working-directory = \(workingDirectory.path)
             """
         )

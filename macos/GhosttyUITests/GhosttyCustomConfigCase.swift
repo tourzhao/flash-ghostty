@@ -45,10 +45,9 @@ class GhosttyCustomConfigCase: XCTestCase {
     private let configFile: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         .appendingPathExtension("ghostty")
 
-    /// UI tests must not inherit the developer's shell startup files. Besides
-    /// making the tests machine-dependent, a startup file that touches a
-    /// protected folder can leave the login shell blocked behind a TCC prompt
-    /// before Ghostty receives its first working-directory report.
+    /// Zsh-based UI tests must not inherit the developer's startup files.
+    /// Besides making the tests machine-dependent, a startup file that touches
+    /// a protected folder can leave the login shell blocked behind a TCC prompt.
     private let shellConfigurationDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
 
@@ -67,14 +66,7 @@ class GhosttyCustomConfigCase: XCTestCase {
             withIntermediateDirectories: true
         )
 
-        // An explicit `command` makes a terminal intentionally non-restorable.
-        // Select zsh through the launch environment so restoration tests still
-        // exercise the same normal-shell path as a production window.
-        let isolatedShellConfig = """
-        shell-integration = zsh
-        """
-        try "\(isolatedShellConfig)\n\(newConfig)"
-            .write(to: configFile, atomically: true, encoding: .utf8)
+        try newConfig.write(to: configFile, atomically: true, encoding: .utf8)
     }
 
     func ghosttyApplication(
@@ -95,9 +87,10 @@ class GhosttyCustomConfigCase: XCTestCase {
         // parser. This DEBUG-only test seam prevents them from opening a
         // Configuration Errors window in the launched application.
         app.launchEnvironment["GHOSTTY_TEST_DISABLE_CLI_ARGS"] = "true"
-        // Let Ghostty's integration capture this as the user's ZDOTDIR before
-        // it temporarily points zsh at the bundled integration entry point.
-        app.launchEnvironment["SHELL"] = "/bin/zsh"
+        // Ghostty's zsh integration captures this as the user's ZDOTDIR before it
+        // temporarily points zsh at the bundled integration entry point. Do
+        // not set SHELL here: desktop launches deliberately resolve their
+        // default shell from passwd rather than the process environment.
         app.launchEnvironment["ZDOTDIR"] = shellConfigurationDirectory.path
         app.launchEnvironment["GHOSTTY_CONFIG_PATH"] = configFile.path
         app.launchEnvironment["GHOSTTY_USER_DEFAULTS_SUITE"] = defaultsSuite
