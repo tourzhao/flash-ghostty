@@ -831,7 +831,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             sharedWorkspacePrepared = controller.adoptSessionWorkspace(
                 parentController.sessionTabGroupAdapter,
                 at: insertionIndex,
-                select: true
+                select: false
             )
         }
 

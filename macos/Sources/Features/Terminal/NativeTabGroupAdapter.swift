@@ -336,8 +336,10 @@ final class NativeTabGroupAdapter: ObservableObject {
         partitionReconciliationGeneration &+= 1
     }
 
-    /// Performs a user-requested selection as one adapter operation. The
-    /// workspace changes only after AppKit confirms the native selection.
+    /// Performs a user-requested selection as one adapter operation. Returning
+    /// true means AppKit accepted the request or already exposes the target; it
+    /// does not imply that a deferred native transition has completed. The
+    /// workspace changes only after a complete native snapshot confirms it.
     @discardableResult
     func selectSession(_ sessionID: SessionID, in tabGroup: NSWindowTabGroup) -> Bool {
         guard workspace.contains(sessionID),
@@ -351,7 +353,15 @@ final class NativeTabGroupAdapter: ObservableObject {
             return false
         }
 
-        return workspace.selectSession(sessionID)
+        // The Objective-C boundary reports that the setter was accepted, not
+        // that AppKit has completed its physical tab transition. Reconcile
+        // only a confirmed, complete native snapshot; KVO will retry this once
+        // a deferred getter exposes the target. Until then the root currently
+        // on screen retains ownership of the live sidebars.
+        if tabGroup.selectedWindow === targetWindow {
+            _ = reconcile(tabGroup)
+        }
+        return true
     }
 
     private func pruneReleasedWindows() {

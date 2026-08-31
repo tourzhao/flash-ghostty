@@ -84,6 +84,20 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         let row = app.buttons["initial.swift"]
         XCTAssertTrue(row.waitForExistence(timeout: 5))
         row.click()
+
+        let copyButton = app.buttons["terminal-file-sidebar.copy"]
+        let selectionPublished = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                copyButton.exists && copyButton.isEnabled &&
+                    app.staticTexts["1 of 1 selected"].exists
+            },
+            object: app
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [selectionPublished], timeout: 5),
+            .completed,
+            "The real Table selection must reach the command bridge before Command-C"
+        )
         app.typeKey("c", modifierFlags: .command)
 
         let expectedURL = workingDirectory
@@ -240,6 +254,13 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         let linkPoint = leftSurface.coordinate(
             withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
         )
+
+        // `leftPane.click()` focused this exact center before the OSC 8 link
+        // existed. Move across terminal cells first so the command-modified
+        // hover must refresh Ghostty's cached hyperlink hit test.
+        leftSurface.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.1, dy: 0.1)
+        ).hover()
         XCUIElement.perform(withKeyModifiers: .command) {
             linkPoint.hover()
             linkPoint.click()

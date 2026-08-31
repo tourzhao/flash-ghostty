@@ -340,6 +340,67 @@ struct SessionWorkspaceTests {
         #expect(destination.workspace.orderedSessionIDs == [sessionID])
     }
 
+    @Test func unboundNewTabMembershipDoesNotPreselectChild() {
+        let parent = SessionID()
+        let child = SessionID()
+        let source = NativeTabGroupAdapter(
+            workspace: SessionWorkspace(sessionIDs: [child])
+        )
+        let destination = NativeTabGroupAdapter(
+            workspace: SessionWorkspace(
+                sessionIDs: [parent],
+                selectedSessionID: parent
+            )
+        )
+
+        #expect(source.transferSession(
+            child,
+            window: nil,
+            to: destination,
+            at: 1,
+            select: false
+        ))
+        #expect(destination.workspace.orderedSessionIDs == [parent, child])
+        #expect(destination.workspace.selectedSessionID == parent)
+
+        let childWindow = NSWindow()
+        #expect(destination.register(childWindow, as: child))
+        #expect(destination.workspace.selectedSessionID == parent)
+    }
+
+    @Test func deferredNativeSelectionCommitsOnlyAfterCompleteConfirmation() {
+        let parent = SessionID()
+        let child = SessionID()
+        let workspace = SessionWorkspace(
+            sessionIDs: [parent, child],
+            selectedSessionID: parent
+        )
+        let adapter = NativeTabGroupAdapter(workspace: workspace)
+
+        #expect(adapter.reconcile(
+            .init(
+                orderedSessionIDs: [parent, child],
+                selectedSessionID: parent
+            )
+        ) == .synchronized(changed: false))
+        #expect(adapter.reconcile(
+            .init(
+                orderedSessionIDs: [child],
+                selectedSessionID: child,
+                reportedWindowCount: 1
+            )
+        ) == .ignoredIncomplete)
+        #expect(workspace.selectedSessionID == parent)
+
+        #expect(adapter.reconcile(
+            .init(
+                orderedSessionIDs: [parent, child],
+                selectedSessionID: child
+            )
+        ) == .synchronized(changed: true))
+        #expect(workspace.selectedSessionID == child)
+    }
+
     @Test func adapterRejectsDuplicateOrMissingNativeSelection() {
         let first = SessionID()
         let second = SessionID()
