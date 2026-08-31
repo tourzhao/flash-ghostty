@@ -43,6 +43,38 @@ private final class TerminalSessionVisibleContentsReadTicket: @unchecked Sendabl
     }
 }
 
+/// The event-driven surface values owned by a metadata binding. Keeping this
+/// seam narrower than `Ghostty.SurfaceView` lets the binding lifecycle be
+/// tested without starting a terminal process.
+@MainActor
+protocol TerminalSessionMetadataBindingSource: AnyObject {
+    var sessionMetadataSurface: Ghostty.SurfaceView? { get }
+    var sessionMetadataTitlePublisher: AnyPublisher<String, Never> { get }
+    var sessionMetadataBellPublisher: AnyPublisher<Bool, Never> { get }
+    var sessionMetadataProgressPublisher:
+        AnyPublisher<Ghostty.Action.ProgressReport?, Never> { get }
+    var sessionMetadataWorkingDirectoryPublisher:
+        AnyPublisher<String?, Never> { get }
+}
+
+extension Ghostty.SurfaceView: TerminalSessionMetadataBindingSource {
+    var sessionMetadataSurface: Ghostty.SurfaceView? { self }
+    var sessionMetadataTitlePublisher: AnyPublisher<String, Never> {
+        $title.eraseToAnyPublisher()
+    }
+    var sessionMetadataBellPublisher: AnyPublisher<Bool, Never> {
+        $bell.eraseToAnyPublisher()
+    }
+    var sessionMetadataProgressPublisher:
+        AnyPublisher<Ghostty.Action.ProgressReport?, Never> {
+        $progressReport.eraseToAnyPublisher()
+    }
+    var sessionMetadataWorkingDirectoryPublisher:
+        AnyPublisher<String?, Never> {
+        $pwd.eraseToAnyPublisher()
+    }
+}
+
 /// Owns the live metadata for one terminal session independently of window and
 /// sidebar presentation. AppKit controllers bind a logical surface and relay
 /// title changes; provider detection and process discovery stay in this model.
@@ -69,8 +101,12 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         qos: .utility
     )
 
+    private weak var bindingSource: (any TerminalSessionMetadataBindingSource)?
     private weak var surface: Ghostty.SurfaceView?
     private var surfaceCancellables: Set<AnyCancellable> = []
+    /// Cancellation prevents future publisher delivery; the generation also
+    /// rejects a callback already queued when the source is rebound or cleared.
+    private var bindingGeneration: UInt = 0
     private var progressReport: Ghostty.Action.ProgressReport?
     private var lastInstructions = SessionInstructionStore()
     private var instructionCaptureGeneration: UInt = 0
@@ -102,16 +138,40 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         contains: (Ghostty.SurfaceView) -> Bool,
         titleDidChange: @escaping (_ title: String, _ bell: Bool) -> Void
     ) {
-        let candidates = [requestedSurface, surface, previousSurface]
-        guard let nextSurface = candidates.compactMap({ $0 }).first(where: contains) else {
+        bindMetadataSource(
+            to: requestedSurface,
+            preserving: previousSurface,
+            contains: { source in
+                guard let surface = source as? Ghostty.SurfaceView else {
+                    return false
+                }
+                return contains(surface)
+            },
+            titleDidChange: titleDidChange
+        )
+    }
+
+    func bindMetadataSource(
+        to requestedSource: (any TerminalSessionMetadataBindingSource)?,
+        preserving previousSource: (any TerminalSessionMetadataBindingSource)?,
+        contains: (any TerminalSessionMetadataBindingSource) -> Bool,
+        titleDidChange: @escaping (_ title: String, _ bell: Bool) -> Void
+    ) {
+        let candidates = [requestedSource, bindingSource, previousSource]
+        guard let nextSource = candidates.compactMap({ $0 }).first(where: contains) else {
             clear(titleDidChange: titleDidChange)
             return
         }
 
-        guard nextSurface !== surface || surfaceCancellables.isEmpty else { return }
+        guard nextSource !== bindingSource || surfaceCancellables.isEmpty else {
+            return
+        }
 
+        bindingGeneration &+= 1
+        let generation = bindingGeneration
         surfaceCancellables = []
-        surface = nextSurface
+        bindingSource = nextSource
+        surface = nextSource.sessionMetadataSurface
         instructionCaptureGeneration &+= 1
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
@@ -124,11 +184,14 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         invalidateVisibleContentsReads()
         deferredInstructionCapture.reset()
 
-        nextSurface.$title
+        nextSource.sessionMetadataTitlePublisher
             .removeDuplicates()
-            .combineLatest(nextSurface.$bell.removeDuplicates())
+            .combineLatest(
+                nextSource.sessionMetadataBellPublisher.removeDuplicates()
+            )
             .sink { [weak self] title, bell in
-                guard let self else { return }
+                guard let self,
+                      bindingGeneration == generation else { return }
                 if dynamicTitle != title {
                     dynamicTitle = title
                     refreshActivityStatus()
@@ -137,9 +200,10 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             }
             .store(in: &surfaceCancellables)
 
-        nextSurface.$progressReport
+        nextSource.sessionMetadataProgressPublisher
             .sink { [weak self] incomingReport in
-                guard let self else { return }
+                guard let self,
+                      bindingGeneration == generation else { return }
 
                 // Surface progress reports expire for display cleanup. A nil
                 // value is not a protocol-level completion event.
@@ -152,14 +216,18 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             }
             .store(in: &surfaceCancellables)
 
-        nextSurface.$pwd
+        nextSource.sessionMetadataWorkingDirectoryPublisher
             .removeDuplicates()
             .map { path -> URL? in
                 guard let path, !path.isEmpty else { return nil }
                 return URL(fileURLWithPath: path)
             }
             .removeDuplicates()
-            .sink { [weak self] in self?.workingDirectory = $0 }
+            .sink { [weak self] workingDirectory in
+                guard let self,
+                      bindingGeneration == generation else { return }
+                self.workingDirectory = workingDirectory
+            }
             .store(in: &surfaceCancellables)
 
         refresh()
@@ -207,10 +275,14 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     /// Window close can leave a controller alive briefly for AppKit teardown, so
     /// unregistering it from the scheduler alone is not sufficient cancellation.
     func stopMonitoring() {
+        bindingGeneration &+= 1
         instructionCaptureGeneration &+= 1
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
         processLookupThrottle.reset()
+        surfaceCancellables.removeAll()
+        bindingSource = nil
+        surface = nil
         _ = refreshThrottle.update(mode: .suspended)
         invalidateVisibleContentsReads()
         deferredInstructionCapture.reset()
@@ -315,11 +387,13 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     private func clear(
         titleDidChange: (_ title: String, _ bell: Bool) -> Void
     ) {
+        bindingGeneration &+= 1
         instructionCaptureGeneration &+= 1
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
         processLookupThrottle.reset()
         surfaceCancellables = []
+        bindingSource = nil
         surface = nil
         dynamicTitle = ""
         foregroundProcessName = nil

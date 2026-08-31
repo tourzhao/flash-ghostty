@@ -48,6 +48,251 @@ struct SessionMetadataObservationIsolationTests {
 }
 
 @MainActor
+@Suite
+struct TerminalSessionMetadataMonitorBindingTests {
+    @Test
+    func transientOrInvalidFocusKeepsTheContainedCurrentSource() {
+        let first = SessionMetadataBindingSourceProbe(
+            title: "First",
+            workingDirectory: "/private/tmp/first"
+        )
+        let outside = SessionMetadataBindingSourceProbe(
+            title: "Outside",
+            workingDirectory: "/private/tmp/outside"
+        )
+        let monitor = TerminalSessionMetadataMonitor()
+        var reportedTitles: [(String, Bool)] = []
+        let contains: (any TerminalSessionMetadataBindingSource) -> Bool = {
+            $0 === first
+        }
+        let titleDidChange: (String, Bool) -> Void = {
+            reportedTitles.append(($0, $1))
+        }
+
+        monitor.bindMetadataSource(
+            to: first,
+            preserving: nil,
+            contains: contains,
+            titleDidChange: titleDidChange
+        )
+        #expect(monitor.dynamicTitle == "First")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/first")
+        let initialReportCount = reportedTitles.count
+
+        // SwiftUI can briefly report no focused split. The current source is
+        // retained while it still belongs to the controller's logical tree.
+        monitor.bindMetadataSource(
+            to: nil,
+            preserving: nil,
+            contains: contains,
+            titleDidChange: titleDidChange
+        )
+        monitor.bindMetadataSource(
+            to: outside,
+            preserving: nil,
+            contains: contains,
+            titleDidChange: titleDidChange
+        )
+
+        outside.title = "Ignored outside"
+        outside.workingDirectory = "/private/tmp/ignored-outside"
+        first.title = "First retained"
+        first.workingDirectory = "/private/tmp/first-retained"
+        #expect(monitor.dynamicTitle == "First retained")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/first-retained")
+        #expect(reportedTitles.count == initialReportCount + 1)
+    }
+
+    @Test func containedPreviousSourceReplacesARemovedCurrentSource() {
+        let removed = SessionMetadataBindingSourceProbe(
+            title: "Removed",
+            workingDirectory: "/private/tmp/removed"
+        )
+        let previous = SessionMetadataBindingSourceProbe(
+            title: "Previous",
+            workingDirectory: "/private/tmp/previous"
+        )
+        let monitor = TerminalSessionMetadataMonitor()
+        var removedIsContained = true
+        let contains: (any TerminalSessionMetadataBindingSource) -> Bool = {
+            source in
+            source === removed ? removedIsContained : source === previous
+        }
+
+        monitor.bindMetadataSource(
+            to: removed,
+            preserving: nil,
+            contains: contains,
+            titleDidChange: { _, _ in }
+        )
+        removedIsContained = false
+        monitor.bindMetadataSource(
+            to: nil,
+            preserving: previous,
+            contains: contains,
+            titleDidChange: { _, _ in }
+        )
+
+        #expect(monitor.dynamicTitle == "Previous")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/previous")
+        removed.title = "Stale removed"
+        removed.workingDirectory = "/private/tmp/stale-removed"
+        #expect(monitor.dynamicTitle == "Previous")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/previous")
+    }
+
+    @Test func rebindAndClearRejectEveryStalePublisher() {
+        let first = SessionMetadataBindingSourceProbe(
+            title: "Codex — First",
+            workingDirectory: "/private/tmp/first"
+        )
+        let second = SessionMetadataBindingSourceProbe(
+            title: "Codex — Second",
+            workingDirectory: "/private/tmp/second"
+        )
+        let monitor = TerminalSessionMetadataMonitor()
+        var sourcesAreContained = true
+        var reportedTitles: [(String, Bool)] = []
+        let contains: (any TerminalSessionMetadataBindingSource) -> Bool = {
+            source in
+            sourcesAreContained && (source === first || source === second)
+        }
+        let titleDidChange: (String, Bool) -> Void = {
+            reportedTitles.append(($0, $1))
+        }
+
+        monitor.bindMetadataSource(
+            to: first,
+            preserving: nil,
+            contains: contains,
+            titleDidChange: titleDidChange
+        )
+        first.progressReport = .init(state: .indeterminate, progress: nil)
+        first.bell = true
+        #expect(monitor.activityStatus == .active)
+
+        monitor.bindMetadataSource(
+            to: second,
+            preserving: first,
+            contains: contains,
+            titleDidChange: titleDidChange
+        )
+        second.progressReport = .init(state: .pause, progress: nil)
+        #expect(monitor.dynamicTitle == "Codex — Second")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/second")
+        #expect(monitor.activityStatus == .paused)
+        let secondReportCount = reportedTitles.count
+
+        // Rebinding must cancel every publisher owned by the old source.
+        first.title = "Stale first"
+        first.bell = false
+        first.progressReport = .init(state: .error, progress: nil)
+        first.workingDirectory = "/private/tmp/stale-first"
+        #expect(monitor.dynamicTitle == "Codex — Second")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/second")
+        #expect(monitor.activityStatus == .paused)
+        #expect(reportedTitles.count == secondReportCount)
+
+        second.title = "Codex — Second current"
+        second.bell = true
+        second.workingDirectory = "/private/tmp/second-current"
+        #expect(monitor.dynamicTitle == "Codex — Second current")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/second-current")
+
+        sourcesAreContained = false
+        monitor.bindMetadataSource(
+            to: nil,
+            preserving: second,
+            contains: contains,
+            titleDidChange: titleDidChange
+        )
+        #expect(monitor.dynamicTitle.isEmpty)
+        #expect(monitor.workingDirectory == nil)
+        #expect(reportedTitles.last?.0 == "👻")
+        #expect(reportedTitles.last?.1 == false)
+        #expect(monitor.activityStatus == .ready)
+        let clearedReportCount = reportedTitles.count
+
+        second.title = "Stale second"
+        second.bell = false
+        second.progressReport = .init(state: .indeterminate, progress: nil)
+        second.workingDirectory = "/private/tmp/stale-second"
+        #expect(monitor.dynamicTitle.isEmpty)
+        #expect(monitor.workingDirectory == nil)
+        #expect(monitor.activityStatus == .ready)
+        #expect(reportedTitles.count == clearedReportCount)
+    }
+
+    @Test func stopMonitoringUnbindsAndRejectsEveryPublisher() {
+        var source: SessionMetadataBindingSourceProbe? =
+            SessionMetadataBindingSourceProbe(
+                title: "Codex — Before stop",
+                workingDirectory: "/private/tmp/before-stop"
+            )
+        weak let weakSource = source
+        let monitor = TerminalSessionMetadataMonitor()
+        var reportedTitles: [(String, Bool)] = []
+
+        monitor.bindMetadataSource(
+            to: source,
+            preserving: nil,
+            contains: { _ in true },
+            titleDidChange: { reportedTitles.append(($0, $1)) }
+        )
+        source?.progressReport = .init(state: .pause, progress: nil)
+        source?.bell = true
+        #expect(monitor.dynamicTitle == "Codex — Before stop")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/before-stop")
+        #expect(monitor.activityStatus == .paused)
+
+        monitor.stopMonitoring()
+        let stoppedReportCount = reportedTitles.count
+
+        source?.title = "Stale after stop"
+        source?.bell = false
+        source?.progressReport = .init(state: .error, progress: nil)
+        source?.workingDirectory = "/private/tmp/stale-after-stop"
+        #expect(monitor.dynamicTitle == "Codex — Before stop")
+        #expect(monitor.workingDirectory?.path == "/private/tmp/before-stop")
+        #expect(monitor.activityStatus == .paused)
+        #expect(reportedTitles.count == stoppedReportCount)
+
+        source = nil
+        #expect(weakSource == nil)
+    }
+}
+
+@MainActor
+private final class SessionMetadataBindingSourceProbe:
+    TerminalSessionMetadataBindingSource {
+    @Published var title: String
+    @Published var bell = false
+    @Published var progressReport: Ghostty.Action.ProgressReport?
+    @Published var workingDirectory: String?
+
+    var sessionMetadataSurface: Ghostty.SurfaceView? { nil }
+    var sessionMetadataTitlePublisher: AnyPublisher<String, Never> {
+        $title.eraseToAnyPublisher()
+    }
+    var sessionMetadataBellPublisher: AnyPublisher<Bool, Never> {
+        $bell.eraseToAnyPublisher()
+    }
+    var sessionMetadataProgressPublisher:
+        AnyPublisher<Ghostty.Action.ProgressReport?, Never> {
+        $progressReport.eraseToAnyPublisher()
+    }
+    var sessionMetadataWorkingDirectoryPublisher:
+        AnyPublisher<String?, Never> {
+        $workingDirectory.eraseToAnyPublisher()
+    }
+
+    init(title: String, workingDirectory: String?) {
+        self.title = title
+        self.workingDirectory = workingDirectory
+    }
+}
+
+@MainActor
 private final class MetadataObservationProbeController: BaseTerminalController {
     override var undoManager: ExpiringUndoManager? { nil }
 }

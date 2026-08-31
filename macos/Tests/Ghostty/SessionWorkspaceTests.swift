@@ -84,6 +84,22 @@ struct SessionWorkspaceTests {
         #expect(!workspace.isSidebarVisible)
     }
 
+    @Test func snapshotInitializationPreservesTransientPresentationState() {
+        let first = SessionID()
+        let second = SessionID()
+        let workspace = SessionWorkspace(snapshot: .init(
+            orderedSessionIDs: [first, second, first],
+            selectedSessionID: second,
+            isSidebarVisible: false,
+            isFileBrowserVisible: false
+        ))
+
+        #expect(workspace.orderedSessionIDs == [first, second])
+        #expect(workspace.selectedSessionID == second)
+        #expect(!workspace.isSidebarVisible)
+        #expect(!workspace.isFileBrowserVisible)
+    }
+
     @Test func registrationIsIdempotentAndKeepsStableOrder() {
         let first = SessionID()
         let second = SessionID()
@@ -236,31 +252,6 @@ struct SessionWorkspaceTests {
             selectedSessionID: sessionID,
             candidates: [candidate, candidate]
         ) == nil)
-    }
-
-    @Test func snapshotWithoutFileBrowserVisibilityDecodesAsVisible() throws {
-        let sessionID = SessionID()
-        let snapshot = SessionWorkspace.Snapshot(
-            orderedSessionIDs: [sessionID],
-            selectedSessionID: sessionID,
-            isSidebarVisible: false,
-            isFileBrowserVisible: false
-        )
-        let encoded = try JSONEncoder().encode(snapshot)
-        var legacyObject = try #require(
-            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
-        )
-        legacyObject.removeValue(forKey: "isFileBrowserVisible")
-        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
-
-        let decoded = try JSONDecoder().decode(
-            SessionWorkspace.Snapshot.self,
-            from: legacyData
-        )
-        #expect(decoded.orderedSessionIDs == [sessionID])
-        #expect(decoded.selectedSessionID == sessionID)
-        #expect(!decoded.isSidebarVisible)
-        #expect(decoded.isFileBrowserVisible)
     }
 
     @Test func adapterIgnoresTransientPartialNativeState() {

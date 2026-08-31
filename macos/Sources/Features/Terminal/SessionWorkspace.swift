@@ -23,7 +23,11 @@ final class SessionWorkspace: ObservableObject {
 
     /// A single atomic value keeps observers from seeing an order, selection,
     /// and sidebar-visibility combination that violates workspace invariants.
-    struct Snapshot: Equatable, Codable, Sendable {
+    ///
+    /// This is deliberately an in-memory projection, not a saved-state schema.
+    /// AppKit restoration is versioned by `TerminalRestorableState`, which owns
+    /// the compatibility defaults for session and file-browser presentation.
+    struct Snapshot: Equatable, Sendable {
         var orderedSessionIDs: [SessionID]
         var selectedSessionID: SessionID?
         var isSidebarVisible: Bool
@@ -39,33 +43,6 @@ final class SessionWorkspace: ObservableObject {
             self.selectedSessionID = selectedSessionID
             self.isSidebarVisible = isSidebarVisible
             self.isFileBrowserVisible = isFileBrowserVisible
-        }
-
-        private enum CodingKeys: String, CodingKey {
-            case orderedSessionIDs
-            case selectedSessionID
-            case isSidebarVisible
-            case isFileBrowserVisible
-        }
-
-        init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            orderedSessionIDs = try container.decode(
-                [SessionID].self,
-                forKey: .orderedSessionIDs
-            )
-            selectedSessionID = try container.decodeIfPresent(
-                SessionID.self,
-                forKey: .selectedSessionID
-            )
-            isSidebarVisible = try container.decodeIfPresent(
-                Bool.self,
-                forKey: .isSidebarVisible
-            ) ?? true
-            isFileBrowserVisible = try container.decodeIfPresent(
-                Bool.self,
-                forKey: .isFileBrowserVisible
-            ) ?? true
         }
     }
 
