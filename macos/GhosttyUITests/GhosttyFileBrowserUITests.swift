@@ -77,13 +77,16 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         )
         app.launch()
 
-        XCTAssertTrue(
-            element("terminal-file-sidebar.list", in: app)
-                .waitForExistence(timeout: 5)
-        )
-        let row = app.buttons["initial.swift"]
-        XCTAssertTrue(row.waitForExistence(timeout: 5))
-        row.click()
+        let table = element("terminal-file-sidebar.list", in: app)
+        XCTAssertTrue(table.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["initial.swift"].waitForExistence(timeout: 5))
+
+        // The filename is an accessibility button for the row's primary Open
+        // action. Select through the native outline row so this exercises the
+        // Table selection contract instead of activating that nested button.
+        let nativeRow = table.outlineRows.firstMatch
+        XCTAssertTrue(nativeRow.waitForExistence(timeout: 5))
+        nativeRow.click()
 
         let copyButton = app.buttons["terminal-file-sidebar.copy"]
         let selectionPublished = XCTNSPredicateExpectation(
@@ -154,9 +157,11 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         }
     }
 
-    /// Uses a real OSC 8 file link and the native file-action menu. The
-    /// revalidation barrier proves the second split receives focus before the
-    /// originating split's reveal request is delivered back to the main actor.
+    /// Uses a real OSC 8 file link and the exact item built by the native
+    /// file-action menu. A DEBUG-only seam dispatches that item because some CI
+    /// macOS versions omit programmatic popup menus from XCUITest's AX tree.
+    /// The revalidation barrier proves the second split receives focus before
+    /// the originating split's reveal request returns to the main actor.
     @MainActor
     func testRevealKeepsOriginatingSplitAfterFocusChangesDuringRevalidation() throws {
         let originDirectory = workingDirectory.appendingPathComponent(
@@ -201,6 +206,9 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         app.launchEnvironment[
             "GHOSTTY_TEST_TERMINAL_FILE_REVALIDATION_BARRIER"
         ] = barrierDirectory.path
+        app.launchEnvironment[
+            "GHOSTTY_TEST_TERMINAL_FILE_AUTO_REVEAL"
+        ] = "1"
         app.launch()
 
         let terminal = app.groups["Terminal pane"]
@@ -266,21 +274,10 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
             linkPoint.click()
         }
 
-        let revealItem = app.menuItems["Show in File Browser"]
-        XCTAssertTrue(
-            revealItem.waitForExistence(timeout: 10),
-            "Command-clicking the OSC 8 file link must present the native reveal menu"
-        )
-        revealItem.click()
-        XCTAssertTrue(
-            revealItem.waitForNonExistence(timeout: 5),
-            "The native file-action menu must dismiss before split focus changes"
-        )
-
         let enteredURL = barrierDirectory.appendingPathComponent("entered")
         XCTAssertTrue(
-            waitForFile(at: enteredURL),
-            "The reveal must reach background filesystem revalidation"
+            waitForFile(at: enteredURL, timeout: 10),
+            "The OSC 8 menu action must reach background filesystem revalidation"
         )
 
         rightPane.click()

@@ -113,13 +113,16 @@ final class FlashSessionTabCoordinator {
                     lastFileBrowserVisibility != snapshot.isFileBrowserVisible
                 lastSidebarVisibility = snapshot.isSidebarVisible
                 lastFileBrowserVisibility = snapshot.isFileBrowserVisible
-                owner.flashSessionSidebarRevisionDidChange()
+                owner.flashSessionWorkspaceDidPublish(snapshot)
 
                 guard visibilityChanged || fileBrowserVisibilityChanged else { return }
                 guard owner.isWindowLoaded else { return }
-                updateInitialContentSize()
+                updateInitialContentSize(for: snapshot)
                 if visibilityChanged {
-                    (owner.window as? TerminalWindow)?.sessionSidebarVisibilityDidChange()
+                    (owner.window as? TerminalWindow)?
+                        .sessionSidebarVisibilityDidChange(
+                            isVisible: snapshot.isSidebarVisible
+                        )
                 }
             }
 
@@ -536,7 +539,9 @@ final class FlashSessionTabCoordinator {
         }
     }
 
-    private func updateInitialContentSize() {
+    private func updateInitialContentSize(
+        for snapshot: SessionWorkspace.Snapshot
+    ) {
         guard usesSidebar,
               let owner,
               owner.isWindowLoaded,
@@ -544,10 +549,10 @@ final class FlashSessionTabCoordinator {
               var initialContentSize = owner.focusedSurface?.initialSize else { return }
 
         initialContentSize.width += TerminalSessionRootView.sidebarChromeWidth(
-            isVisible: isSidebarVisible
+            isVisible: snapshot.isSidebarVisible
         )
         initialContentSize.width += TerminalSessionRootView.fileBrowserChromeWidth(
-            isVisible: fileBrowserIsVisible
+            isVisible: snapshot.isFileBrowserVisible
         )
         initialContentSize.height += TerminalSessionRootView.terminalMetadataHeight
         container.initialContentSize = initialContentSize

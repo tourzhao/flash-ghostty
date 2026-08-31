@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Testing
 @testable import Ghostty
 
@@ -201,6 +202,38 @@ struct SessionWorkspaceTests {
         workspace.toggleSidebarVisibility()
         #expect(workspace.isSidebarVisible)
         #expect(workspace.isFileBrowserVisible)
+    }
+
+    @Test func snapshotPublisherCarriesPendingStateBeforeStorageCommits() {
+        let first = SessionID()
+        let second = SessionID()
+        let workspace = SessionWorkspace(
+            sessionIDs: [first, second],
+            selectedSessionID: first
+        )
+        var deliveries: [(published: SessionWorkspace.Snapshot,
+                          stored: SessionWorkspace.Snapshot)] = []
+        let observation = workspace.$snapshot
+            .dropFirst()
+            .sink { snapshot in
+                deliveries.append((snapshot, workspace.snapshot))
+            }
+
+        #expect(workspace.selectSession(second))
+        workspace.setSidebarVisible(false)
+        workspace.setFileBrowserVisible(false)
+
+        #expect(deliveries.count == 3)
+        #expect(deliveries[0].published.selectedSessionID == second)
+        #expect(deliveries[0].stored.selectedSessionID == first)
+        #expect(!deliveries[1].published.isSidebarVisible)
+        #expect(deliveries[1].stored.isSidebarVisible)
+        #expect(!deliveries[2].published.isFileBrowserVisible)
+        #expect(deliveries[2].stored.isFileBrowserVisible)
+        #expect(workspace.selectedSessionID == second)
+        #expect(!workspace.isSidebarVisible)
+        #expect(!workspace.isFileBrowserVisible)
+        withExtendedLifetime(observation) {}
     }
 
     @Test func completeMergeSampleUsesSelectedSessionPresentation() throws {

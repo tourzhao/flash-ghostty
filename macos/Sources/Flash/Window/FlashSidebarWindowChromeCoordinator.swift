@@ -94,12 +94,13 @@ final class FlashSidebarWindowChromeCoordinator: NSObject {
         }
     }
 
-    func visibilityDidChange() {
+    func visibilityDidChange(isVisible publishedVisibility: Bool? = nil) {
         guard let window else { return }
         updateToggleAccessibility(in: window.tabGroup)
         guard let button = sidebarToggleButton else { return }
 
-        let isVisible = window.terminalController?.sessionSidebarIsVisible ?? true
+        let isVisible = publishedVisibility ??
+            window.terminalController?.sessionSidebarIsVisible ?? true
         let actionTitle = isVisible ? "Hide Sidebar" : "Show Sidebar"
 
         button.toolTip = "\(actionTitle) (⌃⌘S)"

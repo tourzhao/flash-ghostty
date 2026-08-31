@@ -827,6 +827,89 @@ struct FlashTerminalFileTargetTests {
         )
     }
 
+    #if DEBUG
+    @Test func uiTestAutoRevealRequiresDebugIdentityAndBothOptIns() {
+        let completeEnvironment = [
+            FlashTerminalFileActionUITestPolicy.autoRevealEnvironmentKey: "1",
+            FlashTerminalFileActionUITestPolicy
+                .revalidationBarrierEnvironmentKey: "/tmp/barrier",
+        ]
+
+        for bundleIdentifier in [
+            FlashGhosttyProductProfile.debugBundleIdentifier,
+            FlashGhosttyProductProfile.uiTestBundleIdentifier,
+            "\(FlashGhosttyProductProfile.uiTestBundleIdentifier).run-1234",
+        ] {
+            #expect(
+                FlashTerminalFileActionUITestPolicy.permitsTestSeams(
+                    bundleIdentifier: bundleIdentifier
+                )
+            )
+            #expect(
+                FlashTerminalFileActionUITestPolicy
+                    .shouldDispatchRevealAction(
+                        bundleIdentifier: bundleIdentifier,
+                        environment: completeEnvironment
+                    )
+            )
+        }
+
+        #expect(
+            !FlashTerminalFileActionUITestPolicy.permitsTestSeams(
+                bundleIdentifier: nil
+            )
+        )
+        #expect(
+            !FlashTerminalFileActionUITestPolicy.permitsTestSeams(
+                bundleIdentifier: "com.example.debug"
+            )
+        )
+        #expect(
+            !FlashTerminalFileActionUITestPolicy.shouldDispatchRevealAction(
+                bundleIdentifier: FlashGhosttyProductProfile.releaseBundleIdentifier,
+                environment: completeEnvironment
+            )
+        )
+        #expect(
+            !FlashTerminalFileActionUITestPolicy.shouldDispatchRevealAction(
+                bundleIdentifier: FlashGhosttyProductProfile.debugBundleIdentifier,
+                environment: [
+                    FlashTerminalFileActionUITestPolicy.autoRevealEnvironmentKey: "1",
+                ]
+            )
+        )
+        #expect(
+            !FlashTerminalFileActionUITestPolicy.shouldDispatchRevealAction(
+                bundleIdentifier: FlashGhosttyProductProfile.debugBundleIdentifier,
+                environment: [
+                    FlashTerminalFileActionUITestPolicy
+                        .revalidationBarrierEnvironmentKey: "/tmp/barrier",
+                ]
+            )
+        )
+        #expect(
+            !FlashTerminalFileActionUITestPolicy.shouldDispatchRevealAction(
+                bundleIdentifier: FlashGhosttyProductProfile.debugBundleIdentifier,
+                environment: [
+                    FlashTerminalFileActionUITestPolicy.autoRevealEnvironmentKey: "true",
+                    FlashTerminalFileActionUITestPolicy
+                        .revalidationBarrierEnvironmentKey: "/tmp/barrier",
+                ]
+            )
+        )
+        #expect(
+            !FlashTerminalFileActionUITestPolicy.shouldDispatchRevealAction(
+                bundleIdentifier: FlashGhosttyProductProfile.debugBundleIdentifier,
+                environment: [
+                    FlashTerminalFileActionUITestPolicy.autoRevealEnvironmentKey: "1",
+                    FlashTerminalFileActionUITestPolicy
+                        .revalidationBarrierEnvironmentKey: "",
+                ]
+            )
+        )
+    }
+    #endif
+
     @Test func onlyLatestTerminalFileMenuRequestMayPresent() {
         let gate = FlashTerminalFileActionRequestGate()
         let first = gate.begin()

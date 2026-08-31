@@ -308,15 +308,25 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         flashSessionTabCoordinator.resolvedTabGroup(for: window)
     }
 
+    /// Consume the value delivered by `SessionWorkspace.$snapshot` directly.
+    /// Combine publishes `@Published` values from `willSet`, so reading the
+    /// workspace again in that callback would observe the previous selection.
+    func flashSessionWorkspaceDidPublish(
+        _ snapshot: SessionWorkspace.Snapshot
+    ) {
+        sessionSidebarRevision &+= 1
+        let isSelectedSession = snapshot.selectedSessionID == sessionID
+        updateSessionMetadataRefreshContext(
+            sidebarIsVisible: snapshot.isSidebarVisible,
+            sessionIsSelected: isSelectedSession
+        )
+        fileBrowserSessionState.synchronizeSelection(isSelectedSession)
+    }
+
+    /// Native binding and metadata changes invalidate sidebar presentation but
+    /// do not publish a new workspace selection or visibility snapshot.
     func flashSessionSidebarRevisionDidChange() {
         sessionSidebarRevision &+= 1
-        updateSessionMetadataRefreshContext(
-            sidebarIsVisible: sessionSidebarIsVisible,
-            sessionIsSelected: sessionWorkspace.selectedSessionID == sessionID
-        )
-        fileBrowserSessionState.synchronizeSelection(
-            sessionWorkspace.selectedSessionID == sessionID
-        )
     }
 
     @discardableResult

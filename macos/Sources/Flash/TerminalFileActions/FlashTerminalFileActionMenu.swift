@@ -87,11 +87,65 @@ enum FlashTerminalFileActionMenu {
                     terminalController: terminalController,
                     sourceContext: sourceContext
                 )
+                #if DEBUG
+                // Programmatic popup menus are absent from XCUITest's AX tree
+                // on some macOS runners. In an explicitly opted-in UI-test
+                // process, dispatch the exact item and payload just built so
+                // the integration test can cover the remaining async path.
+                if FlashTerminalFileActionUITestPolicy.shouldDispatchRevealAction(
+                    bundleIdentifier: Bundle.main.bundleIdentifier,
+                    environment: ProcessInfo.processInfo.environment
+                ), let revealItem = menu.items.first(where: {
+                    $0.action == #selector(
+                        FlashTerminalFileActionHandler.showInFileBrowser(_:)
+                    )
+                }) {
+                    FlashTerminalFileActionHandler.shared
+                        .showInFileBrowser(revealItem)
+                    return
+                }
+                #endif
                 menu.popUp(positioning: nil, at: screenPoint, in: nil)
             }
         }
     }
 }
+
+#if DEBUG
+/// Strict runtime gate for deterministic UI-test seams. Release builds do not
+/// compile this path. Each seam requires its own explicit environment opt-in;
+/// automatic reveal additionally requires an active revalidation barrier.
+enum FlashTerminalFileActionUITestPolicy {
+    static let revalidationBarrierEnvironmentKey =
+        "GHOSTTY_TEST_TERMINAL_FILE_REVALIDATION_BARRIER"
+    static let autoRevealEnvironmentKey =
+        "GHOSTTY_TEST_TERMINAL_FILE_AUTO_REVEAL"
+
+    static func shouldDispatchRevealAction(
+        bundleIdentifier: String?,
+        environment: [String: String]
+    ) -> Bool {
+        guard permitsTestSeams(bundleIdentifier: bundleIdentifier),
+              environment[autoRevealEnvironmentKey] == "1",
+              let barrierDirectory =
+                environment[revalidationBarrierEnvironmentKey],
+              !barrierDirectory.isEmpty else { return false }
+        return true
+    }
+
+    static func permitsTestSeams(bundleIdentifier: String?) -> Bool {
+        let uiTestBundleIdentifier =
+            FlashGhosttyProductProfile.uiTestBundleIdentifier
+        guard let bundleIdentifier,
+              bundleIdentifier ==
+                FlashGhosttyProductProfile.debugBundleIdentifier ||
+                bundleIdentifier == uiTestBundleIdentifier ||
+                bundleIdentifier.hasPrefix("\(uiTestBundleIdentifier).run-")
+        else { return false }
+        return true
+    }
+}
+#endif
 
 private extension FlashTerminalFileActionMenu {
     @MainActor
@@ -588,17 +642,13 @@ enum FlashTerminalFileActionExecutor {
     /// seam is inert unless the launched test app opts in with a fresh
     /// temporary directory.
     private static func waitForUITestRevalidationBarrierIfConfigured() {
-        let environmentKey =
-            "GHOSTTY_TEST_TERMINAL_FILE_REVALIDATION_BARRIER"
-        let uiTestBundleIdentifier =
-            FlashGhosttyProductProfile.uiTestBundleIdentifier
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier,
-              bundleIdentifier ==
-                FlashGhosttyProductProfile.debugBundleIdentifier ||
-                bundleIdentifier == uiTestBundleIdentifier ||
-                bundleIdentifier.hasPrefix("\(uiTestBundleIdentifier).run-"),
-              let directoryPath = ProcessInfo.processInfo
-            .environment[environmentKey],
+        let environment = ProcessInfo.processInfo.environment
+        guard FlashTerminalFileActionUITestPolicy.permitsTestSeams(
+            bundleIdentifier: Bundle.main.bundleIdentifier
+        ), let directoryPath = environment[
+            FlashTerminalFileActionUITestPolicy
+                .revalidationBarrierEnvironmentKey
+        ],
               !directoryPath.isEmpty else { return }
 
         let directory = URL(
