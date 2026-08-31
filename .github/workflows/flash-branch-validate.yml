@@ -189,6 +189,7 @@ jobs:
           retention-days: 7
 
       - name: Run critical FLASH UI tests
+        id: macos_ui
         run: |
           for suite in \
             GhosttySessionSidebarUITests \
@@ -202,6 +203,15 @@ jobs:
               --only-testing "GhosttyUITests/$suite" \
               --action test
           done
+
+      - name: Upload critical FLASH UI test diagnostics
+        if: failure() && steps.macos_ui.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-macos-ui-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: macos/build/DerivedData/Logs/Test/*.xcresult
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Build universal release candidate
         run: |

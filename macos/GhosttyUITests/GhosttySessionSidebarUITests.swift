@@ -39,7 +39,11 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
 
         XCTAssertTrue(
             waitForWorkingDirectory("/private/tmp", in: app),
-            "The directory header must leave its loading state after launch"
+            """
+            The directory header must leave its loading state after launch; \
+            observed accessibility value: \
+            \(String(describing: workingDirectoryElement(in: app).value))
+            """
         )
 
         terminal.typeKey("t", modifierFlags: .command)
@@ -190,15 +194,15 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
     private func waitForWorkingDirectory(
         _ expectedPath: String,
         in app: XCUIApplication,
-        timeout: TimeInterval = 5
+        timeout: TimeInterval = 15
     ) -> Bool {
+        // The app can mount its AX tree before zsh integration publishes the
+        // first OSC 7 report. Match the cold-start budget used by the file
+        // browser and restoration suites while still failing a missing report.
         // Query the leaf by its unique identifier. A label lookup can still
         // match the text after SwiftUI has propagated an ancestor identifier,
         // masking a broken accessibility hierarchy.
-        let element = element(
-            withIdentifier: "terminal-session-working-directory.text",
-            in: app
-        )
+        let element = workingDirectoryElement(in: app)
         // The product intentionally displays a standardized file URL. On
         // macOS, the system alias `/private/tmp` canonicalizes to `/tmp`.
         let expectedValue = URL(fileURLWithPath: expectedPath)
@@ -206,6 +210,14 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
         let predicate = NSPredicate(format: "value == %@", expectedValue)
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func workingDirectoryElement(in app: XCUIApplication) -> XCUIElement {
+        element(
+            withIdentifier: "terminal-session-working-directory.text",
+            in: app
+        )
     }
 
     @MainActor
