@@ -58,7 +58,7 @@ struct TransferablePasteboardTests {
         #expect(item.types.contains(expectedType))
     }
 
-    @Test func pasteboardItemProvidesCorrectData() {
+    @Test @MainActor func pasteboardItemProvidesCorrectData() throws {
         let transferable = DummyTransferable(payload: "test data")
         guard let item = transferable.pasteboardItem() else {
             Issue.record("Expected pasteboard item to be created")
@@ -72,11 +72,14 @@ struct TransferablePasteboardTests {
         pasteboard.clearContents()
         pasteboard.writeObjects([item])
 
-        // Read back the data
-        guard let data = pasteboard.data(forType: pasteboardType) else {
-            Issue.record("Expected data to be available on pasteboard")
-            return
-        }
+        // Reading lazy pasteboard data is synchronous and can wait for an
+        // asynchronous CoreTransferable completion. Keep that wait on AppKit's
+        // main thread instead of a cooperative Swift executor worker.
+        let providedData = pasteboard.data(forType: pasteboardType)
+        let data = try #require(
+            providedData,
+            "Expected data to be available on pasteboard"
+        )
 
         let string = String(data: data, encoding: .utf8)
         #expect(string == "test data")
@@ -98,7 +101,7 @@ struct TransferablePasteboardTests {
         #expect(item.types.contains(plainType))
     }
 
-    @Test func multipleTypesProvideCorrectData() {
+    @Test @MainActor func multipleTypesProvideCorrectData() throws {
         let transferable = MultiTypeTransferable(text: "shared content")
         guard let item = transferable.pasteboardItem() else {
             Issue.record("Expected pasteboard item to be created")
@@ -113,21 +116,31 @@ struct TransferablePasteboardTests {
         let utf8Type = NSPasteboard.PasteboardType(UTType.utf8PlainText.identifier)
         let plainType = NSPasteboard.PasteboardType(UTType.plainText.identifier)
 
-        if let utf8Data = pasteboard.data(forType: utf8Type) {
-            #expect(String(data: utf8Data, encoding: .utf8) == "shared content")
-        }
+        let providedData = TransferablePasteboardProvidedData(
+            first: pasteboard.data(forType: utf8Type),
+            second: pasteboard.data(forType: plainType)
+        )
+        let utf8Data = try #require(
+            providedData.first,
+            "Expected UTF-8 pasteboard data"
+        )
+        let plainData = try #require(
+            providedData.second,
+            "Expected plain-text pasteboard data"
+        )
 
-        if let plainData = pasteboard.data(forType: plainType) {
-            #expect(String(data: plainData, encoding: .utf8) == "shared content")
-        }
+        #expect(String(data: utf8Data, encoding: .utf8) == "shared content")
+        #expect(String(data: plainData, encoding: .utf8) == "shared content")
     }
 
     @Test func multipleCompletionsCanReturnAsynchronouslyOnTheLoadingQueue() async throws {
         let loadingQueue = DispatchQueue(
-            label: "com.mitchellh.ghostty.tests.transferable-data-provider"
+            label: "com.mitchellh.ghostty.tests.transferable-data-provider",
+            qos: .userInitiated
         )
         let loadingQueueKey = DispatchSpecificKey<Void>()
         loadingQueue.setSpecific(key: loadingQueueKey, value: ())
+        let loadingQueueProbe = TransferablePasteboardQueueProbe()
 
         let dataType = NSPasteboard.PasteboardType(UTType.data.identifier)
         let textType = NSPasteboard.PasteboardType(UTType.plainText.identifier)
@@ -136,59 +149,56 @@ struct TransferablePasteboardTests {
             textType.rawValue: Data("deferred text".utf8),
         ]
         let provider = TransferableDataProvider(loadingQueue: loadingQueue) { type, completion in
-            #expect(DispatchQueue.getSpecific(key: loadingQueueKey) != nil)
+            loadingQueueProbe.record(
+                DispatchQueue.getSpecific(key: loadingQueueKey) != nil
+            )
 
             // CoreTransferable may deliver asynchronously on the executor that
             // initiated the load. The loading queue must be free before the
             // synchronous pasteboard callback starts waiting for this block.
+            let deferredCompletion = TransferablePasteboardDataCompletion(
+                completion
+            )
             loadingQueue.async {
-                completion(expectedData[type])
+                deferredCompletion(expectedData[type])
             }
         }
         let item = NSPasteboardItem()
-        let invocation = TransferablePasteboardInvocation(
-            provider: provider,
-            item: item
-        )
-        let providedDataResult = await withCheckedContinuation { continuation in
-            let completion = TransferablePasteboardCompletion(continuation)
-            DispatchQueue.global(qos: .userInitiated).async {
-                completion.resume(
-                    returning: invocation.provide(dataType, textType)
+        let providedData = try await runTransferablePasteboardInvocation(
+            TransferablePasteboardInvocation {
+                provider.pasteboard(
+                    nil,
+                    item: item,
+                    provideDataForType: dataType
+                )
+                provider.pasteboard(
+                    nil,
+                    item: item,
+                    provideDataForType: textType
+                )
+                return TransferablePasteboardProvidedData(
+                    first: item.data(forType: dataType),
+                    second: item.data(forType: textType)
                 )
             }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(
-                deadline: .now() + 2
-            ) {
-                completion.resume(returning: nil)
-            }
-        }
-        let providedData = try #require(providedDataResult)
+        )
 
+        #expect(loadingQueueProbe.observations == [true, true])
         #expect(providedData.first == expectedData[dataType.rawValue])
         #expect(providedData.second == expectedData[textType.rawValue])
     }
 }
 
-private final class TransferablePasteboardInvocation: @unchecked Sendable {
-    private let provider: TransferableDataProvider
-    private let item: NSPasteboardItem
+private final class TransferablePasteboardInvocation<Value: Sendable>:
+    @unchecked Sendable {
+    private let body: () -> Value
 
-    init(provider: TransferableDataProvider, item: NSPasteboardItem) {
-        self.provider = provider
-        self.item = item
+    init(_ body: @escaping () -> Value) {
+        self.body = body
     }
 
-    func provide(
-        _ firstType: NSPasteboard.PasteboardType,
-        _ secondType: NSPasteboard.PasteboardType
-    ) -> TransferablePasteboardProvidedData {
-        provider.pasteboard(nil, item: item, provideDataForType: firstType)
-        provider.pasteboard(nil, item: item, provideDataForType: secondType)
-        return TransferablePasteboardProvidedData(
-            first: item.data(forType: firstType),
-            second: item.data(forType: secondType)
-        )
+    func run() -> Value {
+        body()
     }
 }
 
@@ -197,28 +207,98 @@ private struct TransferablePasteboardProvidedData: Sendable {
     let second: Data?
 }
 
-private final class TransferablePasteboardCompletion: @unchecked Sendable {
+private final class TransferablePasteboardDataCompletion:
+    @unchecked Sendable {
+    private let body: (Data?) -> Void
+
+    init(_ body: @escaping (Data?) -> Void) {
+        self.body = body
+    }
+
+    func callAsFunction(_ data: Data?) {
+        body(data)
+    }
+}
+
+private final class TransferablePasteboardQueueProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedObservations: [Bool] = []
+
+    func record(_ observation: Bool) {
+        lock.withLock {
+            recordedObservations.append(observation)
+        }
+    }
+
+    var observations: [Bool] {
+        lock.withLock { recordedObservations }
+    }
+}
+
+private enum TransferablePasteboardThreadOutcome<Value: Sendable>: Sendable {
+    case value(Value)
+    case timedOut
+}
+
+private struct TransferablePasteboardTimeoutError: Error {}
+
+private final class TransferablePasteboardCompletion<Value: Sendable>:
+    @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<
-        TransferablePasteboardProvidedData?,
+        TransferablePasteboardThreadOutcome<Value>,
         Never
     >?
 
     init(
         _ continuation: CheckedContinuation<
-            TransferablePasteboardProvidedData?,
+            TransferablePasteboardThreadOutcome<Value>,
             Never
         >
     ) {
         self.continuation = continuation
     }
 
-    func resume(returning result: TransferablePasteboardProvidedData?) {
+    func resume(
+        returning result: TransferablePasteboardThreadOutcome<Value>
+    ) {
         let continuation = lock.withLock {
             let continuation = self.continuation
             self.continuation = nil
             return continuation
         }
         continuation?.resume(returning: result)
+    }
+}
+
+private func runTransferablePasteboardInvocation<Value: Sendable>(
+    _ invocation: TransferablePasteboardInvocation<Value>
+) async throws -> Value {
+    let outcome: TransferablePasteboardThreadOutcome<Value> =
+        await withCheckedContinuation { continuation in
+            let completion = TransferablePasteboardCompletion(continuation)
+            let thread = Thread {
+                let value = autoreleasepool {
+                    invocation.run()
+                }
+                completion.resume(returning: .value(value))
+            }
+            thread.name = "TransferablePasteboardTests.Invocation"
+            thread.qualityOfService = .userInitiated
+            thread.start()
+
+            DispatchQueue(
+                label: "com.mitchellh.ghostty.tests.transferable-timeout",
+                qos: .userInitiated
+            ).asyncAfter(deadline: .now() + 10) {
+                completion.resume(returning: .timedOut)
+            }
+        }
+
+    switch outcome {
+    case let .value(value):
+        return value
+    case .timedOut:
+        throw TransferablePasteboardTimeoutError()
     }
 }

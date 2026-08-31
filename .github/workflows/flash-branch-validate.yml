@@ -167,6 +167,7 @@ jobs:
           swiftlint lint --strict --no-cache
 
       - name: Run macOS unit tests
+        id: macos_unit
         run: |
           macos/build.nu \
             --configuration Debug \
@@ -174,6 +175,15 @@ jobs:
             --action test
           git diff --exit-code -- \
             macos/Ghostty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+      - name: Upload macOS unit test diagnostics
+        if: failure() && steps.macos_unit.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-macos-unit-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: macos/build/DerivedData/Logs/Test/*.xcresult
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Run critical FLASH UI tests
         run: |
