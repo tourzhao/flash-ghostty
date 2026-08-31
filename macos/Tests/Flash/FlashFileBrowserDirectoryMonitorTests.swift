@@ -2,7 +2,10 @@ import Foundation
 import Testing
 @testable import Ghostty
 
-@Suite @MainActor
+// These tests each create a short-lived stream backed by the system FSEvents
+// service. Running several concurrently makes actor polling test daemon
+// scheduling instead of the monitor's behavior.
+@Suite(.serialized) @MainActor
 struct FlashFileBrowserDirectoryMonitorTests {
     @Test
     func compatibilitySymlinkPathPreservesCallbackIdentity() async throws {
@@ -30,8 +33,8 @@ struct FlashFileBrowserDirectoryMonitorTests {
             to: root.appendingPathComponent("created.txt")
         )
 
-        #expect(await waitUntil { callbacks.count == 1 })
-        #expect(callbacks == [normalized(root)])
+        #expect(await waitUntil { !callbacks.isEmpty })
+        #expect(callbacks.allSatisfy { $0 == normalized(root) })
     }
 
     @Test
@@ -57,8 +60,11 @@ struct FlashFileBrowserDirectoryMonitorTests {
             to: root.appendingPathComponent("created.txt")
         )
 
-        #expect(await waitUntil { callbacks.count == 1 })
-        #expect(callbacks == [normalized(root)])
+        // A single filesystem operation may arrive in multiple FSEvents
+        // batches. Exact fixed-window coalescing is covered by the injected
+        // burst test; this integration test owns delivery and actor identity.
+        #expect(await waitUntil { !callbacks.isEmpty })
+        #expect(callbacks.allSatisfy { $0 == normalized(root) })
         #expect(callbackWasOnMainThread)
     }
 
@@ -150,6 +156,9 @@ struct FlashFileBrowserDirectoryMonitorTests {
 
         var callbackCount = 0
         #expect(monitor.watch(root) { _ in callbackCount += 1 })
+        let initialRegistrationGeneration = try #require(
+            monitor.currentRegistrationGenerationForTesting
+        )
         await allowSourceRegistration()
 
         try FileManager.default.moveItem(at: root, to: oldRoot)
@@ -157,14 +166,77 @@ struct FlashFileBrowserDirectoryMonitorTests {
             at: root,
             withIntermediateDirectories: true
         )
-        #expect(await waitUntil { callbackCount == 1 })
+        #expect(await waitUntil {
+            guard let current =
+                    monitor.currentRegistrationGenerationForTesting else {
+                return false
+            }
+            return current != initialRegistrationGeneration
+        })
+        #expect(callbackCount >= 1)
+        let callbackCountBeforeNewIdentityChange = callbackCount
 
-        // The second event belongs to the newly-created vnode at the same
-        // path. Receiving it proves the monitor did not remain on oldRoot.
+        // The registration generation above proves the old stream was
+        // replaced. A later event from the recreated path proves the new
+        // stream remains live without assuming one callback per FSEvents batch.
         try Data("new identity".utf8).write(
             to: root.appendingPathComponent("new.txt")
         )
-        #expect(await waitUntil { callbackCount == 2 })
+        #expect(await waitUntil {
+            callbackCount > callbackCountBeforeNewIdentityChange
+        })
+    }
+
+    @Test
+    func samePathRebindRejectsRetiredRegistrationEvents() throws {
+        let root = try makeDirectory(named: "RetiredRegistration")
+        let monitor = FlashFileBrowserDirectoryMonitor(
+            debounceNanoseconds: 5_000_000_000,
+            ignoresFileSystemEventsForTesting: true
+        )
+        defer {
+            monitor.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        var callbackCount = 0
+        #expect(monitor.watch(root) { _ in callbackCount += 1 })
+        let retiredEvent = try #require(
+            monitor.currentEventIdentityForTesting
+        )
+        let retiredRegistrationGeneration = try #require(
+            monitor.currentRegistrationGenerationForTesting
+        )
+
+        monitor.receiveEventForTesting(
+            retiredEvent,
+            requiresRebind: true
+        )
+        #expect(monitor.hasPendingDeliveryForTesting)
+        monitor.deliverPendingEventForTesting(retiredEvent)
+        #expect(callbackCount == 1)
+
+        let currentEvent = try #require(
+            monitor.currentEventIdentityForTesting
+        )
+        let currentRegistrationGeneration = try #require(
+            monitor.currentRegistrationGenerationForTesting
+        )
+        #expect(
+            currentRegistrationGeneration != retiredRegistrationGeneration
+        )
+
+        // A callback queued before cancellation can reach the main actor after
+        // the replacement is live. Its retired registration identity must not
+        // start another debounce window.
+        monitor.receiveEventForTesting(retiredEvent)
+        #expect(!monitor.hasPendingDeliveryForTesting)
+        #expect(callbackCount == 1)
+
+        monitor.receiveEventForTesting(currentEvent)
+        #expect(monitor.hasPendingDeliveryForTesting)
+        monitor.deliverPendingEventForTesting(currentEvent)
+        #expect(callbackCount == 2)
     }
 
     @Test
@@ -184,6 +256,9 @@ struct FlashFileBrowserDirectoryMonitorTests {
 
         var callbackCount = 0
         #expect(monitor.watch(root) { _ in callbackCount += 1 })
+        let initialRegistrationGeneration = try #require(
+            monitor.currentRegistrationGenerationForTesting
+        )
         await allowSourceRegistration()
 
         try FileManager.default.moveItem(at: root, to: oldRoot)
@@ -210,13 +285,19 @@ struct FlashFileBrowserDirectoryMonitorTests {
         // A successful retry delivers one refresh for changes missed while no
         // stream existed, then the new directory identity remains observable.
         #expect(await waitUntil {
-            callbackCount == callbackCountAfterMissingPath + 1
+            guard let current =
+                    monitor.currentRegistrationGenerationForTesting else {
+                return false
+            }
+            return current != initialRegistrationGeneration
         })
+        #expect(callbackCount > callbackCountAfterMissingPath)
+        let callbackCountAfterRebind = callbackCount
         try Data("new identity".utf8).write(
             to: root.appendingPathComponent("new.txt")
         )
         #expect(await waitUntil {
-            callbackCount == callbackCountAfterMissingPath + 2
+            callbackCount > callbackCountAfterRebind
         })
     }
 

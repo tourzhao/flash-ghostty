@@ -46,6 +46,11 @@ final class FlashFileBrowserDirectoryMonitor:
     private var changeHandler: ChangeHandler?
     private var pendingRebind = false
     private var generation: UInt = 0
+    /// A logical watch keeps its generation while a same-path replacement
+    /// reopens the underlying stream. Give every concrete registration its
+    /// own generation so callbacks already queued by the retired stream cannot
+    /// become valid again after the replacement stream is installed.
+    private var registrationGeneration: UInt = 0
 
 #if DEBUG
     private let ignoresFileSystemEventsForTesting: Bool
@@ -57,6 +62,7 @@ final class FlashFileBrowserDirectoryMonitor:
     struct EventIdentityForTesting {
         fileprivate let directory: URL
         fileprivate let generation: UInt
+        fileprivate let registrationGeneration: UInt
     }
 
     /// Test-only visibility into the debounce boundary. Kernel event delivery
@@ -79,8 +85,16 @@ final class FlashFileBrowserDirectoryMonitor:
         guard let watchedDirectory, registration != nil else { return nil }
         return EventIdentityForTesting(
             directory: watchedDirectory,
-            generation: generation
+            generation: generation,
+            registrationGeneration: registrationGeneration
         )
+    }
+
+    /// Identifies the concrete FSEvents stream rather than the logical watch.
+    /// A same-path rebind must replace this value even though `generation`
+    /// intentionally remains stable.
+    var currentRegistrationGenerationForTesting: UInt? {
+        registration == nil ? nil : registrationGeneration
     }
 
     /// Drives the debounce state machine without coupling its unit tests to
@@ -96,6 +110,7 @@ final class FlashFileBrowserDirectoryMonitor:
         receiveEvent(
             for: identity.directory,
             generation: identity.generation,
+            registrationGeneration: identity.registrationGeneration,
             requiresRebind: requiresRebind
         )
     }
@@ -109,6 +124,7 @@ final class FlashFileBrowserDirectoryMonitor:
     ) {
         guard debounceTask != nil,
               identity.generation == generation,
+              identity.registrationGeneration == registrationGeneration,
               identity.directory == watchedDirectory else { return }
         debounceTask?.cancel()
         deliverDebouncedEvent(
@@ -181,9 +197,11 @@ final class FlashFileBrowserDirectoryMonitor:
     private func receiveEvent(
         for directory: URL,
         generation eventGeneration: UInt,
+        registrationGeneration eventRegistrationGeneration: UInt,
         requiresRebind: Bool
     ) {
         guard eventGeneration == generation,
+              eventRegistrationGeneration == registrationGeneration,
               directory == watchedDirectory,
               registration != nil else { return }
 
@@ -325,6 +343,9 @@ final class FlashFileBrowserDirectoryMonitor:
             for: directory
         ) else { return nil }
 
+        registrationGeneration &+= 1
+        let sourceGeneration = registrationGeneration
+
         return Registration(
             directoryPath: observedDirectoryPath
         ) { [weak self] requiresRebind in
@@ -335,6 +356,7 @@ final class FlashFileBrowserDirectoryMonitor:
                 self?.receiveEvent(
                     for: directory,
                     generation: watchGeneration,
+                    registrationGeneration: sourceGeneration,
                     requiresRebind: requiresRebind
                 )
             }
