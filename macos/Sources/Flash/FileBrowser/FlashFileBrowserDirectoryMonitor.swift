@@ -99,6 +99,23 @@ final class FlashFileBrowserDirectoryMonitor:
             requiresRebind: requiresRebind
         )
     }
+
+    /// Deterministically drains an injected debounce event. The aggregate
+    /// test suite can keep the main actor busy beyond a short wall-clock
+    /// timeout; draining the already-scheduled event tests retry ownership
+    /// without depending on executor scheduling latency.
+    func deliverPendingEventForTesting(
+        _ identity: EventIdentityForTesting
+    ) {
+        guard debounceTask != nil,
+              identity.generation == generation,
+              identity.directory == watchedDirectory else { return }
+        debounceTask?.cancel()
+        deliverDebouncedEvent(
+            for: identity.directory,
+            generation: identity.generation
+        )
+    }
 #endif
 
     init(
@@ -192,26 +209,36 @@ final class FlashFileBrowserDirectoryMonitor:
             }
 
             guard let self else { return }
-            self.debounceTask = nil
-            guard eventGeneration == self.generation,
-                  directory == self.watchedDirectory else { return }
+            self.deliverDebouncedEvent(
+                for: directory,
+                generation: eventGeneration
+            )
+        }
+    }
 
-            if self.pendingRebind {
-                self.pendingRebind = false
-                let didReopen = self.reopenCurrentWatch(
-                    directory,
+    private func deliverDebouncedEvent(
+        for directory: URL,
+        generation eventGeneration: UInt
+    ) {
+        debounceTask = nil
+        guard eventGeneration == generation,
+              directory == watchedDirectory else { return }
+
+        if pendingRebind {
+            pendingRebind = false
+            let didReopen = reopenCurrentWatch(
+                directory,
+                generation: eventGeneration
+            )
+            if !didReopen {
+                startRebindRetry(
+                    for: directory,
                     generation: eventGeneration
                 )
-                if !didReopen {
-                    self.startRebindRetry(
-                        for: directory,
-                        generation: eventGeneration
-                    )
-                }
             }
-
-            self.changeHandler?(directory)
         }
+
+        changeHandler?(directory)
     }
 
     /// A watched directory can remain absent beyond the debounce window during
@@ -327,7 +354,10 @@ final class FlashFileBrowserDirectoryMonitor:
             Darwin.fcntl(descriptor, F_GETPATH, $0.baseAddress!)
         }
         guard result == 0 else { return nil }
-        return String(cString: pathBuffer)
+        let pathBytes = pathBuffer
+            .prefix { $0 != 0 }
+            .map { UInt8(bitPattern: $0) }
+        return String(bytes: pathBytes, encoding: .utf8)
     }
 
     private func invalidateCurrentWatch() {

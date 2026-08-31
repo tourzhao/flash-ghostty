@@ -246,9 +246,10 @@ struct FlashFileBrowserDirectoryMonitorTests {
             eventIdentity,
             requiresRebind: true
         )
-        #expect(await waitUntil {
-            monitor.hasPendingRebindRetryForTesting
-        })
+        #expect(monitor.hasPendingDeliveryForTesting)
+        monitor.deliverPendingEventForTesting(eventIdentity)
+        #expect(!monitor.hasPendingDeliveryForTesting)
+        #expect(monitor.hasPendingRebindRetryForTesting)
         let callbackCountBeforeStop = callbackCount
 
         monitor.stop()
