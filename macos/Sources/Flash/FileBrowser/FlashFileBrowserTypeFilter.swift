@@ -157,6 +157,41 @@ enum FlashFileBrowserTypeFilter {
         selectedTypes: Set<FlashFileBrowserFileType>,
         revealing revealedItemID: FlashFileBrowserItem.ID? = nil
     ) -> Bool {
+        isVisible(
+            item,
+            normalizedQuery: normalizedQuery,
+            selectedTypes: selectedTypes,
+            revealing: revealedItemID,
+            fileType: { fileType(for: item) }
+        )
+    }
+
+    /// Projection already resolves every item's type while collecting the
+    /// available choices. Reusing that value prevents a second extension
+    /// normalization pass whenever a type filter is active.
+    static func isVisible(
+        _ item: FlashFileBrowserItem,
+        normalizedQuery: String,
+        selectedTypes: Set<FlashFileBrowserFileType>,
+        resolvedFileType: FlashFileBrowserFileType?,
+        revealing revealedItemID: FlashFileBrowserItem.ID? = nil
+    ) -> Bool {
+        isVisible(
+            item,
+            normalizedQuery: normalizedQuery,
+            selectedTypes: selectedTypes,
+            revealing: revealedItemID,
+            fileType: { resolvedFileType }
+        )
+    }
+
+    private static func isVisible(
+        _ item: FlashFileBrowserItem,
+        normalizedQuery: String,
+        selectedTypes: Set<FlashFileBrowserFileType>,
+        revealing revealedItemID: FlashFileBrowserItem.ID?,
+        fileType: () -> FlashFileBrowserFileType?
+    ) -> Bool {
         // A direct reveal is a temporary presentation override. The persistent
         // type selection and search text resume when the reveal is dismissed.
         if item.id == revealedItemID { return true }
@@ -172,7 +207,7 @@ enum FlashFileBrowserTypeFilter {
             return true
         }
 
-        guard let type = fileType(for: item) else { return false }
+        guard let type = fileType() else { return false }
         return selectedTypes.contains(type)
     }
 

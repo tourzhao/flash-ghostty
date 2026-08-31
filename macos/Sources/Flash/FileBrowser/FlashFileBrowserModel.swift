@@ -9,7 +9,13 @@ import Foundation
 /// when it eventually completes.
 @MainActor
 final class FlashFileBrowserModel: ObservableObject {
-    @Published private(set) var items: [FlashFileBrowserItem] = []
+    /// The potentially large payload stays outside `ObservableObject` change
+    /// comparison. Views observe the scalar revision and pull the immutable
+    /// snapshot only when it changes.
+    private(set) var items: [FlashFileBrowserItem] = [] {
+        didSet { itemsRevision &+= 1 }
+    }
+    @Published private(set) var itemsRevision: UInt = 0
     @Published private(set) var currentDirectory: URL? {
         didSet {
             guard oldValue?.standardizedFileURL.path !=
@@ -19,27 +25,27 @@ final class FlashFileBrowserModel: ObservableObject {
     }
     @Published private(set) var sessionRoot: URL?
     @Published private(set) var isLoading = false
-    @Published private(set) var isPerformingOperation = false
+    @Published var isPerformingOperation = false
     @Published private(set) var showingHiddenFiles: Bool
-    @Published private(set) var errorMessage: String?
+    @Published var errorMessage: String?
 
     var canGoBack: Bool { !backHistory.isEmpty }
     var canGoForward: Bool { !forwardHistory.isEmpty }
 
-    private let fileSystem: any FlashFileBrowserFileSystem
+    let fileSystem: any FlashFileBrowserFileSystem
     private let directoryMonitor: any FlashFileBrowserDirectoryMonitoring
     private let snapshotWorker = FlashFileBrowserSnapshotWorker()
-    private var synchronizedSessionID: SessionWorkspace.SessionID?
+    private(set) var synchronizedSessionID: SessionWorkspace.SessionID?
     private var backHistory: [URL] = []
-    private var forwardHistory: [URL] = []
+    var forwardHistory: [URL] = []
     private var loadGeneration: UInt = 0
-    private var operationGeneration: UInt = 0
+    var operationGeneration: UInt = 0
     private var synchronizationGeneration: UInt = 0
     private var directoryMonitorGeneration: UInt = 0
     private var revealGeneration: UInt = 0
     private var transientRevealedHiddenTarget: URL?
     private var directoryMonitoringEnabled = false
-    private var externalReloadPending = false
+    var externalReloadPending = false
     private var externalReloadTask: Task<Void, Never>?
     private var rootBindingTail: Task<Void, Never>?
     private var pendingRootBindingCount = 0
@@ -250,7 +256,7 @@ final class FlashFileBrowserModel: ObservableObject {
         }
         forwardHistory.removeAll(keepingCapacity: true)
         currentDirectory = destination
-        items = []
+        clearItemsIfNeeded()
         errorMessage = nil
         await reload()
     }
@@ -301,7 +307,7 @@ final class FlashFileBrowserModel: ObservableObject {
             }
             forwardHistory.removeAll(keepingCapacity: true)
             currentDirectory = destination
-            items = []
+            clearItemsIfNeeded()
             errorMessage = nil
         }
         if changesDirectory || refreshCurrentDirectory {
@@ -367,7 +373,7 @@ final class FlashFileBrowserModel: ObservableObject {
         backHistory.removeLast()
         forwardHistory.append(currentDirectory)
         self.currentDirectory = destination
-        items = []
+        clearItemsIfNeeded()
         errorMessage = nil
         await reload()
     }
@@ -382,7 +388,7 @@ final class FlashFileBrowserModel: ObservableObject {
         forwardHistory.removeLast()
         backHistory.append(currentDirectory)
         self.currentDirectory = destination
-        items = []
+        clearItemsIfNeeded()
         errorMessage = nil
         await reload()
     }
@@ -401,7 +407,7 @@ final class FlashFileBrowserModel: ObservableObject {
         }
         forwardHistory.removeAll(keepingCapacity: true)
         currentDirectory = root
-        items = []
+        clearItemsIfNeeded()
         errorMessage = nil
         await reload()
     }
@@ -413,7 +419,7 @@ final class FlashFileBrowserModel: ObservableObject {
         self.showingHiddenFiles = showingHiddenFiles
         clearTransientRevealedHiddenTarget()
         if !showingHiddenFiles {
-            items.removeAll(where: \.isHidden)
+            removeHiddenItemsIfNeeded()
         }
         await reload()
     }
@@ -423,103 +429,6 @@ final class FlashFileBrowserModel: ObservableObject {
     func dismissReveal() {
         invalidateReveal()
         clearTransientRevealedHiddenTarget()
-    }
-
-    func createFolder(named name: String) async {
-        await performOperation { fileSystem, directory, root in
-            _ = try await fileSystem.createFolder(
-                named: name,
-                in: directory,
-                allowedRoot: root
-            )
-        }
-    }
-
-    func rename(_ item: FlashFileBrowserItem, to name: String) async {
-        guard let item = currentItem(matching: item) else {
-            present(FlashFileBrowserFileSystemError.itemIsNotCurrent)
-            return
-        }
-
-        await performOperation { fileSystem, directory, root in
-            _ = try await fileSystem.rename(
-                item.url,
-                expectedIdentity: item.identity,
-                to: name,
-                in: directory,
-                allowedRoot: root
-            )
-        }
-    }
-
-    func duplicate(_ item: FlashFileBrowserItem) async {
-        guard let item = currentItem(matching: item) else {
-            present(FlashFileBrowserFileSystemError.itemIsNotCurrent)
-            return
-        }
-
-        await performOperation { fileSystem, directory, root in
-            _ = try await fileSystem.duplicate(
-                item.url,
-                expectedIdentity: item.identity,
-                in: directory,
-                allowedRoot: root
-            )
-        }
-    }
-
-    func paste(_ sourceURLs: [URL]) async {
-        let sources = uniqueFileURLs(sourceURLs)
-        guard !sources.isEmpty else {
-            present(FlashFileBrowserModelError.nothingToPaste)
-            return
-        }
-
-        await performOperation(reloadAfterError: true) { fileSystem, directory, root in
-            var completed = 0
-            for source in sources {
-                do {
-                    _ = try await fileSystem.copyItem(
-                        source,
-                        to: directory,
-                        allowedRoot: root
-                    )
-                    completed += 1
-                } catch {
-                    throw FlashFileBrowserFileSystemError.batchOperationFailed(
-                        completed: completed,
-                        total: sources.count,
-                        reason: error.localizedDescription
-                    )
-                }
-            }
-        }
-    }
-
-    func moveToTrash(_ item: FlashFileBrowserItem) async {
-        await moveToTrash([item])
-    }
-
-    func moveToTrash(_ candidates: [FlashFileBrowserItem]) async {
-        guard let items = currentItems(matching: candidates),
-              !items.isEmpty else {
-            present(FlashFileBrowserFileSystemError.itemIsNotCurrent)
-            return
-        }
-
-        let targets = items.map {
-            FlashFileBrowserMutationTarget(
-                url: $0.url,
-                expectedIdentity: $0.identity
-            )
-        }
-        await performOperation(reloadAfterError: items.count > 1) { fileSystem, directory, root in
-            try await fileSystem.moveToTrash(
-                targets,
-                in: directory,
-                allowedRoot: root
-            )
-        }
     }
 
     func clearError() {
@@ -556,7 +465,7 @@ final class FlashFileBrowserModel: ObservableObject {
         startExternalReloadIfNeeded()
     }
 
-    private func startExternalReloadIfNeeded() {
+    func startExternalReloadIfNeeded() {
         guard externalReloadPending,
               !isPerformingOperation,
               directoryMonitoringEnabled,
@@ -618,9 +527,21 @@ final class FlashFileBrowserModel: ObservableObject {
     private func invalidateLoads(clearItems: Bool) {
         loadGeneration &+= 1
         isLoading = false
-        if clearItems {
-            items = []
-        }
+        if clearItems { clearItemsIfNeeded() }
+    }
+
+    /// Directory changes independently invalidate the presentation store, so
+    /// an already-empty source must not manufacture a payload revision and a
+    /// redundant projection request.
+    private func clearItemsIfNeeded() {
+        guard !items.isEmpty else { return }
+        items = []
+    }
+
+    private func removeHiddenItemsIfNeeded() {
+        let visibleItems = items.filter { !$0.isHidden }
+        guard visibleItems.count != items.count else { return }
+        items = visibleItems
     }
 
     private func invalidateOperations() {
@@ -637,7 +558,7 @@ final class FlashFileBrowserModel: ObservableObject {
         transientRevealedHiddenTarget = nil
         invalidateLoads(clearItems: false)
         if !showingHiddenFiles {
-            items.removeAll(where: \.isHidden)
+            removeHiddenItemsIfNeeded()
         }
     }
 
@@ -645,7 +566,7 @@ final class FlashFileBrowserModel: ObservableObject {
         generation == revealGeneration && !Task.isCancelled
     }
 
-    private func currentItem(
+    func currentItem(
         matching candidate: FlashFileBrowserItem
     ) -> FlashFileBrowserItem? {
         guard let currentDirectory,
@@ -668,103 +589,7 @@ final class FlashFileBrowserModel: ObservableObject {
         FlashFileBrowserPathPolicy.standardized(item.url)
     }
 
-    private func currentItems(
-        matching candidates: [FlashFileBrowserItem]
-    ) -> [FlashFileBrowserItem]? {
-        guard let currentDirectory else { return nil }
-        let currentItemsByID = Dictionary(
-            uniqueKeysWithValues: items.map { ($0.id, $0) }
-        )
-        var itemIDs: Set<FlashFileBrowserItem.ID> = []
-        var result: [FlashFileBrowserItem] = []
-
-        for candidate in candidates where itemIDs.insert(candidate.id).inserted {
-            guard FlashFileBrowserPathPolicy.isDirectChild(
-                candidate.url,
-                of: currentDirectory
-            ), let item = currentItemsByID[candidate.id],
-               item.identity == candidate.identity else { return nil }
-            result.append(item)
-        }
-        return result
-    }
-
-    private func uniqueFileURLs(_ urls: [URL]) -> [URL] {
-        var paths: Set<String> = []
-        return urls.compactMap { url in
-            guard url.isFileURL else { return nil }
-            let standardized = url.standardizedFileURL
-            guard paths.insert(standardized.path).inserted else { return nil }
-            return standardized
-        }
-    }
-
-    private func performOperation(
-        reloadAfterError: Bool = false,
-        _ operation: (
-            any FlashFileBrowserFileSystem,
-            URL,
-            URL
-        ) async throws -> Void
-    ) async {
-        guard !isPerformingOperation else { return }
-        guard let sessionID = synchronizedSessionID,
-              let directory = currentDirectory,
-              let root = sessionRoot else {
-            present(FlashFileBrowserModelError.workingDirectoryUnavailable)
-            return
-        }
-
-        operationGeneration &+= 1
-        let generation = operationGeneration
-        isPerformingOperation = true
-        errorMessage = nil
-
-        defer {
-            if generation == operationGeneration {
-                isPerformingOperation = false
-                startExternalReloadIfNeeded()
-            }
-        }
-
-        do {
-            try await operation(fileSystem, directory, root)
-
-            guard generation == operationGeneration,
-                  sessionID == synchronizedSessionID,
-                  directory == currentDirectory,
-                  root == sessionRoot else { return }
-
-            // A mutation invalidates forward history even when it leaves the
-            // current directory in place.
-            forwardHistory.removeAll(keepingCapacity: true)
-            // This explicit load includes every event delivered before it.
-            // Keep only events that arrive while the load itself is running.
-            externalReloadPending = false
-            await reload()
-        } catch is CancellationError {
-            return
-        } catch {
-            guard generation == operationGeneration,
-                  sessionID == synchronizedSessionID,
-                  directory == currentDirectory,
-                  root == sessionRoot else { return }
-
-            let message = error.localizedDescription
-            if reloadAfterError {
-                forwardHistory.removeAll(keepingCapacity: true)
-                externalReloadPending = false
-                await reload()
-                guard generation == operationGeneration,
-                      sessionID == synchronizedSessionID,
-                      directory == currentDirectory,
-                      root == sessionRoot else { return }
-            }
-            errorMessage = message
-        }
-    }
-
-    private func present(_ error: any Error) {
+    func present(_ error: any Error) {
         errorMessage = error.localizedDescription
     }
 

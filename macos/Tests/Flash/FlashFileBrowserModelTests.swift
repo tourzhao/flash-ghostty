@@ -38,6 +38,69 @@ struct FlashFileBrowserModelTests {
     typealias SessionID = SessionWorkspace.SessionID
 
     @Test
+    func largeItemPayloadPublishesOnlyItsScalarRevision() async {
+        let fileSystem = ControlledFlashFileBrowserFileSystem()
+        let root = makeRoot()
+        let items = (0..<10_000).map { index in
+            makeItem("item-\(index).txt", in: root)
+        }
+        await fileSystem.setListing(items, for: root)
+        let model = FlashFileBrowserModel(fileSystem: fileSystem)
+
+        #expect(model.itemsRevision == 0)
+        await model.synchronize(sessionID: SessionID(), directory: root)
+
+        #expect(model.items.count == items.count)
+        #expect(model.itemsRevision == 1)
+
+        // An identical reload is reconciled off-main and does not publish a
+        // new revision or force SwiftUI to compare the 10k-element payload.
+        await model.reload()
+        #expect(model.itemsRevision == 1)
+    }
+
+    @Test
+    func navigatingBetweenEmptyDirectoriesDoesNotPublishAnItemRevision() async {
+        let fileSystem = ControlledFlashFileBrowserFileSystem()
+        let root = makeRoot()
+        let child = root.appendingPathComponent("Empty Child", isDirectory: true)
+        await fileSystem.setListing([], for: root)
+        await fileSystem.setListing([], for: child)
+        let model = FlashFileBrowserModel(fileSystem: fileSystem)
+
+        await model.synchronize(sessionID: SessionID(), directory: root)
+        #expect(model.itemsRevision == 0)
+
+        await model.navigate(to: child)
+
+        #expect(
+            model.currentDirectory ==
+                FlashFileBrowserPathPolicy.standardized(child)
+        )
+        #expect(model.items.isEmpty)
+        #expect(model.itemsRevision == 0)
+    }
+
+    @Test
+    func togglingHiddenFilesWithoutAHiddenItemDoesNotPublishAnItemRevision() async {
+        let fileSystem = ControlledFlashFileBrowserFileSystem()
+        let root = makeRoot()
+        let visible = makeItem("visible.txt", in: root)
+        await fileSystem.setListing([visible], for: root, showingHiddenFiles: false)
+        await fileSystem.setListing([visible], for: root, showingHiddenFiles: true)
+        let model = FlashFileBrowserModel(fileSystem: fileSystem)
+
+        await model.synchronize(sessionID: SessionID(), directory: root)
+        #expect(model.itemsRevision == 1)
+
+        await model.setShowingHiddenFiles(true)
+        await model.setShowingHiddenFiles(false)
+
+        #expect(model.items == [visible])
+        #expect(model.itemsRevision == 1)
+    }
+
+    @Test
     func differentSessionWithoutDirectoryClearsPreviousSession() async {
         let fileSystem = ControlledFlashFileBrowserFileSystem()
         let root = makeRoot()
@@ -355,16 +418,21 @@ struct FlashFileBrowserModelTests {
         )
 
         let model = FlashFileBrowserModel(fileSystem: fileSystem)
+        defer {
+            Task {
+                await fileSystem.resumeAllPendingLoads(returning: [])
+            }
+        }
         await model.synchronize(sessionID: SessionID(), directory: root)
         await fileSystem.setSuspendingLoads(true)
 
         let staleTask = Task { await model.reveal(staleTarget.url) }
-        await fileSystem.waitForLoadCount(2)
+        try #require(await fileSystem.waitForLoadCount(2))
         let staleLoad = try #require(await fileSystem.recordedLoadRequests.last)
 
         staleTask.cancel()
         let currentTask = Task { await model.reveal(currentTarget.url) }
-        await fileSystem.waitForLoadCount(3)
+        try #require(await fileSystem.waitForLoadCount(3))
         let currentLoad = try #require(await fileSystem.recordedLoadRequests.last)
 
         #expect(await fileSystem.resumeLoad(staleLoad.id, returning: []))
@@ -516,14 +584,17 @@ struct FlashFileBrowserModelTests {
         let model = FlashFileBrowserModel(fileSystem: fileSystem)
         await model.synchronize(sessionID: SessionID(), directory: root)
         #expect(model.items == [visible])
+        #expect(model.itemsRevision == 1)
 
         await model.setShowingHiddenFiles(true)
         #expect(model.showingHiddenFiles)
         #expect(Set(model.items.map(\.id)) == Set([visible.id, hidden.id]))
+        #expect(model.itemsRevision == 2)
 
         await model.setShowingHiddenFiles(false)
         #expect(!model.showingHiddenFiles)
         #expect(model.items == [visible])
+        #expect(model.itemsRevision == 3)
         #expect(
             await fileSystem.recordedLoadRequests.map(\.showingHiddenFiles) ==
                 [false, true, false]
@@ -531,6 +602,7 @@ struct FlashFileBrowserModelTests {
 
         await model.setShowingHiddenFiles(false)
         #expect(await fileSystem.recordedLoadRequests.count == 3)
+        #expect(model.itemsRevision == 3)
     }
 
     @Test
@@ -602,7 +674,7 @@ struct FlashFileBrowserModelTests {
     }
 
     @Test
-    func directoryMonitorCoalescesEventsDuringAnExternalReload() async throws {
+    func sustainedDirectoryChurnKeepsOnePendingReloadAndConverges() async throws {
         let fileSystem = ControlledFlashFileBrowserFileSystem()
         let monitor = ControlledDirectoryMonitor()
         let root = makeRoot()
@@ -613,12 +685,18 @@ struct FlashFileBrowserModelTests {
             directoryMonitor: monitor
         )
         model.setDirectoryMonitoringEnabled(true)
+        defer {
+            model.setDirectoryMonitoringEnabled(false)
+            Task {
+                await fileSystem.resumeAllPendingLoads(returning: [])
+            }
+        }
         await model.synchronize(sessionID: SessionID(), directory: root)
         await fileSystem.setSuspendingLoads(true)
 
         monitor.emitChange(in: root)
-        await fileSystem.waitForLoadCount(2)
-        for _ in 0..<20 {
+        try #require(await fileSystem.waitForLoadCount(2))
+        for _ in 0..<100 {
             monitor.emitChange(in: root)
         }
         await Task.yield()
@@ -633,20 +711,34 @@ struct FlashFileBrowserModelTests {
             returning: [intermediate]
         ))
 
-        await fileSystem.waitForLoadCount(3)
+        try #require(await fileSystem.waitForLoadCount(3))
         #expect(await fileSystem.recordedLoadRequests.count == 3)
-        let followUpRefresh = try #require(
+        let secondRefresh = try #require(
+            await fileSystem.recordedLoadRequests.last
+        )
+        for _ in 0..<100 {
+            monitor.emitChange(in: root)
+        }
+        await Task.yield()
+        #expect(await fileSystem.recordedLoadRequests.count == 3)
+        let secondIntermediate = makeItem("second-intermediate.swift", in: root)
+        #expect(await fileSystem.resumeLoad(
+            secondRefresh.id,
+            returning: [secondIntermediate]
+        ))
+
+        try #require(await fileSystem.waitForLoadCount(4))
+        #expect(await fileSystem.recordedLoadRequests.count == 4)
+        let finalRefresh = try #require(
             await fileSystem.recordedLoadRequests.last
         )
         let latest = makeItem("latest.swift", in: root)
         #expect(await fileSystem.resumeLoad(
-            followUpRefresh.id,
+            finalRefresh.id,
             returning: [latest]
         ))
         #expect(await waitUntil { model.items == [latest] })
-        #expect(await fileSystem.recordedLoadRequests.count == 3)
-
-        model.setDirectoryMonitoringEnabled(false)
+        #expect(await fileSystem.recordedLoadRequests.count == 4)
     }
 
     @Test
@@ -663,13 +755,19 @@ struct FlashFileBrowserModelTests {
             directoryMonitor: monitor
         )
         model.setDirectoryMonitoringEnabled(true)
+        defer {
+            model.setDirectoryMonitoringEnabled(false)
+            Task {
+                await fileSystem.resumeAllPendingLoads(returning: [])
+            }
+        }
         await model.synchronize(sessionID: SessionID(), directory: root)
         await fileSystem.setSuspendingLoads(true)
 
         let operationTask = Task { @MainActor in
             await model.createFolder(named: "Browser Folder")
         }
-        await fileSystem.waitForLoadCount(2)
+        try #require(await fileSystem.waitForLoadCount(2))
         #expect(model.isPerformingOperation)
 
         // The browser's explicit reload is already in flight when an external
@@ -684,7 +782,7 @@ struct FlashFileBrowserModelTests {
         ))
         await operationTask.value
 
-        await fileSystem.waitForLoadCount(3)
+        try #require(await fileSystem.waitForLoadCount(3))
         let followUpReload = try #require(
             await fileSystem.recordedLoadRequests.last
         )
@@ -697,7 +795,6 @@ struct FlashFileBrowserModelTests {
             model.items.contains(createdExternally)
         })
         #expect(await fileSystem.recordedLoadRequests.count == 3)
-        model.setDirectoryMonitoringEnabled(false)
     }
 
     @Test
@@ -709,16 +806,21 @@ struct FlashFileBrowserModelTests {
         let firstItem = makeItem("first.txt", in: firstRoot)
         let secondItem = makeItem("second.txt", in: secondRoot)
         let model = FlashFileBrowserModel(fileSystem: fileSystem)
+        defer {
+            Task {
+                await fileSystem.resumeAllPendingLoads(returning: [])
+            }
+        }
 
         let firstTask = Task { @MainActor in
             await model.synchronize(sessionID: SessionID(), directory: firstRoot)
         }
-        await fileSystem.waitForLoadCount(1)
+        try #require(await fileSystem.waitForLoadCount(1))
 
         let secondTask = Task { @MainActor in
             await model.synchronize(sessionID: SessionID(), directory: secondRoot)
         }
-        await fileSystem.waitForLoadCount(2)
+        try #require(await fileSystem.waitForLoadCount(2))
 
         let requests = await fileSystem.recordedLoadRequests
         let firstRequest = try #require(requests.first { $0.directory == firstRoot })
@@ -858,7 +960,7 @@ struct FlashFileBrowserModelTests {
     }
 
     @Test
-    func mutationErrorIsPresentedWithoutReloadingOrTouchingTrash() async {
+    func mutationErrorIsPresentedAndReloadsToReconcilePossibleCommit() async {
         let fileSystem = ControlledFlashFileBrowserFileSystem()
         let root = makeRoot()
         let item = makeItem("original.txt", in: root)
@@ -880,7 +982,7 @@ struct FlashFileBrowserModelTests {
         )
         #expect(model.items == [item])
         #expect(!model.isPerformingOperation)
-        #expect(await fileSystem.recordedLoadRequests.count == loadCount)
+        #expect(await fileSystem.recordedLoadRequests.count == loadCount + 1)
         #expect(await fileSystem.recordedMutations == [
             .duplicate(
                 item: item.url,
@@ -892,6 +994,43 @@ struct FlashFileBrowserModelTests {
 
         model.clearError()
         #expect(model.errorMessage == nil)
+    }
+
+    @Test
+    func createErrorReloadsBecauseTheFinalPathMayHaveCommitted() async {
+        let fileSystem = ControlledFlashFileBrowserFileSystem()
+        let root = makeRoot()
+        let committedFolder = makeItem(
+            "Committed Folder",
+            in: root,
+            isDirectory: true
+        )
+        await fileSystem.setListing([], for: root)
+        await fileSystem.setMutationError(
+            .itemIsNotCurrent,
+            for: .createFolder
+        )
+
+        let model = FlashFileBrowserModel(fileSystem: fileSystem)
+        await model.synchronize(sessionID: SessionID(), directory: root)
+        let loadCount = await fileSystem.recordedLoadRequests.count
+        await fileSystem.setListing([committedFolder], for: root)
+
+        await model.createFolder(named: committedFolder.name)
+
+        #expect(model.items == [committedFolder])
+        #expect(
+            model.errorMessage ==
+                FlashFileBrowserFileSystemError.itemIsNotCurrent.localizedDescription
+        )
+        #expect(await fileSystem.recordedLoadRequests.count == loadCount + 1)
+        #expect(await fileSystem.recordedMutations == [
+            .createFolder(
+                name: committedFolder.name,
+                directory: root,
+                allowedRoot: root
+            ),
+        ])
     }
 
     @Test
@@ -1003,6 +1142,39 @@ struct FlashFileBrowserModelTests {
                 )
                 .localizedDescription
         )
+        #expect(await fileSystem.recordedMutations == [
+            .copyItem(source: firstSource, directory: root, allowedRoot: root),
+            .copyItem(source: secondSource, directory: root, allowedRoot: root),
+        ])
+        #expect(!model.isPerformingOperation)
+    }
+
+    @Test
+    func cancelledPartialPasteReloadsWithoutPresentingAnError() async throws {
+        let fileSystem = ControlledFlashFileBrowserFileSystem()
+        let root = makeRoot()
+        let outside = makeRoot()
+        let firstSource = outside.appendingPathComponent("first.txt")
+        let secondSource = outside.appendingPathComponent("cancel.txt")
+        let thirdSource = outside.appendingPathComponent("must-not-copy.txt")
+        let firstCopy = makeItem("first.txt", in: root)
+        await fileSystem.setListing([], for: root)
+        await fileSystem.setCopySuspended(true, for: secondSource)
+
+        let model = FlashFileBrowserModel(fileSystem: fileSystem)
+        await model.synchronize(sessionID: SessionID(), directory: root)
+        await fileSystem.setListing([firstCopy], for: root)
+        let operationTask = Task { @MainActor in
+            await model.paste([firstSource, secondSource, thirdSource])
+        }
+        defer { operationTask.cancel() }
+        try #require(await fileSystem.waitForMutationCount(2))
+        operationTask.cancel()
+        await operationTask.value
+
+        #expect(model.items == [firstCopy])
+        #expect(model.errorMessage == nil)
+        #expect(await fileSystem.recordedLoadRequests.count == 2)
         #expect(await fileSystem.recordedMutations == [
             .copyItem(source: firstSource, directory: root, allowedRoot: root),
             .copyItem(source: secondSource, directory: root, allowedRoot: root),
@@ -1230,11 +1402,6 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         let showingHiddenFiles: Bool
     }
 
-    private struct LoadWaiter {
-        let count: Int
-        let continuation: CheckedContinuation<Void, Never>
-    }
-
     private struct BindingWaiter {
         let count: Int
         let continuation: CheckedContinuation<Void, Never>
@@ -1243,13 +1410,13 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
     private var listings: [ListingKey: [FlashFileBrowserItem]] = [:]
     private var mutationErrors: [MutationKind: FlashFileBrowserFileSystemError] = [:]
     private var copyErrorsBySource: [URL: FlashFileBrowserFileSystemError] = [:]
+    private var suspendedCopySources: Set<URL> = []
     private var pendingLoads: [
         Int: CheckedContinuation<[FlashFileBrowserItem], any Error>
     ] = [:]
     private var pendingBindings: [
         Int: CheckedContinuation<Void, any Error>
     ] = [:]
-    private var loadWaiters: [LoadWaiter] = []
     private var bindingWaiters: [BindingWaiter] = []
     private var suspendsLoads = false
     private var suspendsBindings = false
@@ -1309,6 +1476,15 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         copyErrorsBySource[source.standardizedFileURL] = error
     }
 
+    func setCopySuspended(_ suspended: Bool, for source: URL) {
+        let source = source.standardizedFileURL
+        if suspended {
+            suspendedCopySources.insert(source)
+        } else {
+            suspendedCopySources.remove(source)
+        }
+    }
+
     func setSuspendingLoads(_ suspendsLoads: Bool) {
         self.suspendsLoads = suspendsLoads
     }
@@ -1317,14 +1493,36 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         self.suspendsBindings = suspendsBindings
     }
 
-    func waitForLoadCount(_ count: Int) async {
-        guard recordedLoadRequests.count < count else { return }
-        await withCheckedContinuation { continuation in
-            loadWaiters.append(LoadWaiter(
-                count: count,
-                continuation: continuation
-            ))
+    func waitForLoadCount(
+        _ count: Int,
+        timeoutNanoseconds: UInt64 = 15_000_000_000
+    ) async -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
+        while recordedLoadRequests.count < count,
+              DispatchTime.now().uptimeNanoseconds < deadline {
+            do {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            } catch {
+                return false
+            }
         }
+        return recordedLoadRequests.count >= count
+    }
+
+    func waitForMutationCount(
+        _ count: Int,
+        timeoutNanoseconds: UInt64 = 15_000_000_000
+    ) async -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
+        while recordedMutations.count < count,
+              DispatchTime.now().uptimeNanoseconds < deadline {
+            do {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            } catch {
+                return false
+            }
+        }
+        return recordedMutations.count >= count
     }
 
     func waitForBindingCount(_ count: Int) async {
@@ -1358,11 +1556,21 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         return true
     }
 
+    func resumeAllPendingLoads(returning items: [FlashFileBrowserItem]) {
+        suspendsLoads = false
+        let continuations = Array(pendingLoads.values)
+        pendingLoads.removeAll(keepingCapacity: true)
+        for continuation in continuations {
+            continuation.resume(returning: items)
+        }
+    }
+
     func contents(
         of directory: URL,
         showingHiddenFiles: Bool,
         allowedRoot: URL
     ) async throws -> [FlashFileBrowserItem] {
+        try Task.checkCancellation()
         guard FlashFileBrowserPathPolicy.contains(directory, in: allowedRoot),
               FlashFileBrowserPathPolicy.containsResolved(directory, in: allowedRoot) else {
             throw FlashFileBrowserFileSystemError.outsideWorkingDirectory
@@ -1375,12 +1583,13 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         )
         nextLoadID += 1
         recordedLoadRequests.append(request)
-        resumeSatisfiedLoadWaiters()
 
         if suspendsLoads {
-            return try await withCheckedThrowingContinuation { continuation in
+            let items = try await withCheckedThrowingContinuation { continuation in
                 pendingLoads[request.id] = continuation
             }
+            try Task.checkCancellation()
+            return items
         }
 
         return listings[ListingKey(
@@ -1456,13 +1665,17 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         _ source: URL,
         to directory: URL,
         allowedRoot: URL
-    ) throws -> URL {
+    ) async throws -> URL {
         let source = source.standardizedFileURL
         recordedMutations.append(.copyItem(
             source: source,
             directory: directory,
             allowedRoot: allowedRoot
         ))
+        while suspendedCopySources.contains(source) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try Task.checkCancellation()
         if let error = copyErrorsBySource[source] { throw error }
         try throwMutationError(for: .copyItem)
         return directory
@@ -1489,16 +1702,6 @@ private actor ControlledFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         if let error = mutationErrors[kind] {
             throw error
         }
-    }
-
-    private func resumeSatisfiedLoadWaiters() {
-        let satisfied = loadWaiters.filter {
-            recordedLoadRequests.count >= $0.count
-        }
-        loadWaiters.removeAll {
-            recordedLoadRequests.count >= $0.count
-        }
-        satisfied.forEach { $0.continuation.resume() }
     }
 
     private func resumeSatisfiedBindingWaiters() {

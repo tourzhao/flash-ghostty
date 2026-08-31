@@ -79,6 +79,31 @@ struct FileBrowserProjectionTests {
     }
 
     @Test
+    func dismissingRevealResumesTheUnchangedQueryAndTypeSelection() {
+        let selectedType = FlashFileBrowserFileType(fileExtension: "swift")
+        let source = makeItem("source.swift", inode: 1)
+        let target = makeItem("README.md", inode: 2)
+        var input = makeInput(
+            items: [source, target],
+            query: "source",
+            selectedTypes: [selectedType],
+            revealedItemID: target.id,
+            sort: .init(field: .name, direction: .ascending)
+        )
+
+        let revealed = FlashFileBrowserPresentationProjector.project(input)
+        #expect(revealed.snapshot.items == [target, source])
+        #expect(input.query == "source")
+        #expect(input.selectedTypes == [selectedType])
+
+        input.revealedItemID = nil
+        let resumed = FlashFileBrowserPresentationProjector.project(input)
+        #expect(resumed.snapshot.items == [source])
+        #expect(input.query == "source")
+        #expect(input.selectedTypes == [selectedType])
+    }
+
+    @Test
     func staleGenerationCannotCommitAfterANewerRequestBegins() {
         var generation = FlashFileBrowserProjectionGeneration()
         let staleRequest = generation.beginRequest()
@@ -103,11 +128,17 @@ struct FileBrowserProjectionTests {
             projection.snapshot.resolveSelection([second.id, first.id]) ==
                 [first, second]
         )
+        #expect(
+            projection.snapshot.reconciledSelection([first.id, "stale-id"]) ==
+                [first.id]
+        )
+        #expect(projection.snapshot.reconciledSelection(["stale-id"]).isEmpty)
         #expect(projection.snapshot.resolveSelection(["stale-id"]) == nil)
+        #expect(projection.snapshot.resolveSelection([]) == nil)
     }
 
     @Test
-    func tenThousandItemProjectionVisitsEachInputOnlyOnce() {
+    func tenThousandItemProjectionResolvesEachTypeOnceAndBuildsSelectionIndex() {
         let items = (0..<10_000).map { index in
             makeItem(
                 "file\(index).\(index.isMultiple(of: 2) ? "swift" : "txt")",
@@ -121,11 +152,18 @@ struct FileBrowserProjectionTests {
             selectedTypes: [FlashFileBrowserFileType(fileExtension: "swift")]
         )
 
-        let result = FlashFileBrowserPresentationProjector.project(input)
+        var fileTypeResolutionCount = 0
+        let result = FlashFileBrowserPresentationProjector.project(
+            input,
+            fileTypeResolver: { item in
+                fileTypeResolutionCount += 1
+                return FlashFileBrowserTypeFilter.fileType(for: item)
+            }
+        )
 
         #expect(result.sourceVisitCount == 10_000)
+        #expect(fileTypeResolutionCount == 10_000)
         #expect(result.snapshot.items.count == 5_000)
-        #expect(result.snapshot.itemIDs.count == 5_000)
         #expect(result.snapshot.rowByItemID.count == 5_000)
         #expect(result.snapshot.items.first?.name == "file9998.swift")
         #expect(result.snapshot.items.last?.name == "file0.swift")
@@ -168,7 +206,6 @@ struct FileBrowserProjectionTests {
         #expect(result.snapshot.items.first?.name == "file0.swift")
         #expect(result.snapshot.items.last?.name == "file9999.swift")
         #expect(result.snapshot.rowByItemID[target.id] == targetIndex)
-        #expect(result.snapshot.itemIDs[targetIndex] == target.id)
         #expect(result.snapshot.items[targetIndex] == target)
     }
 
@@ -539,10 +576,12 @@ struct FileBrowserPresentationStoreTests {
             items: [item],
             directory: oldDirectory
         )
+        #expect(store.snapshotRevision == 1)
 
         store.setDirectory(URL(fileURLWithPath: "/tmp/New"))
 
         #expect(store.snapshot.items.isEmpty)
+        #expect(store.snapshotRevision == 2)
     }
 
     private func waitForPendingProjection(

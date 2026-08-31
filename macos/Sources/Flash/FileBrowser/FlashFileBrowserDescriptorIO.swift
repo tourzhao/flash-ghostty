@@ -35,22 +35,64 @@ enum FlashFileBrowserDescriptorIO {
         in descriptor: Int32,
         body: (String) throws -> Void
     ) throws {
-        let streamDescriptor = Darwin.fcntl(
-            descriptor,
-            F_DUPFD_CLOEXEC,
-            0
-        )
-        guard streamDescriptor >= 0 else { throw currentPOSIXError() }
-        guard let stream = Darwin.fdopendir(streamDescriptor) else {
+        // `dup` shares the original directory's open-file-description and
+        // therefore its readdir offset. Opening `.` creates an independent
+        // description so every scan starts at the beginning and a later
+        // security revalidation cannot accidentally begin at EOF.
+        let openOutcome = ".".withCString { name in
+            callCapturingErrno {
+                Darwin.openat(
+                    descriptor,
+                    name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                        O_RESOLVE_BENEATH | O_CLOEXEC
+                )
+            }
+        }
+        let streamDescriptor = openOutcome.result
+        guard streamDescriptor >= 0 else {
+            throw posixError(openOutcome.errorCode)
+        }
+
+        var sourceMetadata = stat()
+        var streamMetadata = stat()
+        let sourceOutcome = callCapturingErrno {
+            Darwin.fstat(descriptor, &sourceMetadata)
+        }
+        guard sourceOutcome.result == 0 else {
+            let error = posixError(sourceOutcome.errorCode)
             Darwin.close(streamDescriptor)
-            throw currentPOSIXError()
+            throw error
+        }
+        let streamOutcome = callCapturingErrno {
+            Darwin.fstat(streamDescriptor, &streamMetadata)
+        }
+        guard streamOutcome.result == 0 else {
+            let error = posixError(streamOutcome.errorCode)
+            Darwin.close(streamDescriptor)
+            throw error
+        }
+        guard identity(from: sourceMetadata) == identity(from: streamMetadata) else {
+            Darwin.close(streamDescriptor)
+            throw FlashFileBrowserFileSystemError.itemIsNotCurrent
+        }
+        let directoryOutcome = callCapturingErrno {
+            Darwin.fdopendir(streamDescriptor)
+        }
+        guard let stream = directoryOutcome.result else {
+            let error = posixError(directoryOutcome.errorCode)
+            Darwin.close(streamDescriptor)
+            throw error
         }
         defer { Darwin.closedir(stream) }
 
         while true {
             errno = 0
-            guard let entry = Darwin.readdir(stream) else {
-                if errno != 0 { throw currentPOSIXError() }
+            let readOutcome = callCapturingErrno { Darwin.readdir(stream) }
+            guard let entry = readOutcome.result else {
+                if readOutcome.errorCode != 0 {
+                    throw posixError(readOutcome.errorCode)
+                }
                 break
             }
             let name = withUnsafePointer(to: entry.pointee.d_name) { pointer in
@@ -70,7 +112,20 @@ enum FlashFileBrowserDescriptorIO {
     }
 
     static func currentPOSIXError() -> POSIXError {
-        POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        posixError(errno)
+    }
+
+    static func posixError(_ errorCode: Int32) -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: errorCode) ?? .EIO)
+    }
+
+    @inline(__always)
+    static func callCapturingErrno<Result>(
+        _ operation: () -> Result
+    ) -> (result: Result, errorCode: Int32) {
+        let result = operation()
+        let errorCode = errno
+        return (result, errorCode)
     }
 
     static func canonicalPath(for descriptor: Int32) -> String? {

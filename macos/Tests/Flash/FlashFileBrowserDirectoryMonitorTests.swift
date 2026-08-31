@@ -168,6 +168,106 @@ struct FlashFileBrowserDirectoryMonitorTests {
     }
 
     @Test
+    func delayedSamePathRecreationAutomaticallyRearmsTheWatch() async throws {
+        let root = try makeDirectory(named: "DelayedReplacement")
+        let oldRoot = root.deletingLastPathComponent().appendingPathComponent(
+            "\(root.lastPathComponent)-old"
+        )
+        let monitor = FlashFileBrowserDirectoryMonitor(
+            debounceNanoseconds: 80_000_000
+        )
+        defer {
+            monitor.stop()
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: oldRoot)
+        }
+
+        var callbackCount = 0
+        #expect(monitor.watch(root) { _ in callbackCount += 1 })
+        await allowSourceRegistration()
+
+        try FileManager.default.moveItem(at: root, to: oldRoot)
+
+        // FSEvents may report an ordinary move event before RootChanged. Wait
+        // for the RootChanged debounce itself to expire while the lexical path
+        // is still absent, proving that its first reopen attempt failed.
+        #expect(await waitUntil {
+            monitor.hasPendingRebindRetryForTesting
+        })
+        let callbackCountAfterMissingPath = callbackCount
+        #expect(callbackCountAfterMissingPath >= 1)
+        try Data("old identity".utf8).write(
+            to: oldRoot.appendingPathComponent("old.txt")
+        )
+        await pause(nanoseconds: 150_000_000)
+        #expect(callbackCount == callbackCountAfterMissingPath)
+
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+
+        // A successful retry delivers one refresh for changes missed while no
+        // stream existed, then the new directory identity remains observable.
+        #expect(await waitUntil {
+            callbackCount == callbackCountAfterMissingPath + 1
+        })
+        try Data("new identity".utf8).write(
+            to: root.appendingPathComponent("new.txt")
+        )
+        #expect(await waitUntil {
+            callbackCount == callbackCountAfterMissingPath + 2
+        })
+    }
+
+    @Test
+    func stopCancelsARebindRetryAndIgnoresLaterRecreation() async throws {
+        let root = try makeDirectory(named: "StoppedRebind")
+        let oldRoot = root.deletingLastPathComponent().appendingPathComponent(
+            "\(root.lastPathComponent)-old"
+        )
+        let monitor = FlashFileBrowserDirectoryMonitor(
+            debounceNanoseconds: 80_000_000,
+            ignoresFileSystemEventsForTesting: true
+        )
+        defer {
+            monitor.stop()
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: oldRoot)
+        }
+
+        var callbackCount = 0
+        #expect(monitor.watch(root) { _ in callbackCount += 1 })
+        let eventIdentity = try #require(
+            monitor.currentEventIdentityForTesting
+        )
+        try FileManager.default.moveItem(at: root, to: oldRoot)
+        monitor.receiveEventForTesting(
+            eventIdentity,
+            requiresRebind: true
+        )
+        #expect(await waitUntil {
+            monitor.hasPendingRebindRetryForTesting
+        })
+        let callbackCountBeforeStop = callbackCount
+
+        monitor.stop()
+        #expect(!monitor.hasPendingRebindRetryForTesting)
+        #expect(monitor.watchedDirectory == nil)
+
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        await pause(nanoseconds: 350_000_000)
+        try Data("must stay unobserved".utf8).write(
+            to: root.appendingPathComponent("after-stop.txt")
+        )
+        await pause(nanoseconds: 150_000_000)
+        #expect(callbackCount == callbackCountBeforeStop)
+    }
+
+    @Test
     func stopInvalidatesPendingAndFutureEvents() async throws {
         let root = try makeDirectory(named: "Stop")
         let monitor = FlashFileBrowserDirectoryMonitor(

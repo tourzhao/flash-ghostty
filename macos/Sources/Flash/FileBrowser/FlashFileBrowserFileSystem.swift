@@ -12,9 +12,15 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         case directoryOpened
         case directoryReadStarted
         case directoryReadFinished
+        case folderCreationReady
+        case folderStagingIdentityCaptured
+        case folderStaged
+        case folderPromotionReady
+        case folderPromoted
         case copyDestinationOpened
         case copyDestinationFinished
         case copyEntryCopied
+        case copyPromoted
         case copySourceOpened
         case copySourceFinished
         case itemValidated
@@ -22,8 +28,8 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         case trashDirectoryOpened
     }
 
-    private let fileManager: FileManager
-    private let maximumCopyNameAttempts: Int
+    let fileManager: FileManager
+    let maximumCopyNameAttempts: Int
     private let mutationHook: MutationHook?
     private let trashDirectoryProvider: TrashDirectoryProvider?
     private let trashHandler: TrashHandler?
@@ -34,16 +40,8 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
     private var directoryAnchors: [String: DirectoryAnchor] = [:]
     private var directoryAnchorRecency: [String] = []
     private let maximumDirectoryAnchorCount = 8
-    private static let maximumCopyDepth = 256
-    /// Cleanup starts at the temporary staging wrapper rather than the copied
-    /// entry, so it needs one additional level to visit the deepest entry that
-    /// the copy traversal can create.
-    private static let maximumCopyCleanupDepth = maximumCopyDepth + 1
-    private static let removalBlockingFlags = UInt32(
-        UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND
-    )
 
-    private struct DirectoryAnchor: Equatable {
+    struct DirectoryAnchor: Equatable {
         let url: URL
         let entryIdentity: FlashFileBrowserItemIdentity
         let directoryIdentity: FlashFileBrowserItemIdentity
@@ -164,35 +162,94 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
             allowedRoot: allowedRoot
         )
 
-        let result = name.withCString {
-            Darwin.mkdirat(validated.descriptor, $0, mode_t(0o777))
+        try runMutationHook(.folderCreationReady, directory: destination)
+        if entryIdentity(named: name, in: validated.descriptor) != nil {
+            throw FlashFileBrowserFileSystemError.itemAlreadyExists(name)
         }
-        if result != 0 {
-            if errno == EEXIST {
-                throw FlashFileBrowserFileSystemError.itemAlreadyExists(name)
+        // Descriptor pinning and empty-directory verification require read
+        // access to the newly created mode. An unusual process umask or ACL
+        // that denies the owner that access fails explicitly instead of
+        // falling back to an unverifiable direct mkdir.
+        let stagedFolder: TemporaryDirectoryContainer
+        stagedFolder = try createTemporaryDirectoryContainer(
+            options: .folder,
+            descriptor: validated.descriptor,
+            identityCaptured: { [self] stagedName in
+                try runMutationHook(
+                    .folderStagingIdentityCaptured,
+                    directory: validated.anchor.url.appendingPathComponent(
+                        stagedName,
+                        isDirectory: true
+                    )
+                )
             }
-            throw currentPOSIXError()
-        }
+        )
+        defer { Darwin.close(stagedFolder.descriptor) }
 
-        guard let createdIdentity = entryIdentity(
-            named: name,
-            in: validated.descriptor
-        ) else {
+        try runMutationHook(.folderStaged, directory: stagedFolder.url)
+        try revalidateDirectoryDescriptor(
+            validated,
+            directory: directory,
+            allowedRoot: allowedRoot
+        )
+        guard entryIdentity(named: stagedFolder.name, in: validated.descriptor) ==
+                stagedFolder.identity,
+              canonicalPath(for: stagedFolder.descriptor) == stagedFolder.canonicalPath,
+              try directoryIsEmpty(stagedFolder.descriptor) else {
             throw FlashFileBrowserFileSystemError.itemIsNotCurrent
         }
-        do {
-            try revalidateDirectoryDescriptor(
-                validated,
-                directory: directory,
-                allowedRoot: allowedRoot
-            )
-        } catch {
-            if entryIdentity(named: name, in: validated.descriptor) == createdIdentity {
-                _ = name.withCString {
-                    Darwin.unlinkat(validated.descriptor, $0, AT_REMOVEDIR)
+
+        // Darwin cannot condition rename on the source inode. Pinning the
+        // same-parent, randomly named directory first preserves the target
+        // parent's mkdir mode/umask and inherited ACL semantics. RENAME_EXCL
+        // protects the final name, and postconditions prevent an unknown object
+        // from being reported as a successful creation. A same-UID process can
+        // still race the source between any identity check and pathname syscall;
+        // Darwin offers no source-inode-conditional rename. We therefore never
+        // attempt a pathname rollback after the final name has committed.
+        try runMutationHook(.folderPromotionReady, directory: stagedFolder.url)
+        let promoteOutcome = stagedFolder.name.withCString { stagedName in
+            name.withCString { destinationName in
+                callCapturingErrno {
+                    Darwin.renameatx_np(
+                        validated.descriptor,
+                        stagedName,
+                        validated.descriptor,
+                        destinationName,
+                        UInt32(RENAME_EXCL)
+                    )
                 }
             }
-            throw error
+        }
+        if promoteOutcome.result != 0 {
+            if promoteOutcome.errorCode == EEXIST {
+                throw FlashFileBrowserFileSystemError.itemAlreadyExists(name)
+            }
+            if promoteOutcome.errorCode == ENOTSUP {
+                throw FlashFileBrowserFileSystemError.cannotCreateFolderSafely
+            }
+            throw posixError(promoteOutcome.errorCode)
+        }
+
+        try runMutationHook(.folderPromoted, directory: destination)
+        var metadata = stat()
+        guard Darwin.fstat(stagedFolder.descriptor, &metadata) == 0,
+              identity(from: metadata) == stagedFolder.identity,
+              metadata.st_mode & S_IFMT == S_IFDIR,
+              entryIdentity(named: name, in: validated.descriptor) ==
+                stagedFolder.identity,
+              try directoryIsEmpty(stagedFolder.descriptor) else {
+            throw FlashFileBrowserFileSystemError.itemIsNotCurrent
+        }
+        try revalidateDirectoryDescriptor(
+            validated,
+            directory: directory,
+            allowedRoot: allowedRoot
+        )
+        guard try directoryIsEmpty(stagedFolder.descriptor),
+              entryIdentity(named: name, in: validated.descriptor) ==
+                stagedFolder.identity else {
+            throw FlashFileBrowserFileSystemError.itemIsNotCurrent
         }
         return destination
     }
@@ -228,19 +285,11 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
             named: name,
             in: validated.descriptor
         )
-        if let destinationIdentity {
-            var isDistinctHardLink = false
-            if destinationIdentity == expectedIdentity, name != sourceName {
-                isDistinctHardLink = try containsLiteralEntry(
-                    named: name,
-                    in: validated.descriptor
-                )
-            }
-            if destinationIdentity != expectedIdentity || isDistinctHardLink {
-                throw FlashFileBrowserFileSystemError.itemAlreadyExists(
-                    destination.lastPathComponent
-                )
-            }
+        if let destinationIdentity,
+           destinationIdentity != expectedIdentity {
+            throw FlashFileBrowserFileSystemError.itemAlreadyExists(
+                destination.lastPathComponent
+            )
         }
 
         try runMutationHook(.itemValidated, directory: directory)
@@ -253,16 +302,14 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
             throw FlashFileBrowserFileSystemError.itemIsNotCurrent
         }
 
-        let result = sourceName.withCString { source in
+        // Darwin has no rename primitive conditioned on a source inode. This
+        // is therefore the final preflight before the syscall; `RENAME_EXCL`
+        // protects an unrelated destination and the postcondition rejects a
+        // mismatched result. Never attempt a pathname rollback after commit:
+        // its source could be replaced after any identity precheck.
+        let outcome = sourceName.withCString { source in
             name.withCString { target in
-                if destinationIdentity == expectedIdentity {
-                    Darwin.renameat(
-                        validated.descriptor,
-                        source,
-                        validated.descriptor,
-                        target
-                    )
-                } else {
+                callCapturingErrno {
                     Darwin.renameatx_np(
                         validated.descriptor,
                         source,
@@ -273,109 +320,22 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
                 }
             }
         }
-        if result != 0 {
-            if errno == EEXIST {
+        if outcome.result != 0 {
+            if outcome.errorCode == EEXIST {
                 throw FlashFileBrowserFileSystemError.itemAlreadyExists(name)
             }
-            throw currentPOSIXError()
+            throw posixError(outcome.errorCode)
         }
 
         guard entryIdentity(named: name, in: validated.descriptor) == expectedIdentity else {
-            rollbackRename(
-                from: name,
-                to: sourceName,
-                expectedIdentity: expectedIdentity,
-                descriptor: validated.descriptor
-            )
             throw FlashFileBrowserFileSystemError.itemIsNotCurrent
         }
-        do {
-            try revalidateDirectoryDescriptor(
-                validated,
-                directory: directory,
-                allowedRoot: allowedRoot
-            )
-        } catch {
-            rollbackRename(
-                from: name,
-                to: sourceName,
-                expectedIdentity: expectedIdentity,
-                descriptor: validated.descriptor
-            )
-            throw error
-        }
+        try revalidateDirectoryDescriptor(
+            validated,
+            directory: directory,
+            allowedRoot: allowedRoot
+        )
         return destination
-    }
-
-    func duplicate(
-        _ item: URL,
-        expectedIdentity: FlashFileBrowserItemIdentity,
-        in directory: URL,
-        allowedRoot: URL
-    ) throws -> URL {
-        let validated = try openValidatedDirectory(
-            directory,
-            allowedRoot: allowedRoot
-        )
-        defer { Darwin.close(validated.descriptor) }
-        try validateItem(
-            item,
-            expectedIdentity: expectedIdentity,
-            in: directory,
-            allowedRoot: allowedRoot,
-            descriptor: validated.descriptor
-        )
-        let destinationName = try duplicateDestinationName(
-            for: item,
-            descriptor: validated.descriptor
-        )
-        return try stageAndPromoteCopy(
-            source: CopySource(
-                url: item,
-                identity: expectedIdentity,
-                entryName: item.lastPathComponent
-            ),
-            destinationName: destinationName,
-            directory: directory,
-            allowedRoot: allowedRoot,
-            validated: validated
-        )
-    }
-
-    func copyItem(
-        _ source: URL,
-        to directory: URL,
-        allowedRoot: URL
-    ) throws -> URL {
-        let source = source.standardizedFileURL
-        let sourceIdentity = itemIdentity(at: source)
-        guard source.isFileURL,
-              !source.lastPathComponent.isEmpty,
-              let sourceIdentity else {
-            throw FlashFileBrowserFileSystemError.copySourceUnavailable(
-                source.lastPathComponent
-            )
-        }
-        let validated = try openValidatedDirectory(
-            directory,
-            allowedRoot: allowedRoot
-        )
-        defer { Darwin.close(validated.descriptor) }
-        let destinationName = try copyDestinationName(
-            for: source,
-            descriptor: validated.descriptor
-        )
-        return try stageAndPromoteCopy(
-            source: CopySource(
-                url: source,
-                identity: sourceIdentity,
-                entryName: nil
-            ),
-            destinationName: destinationName,
-            directory: directory,
-            allowedRoot: allowedRoot,
-            validated: validated
-        )
     }
 
     func moveToTrash(
@@ -431,55 +391,43 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
                 expectedIdentity else {
             throw FlashFileBrowserFileSystemError.itemIsNotCurrent
         }
+        // As with rename, Darwin cannot make source identity a syscall
+        // precondition. The exclusive destination and postcondition prevent
+        // overwrites. A post-commit failure is never rolled back by pathname,
+        // because the source could be replaced between a check and rollback.
         let trashName = try trashDestinationName(
             for: item.lastPathComponent,
             descriptor: trash.descriptor
         )
-        let moveResult = item.lastPathComponent.withCString { source in
+        let moveOutcome = item.lastPathComponent.withCString { source in
             trashName.withCString { destination in
-                Darwin.renameatx_np(
-                    validated.descriptor,
-                    source,
-                    trash.descriptor,
-                    destination,
-                    UInt32(RENAME_EXCL)
-                )
+                callCapturingErrno {
+                    Darwin.renameatx_np(
+                        validated.descriptor,
+                        source,
+                        trash.descriptor,
+                        destination,
+                        UInt32(RENAME_EXCL)
+                    )
+                }
             }
         }
-        guard moveResult == 0 else {
-            if errno == EEXIST {
+        guard moveOutcome.result == 0 else {
+            if moveOutcome.errorCode == EEXIST {
                 throw FlashFileBrowserFileSystemError.cannotPrepareTrash
             }
-            throw currentPOSIXError()
+            throw posixError(moveOutcome.errorCode)
         }
         guard entryIdentity(named: trashName, in: trash.descriptor) == expectedIdentity else {
-            rollbackRename(
-                from: trashName,
-                sourceDescriptor: trash.descriptor,
-                to: item.lastPathComponent,
-                destinationDescriptor: validated.descriptor,
-                expectedIdentity: expectedIdentity
-            )
             throw FlashFileBrowserFileSystemError.itemIsNotCurrent
         }
 
-        do {
-            try revalidateDirectoryDescriptor(
-                validated,
-                directory: directory,
-                allowedRoot: allowedRoot
-            )
-            try revalidateExternalDirectoryDescriptor(trash)
-        } catch {
-            rollbackRename(
-                from: trashName,
-                sourceDescriptor: trash.descriptor,
-                to: item.lastPathComponent,
-                destinationDescriptor: validated.descriptor,
-                expectedIdentity: expectedIdentity,
-            )
-            throw error
-        }
+        try revalidateDirectoryDescriptor(
+            validated,
+            directory: directory,
+            allowedRoot: allowedRoot
+        )
+        try revalidateExternalDirectoryDescriptor(trash)
     }
 
     func moveToTrash(
@@ -491,6 +439,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         // Each entry is checked again immediately before Trash in case an
         // external process replaces it while an earlier item is moving.
         for target in targets {
+            try Task.checkCancellation()
             try validateItem(
                 target.url,
                 expectedIdentity: target.expectedIdentity,
@@ -501,6 +450,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
 
         var completed = 0
         for target in targets {
+            try Task.checkCancellation()
             do {
                 try moveToTrash(
                     target.url,
@@ -509,6 +459,8 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
                     allowedRoot: allowedRoot
                 )
                 completed += 1
+            } catch let error as CancellationError {
+                throw error
             } catch {
                 throw FlashFileBrowserFileSystemError.batchOperationFailed(
                     completed: completed,
@@ -599,7 +551,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         }
     }
 
-    private struct ValidatedDirectoryDescriptor {
+    struct ValidatedDirectoryDescriptor {
         let descriptor: Int32
         let anchor: DirectoryAnchor
     }
@@ -609,14 +561,19 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         let anchor: DirectoryAnchor
     }
 
-    private func openValidatedDirectory(
+    func openValidatedDirectory(
         _ directory: URL,
         allowedRoot: URL
     ) throws -> ValidatedDirectoryDescriptor {
         let anchor = try validateDirectory(directory, allowedRoot: allowedRoot)
         let path = fileManager.fileSystemRepresentation(withPath: anchor.url.path)
-        let descriptor = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard descriptor >= 0 else { throw currentPOSIXError() }
+        let openOutcome = callCapturingErrno {
+            Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        let descriptor = openOutcome.result
+        guard descriptor >= 0 else {
+            throw posixError(openOutcome.errorCode)
+        }
 
         do {
             let result = ValidatedDirectoryDescriptor(
@@ -635,7 +592,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         }
     }
 
-    private func revalidateDirectoryDescriptor(
+    func revalidateDirectoryDescriptor(
         _ validated: ValidatedDirectoryDescriptor,
         directory: URL,
         allowedRoot: URL
@@ -727,7 +684,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         }
     }
 
-    private func entryIdentity(
+    func entryIdentity(
         named name: String,
         in descriptor: Int32
     ) -> FlashFileBrowserItemIdentity? {
@@ -737,7 +694,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         )
     }
 
-    private func entryMetadata(
+    func entryMetadata(
         named name: String,
         in descriptor: Int32,
         followingSymbolicLinks: Bool = false
@@ -761,7 +718,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         )
     }
 
-    private func forEachDirectoryEntry(
+    func forEachDirectoryEntry(
         in descriptor: Int32,
         body: (String) throws -> Void
     ) throws {
@@ -771,31 +728,33 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         )
     }
 
-    private func containsLiteralEntry(
-        named expectedName: String,
-        in descriptor: Int32
-    ) throws -> Bool {
-        var containsEntry = false
-        try forEachDirectoryEntry(in: descriptor) { name in
-            if name == expectedName {
-                containsEntry = true
-            }
+    private func directoryIsEmpty(_ descriptor: Int32) throws -> Bool {
+        var isEmpty = true
+        try forEachDirectoryEntry(in: descriptor) { _ in
+            isEmpty = false
         }
-        return containsEntry
+        return isEmpty
     }
 
-    private func runMutationHook(
+    func runMutationHook(
         _ checkpoint: MutationCheckpoint,
         directory: URL
     ) throws {
         try mutationHook?(checkpoint, directory)
     }
 
-    private func currentPOSIXError() -> POSIXError {
-        FlashFileBrowserDescriptorIO.currentPOSIXError()
+    func posixError(_ errorCode: Int32) -> POSIXError {
+        FlashFileBrowserDescriptorIO.posixError(errorCode)
     }
 
-    private func validateItem(
+    @inline(__always)
+    func callCapturingErrno<Result>(
+        _ operation: () -> Result
+    ) -> (result: Result, errorCode: Int32) {
+        FlashFileBrowserDescriptorIO.callCapturingErrno(operation)
+    }
+
+    func validateItem(
         _ item: URL,
         expectedIdentity: FlashFileBrowserItemIdentity,
         in directory: URL,
@@ -829,46 +788,6 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         }
     }
 
-    private func rollbackRename(
-        from sourceName: String,
-        to destinationName: String,
-        expectedIdentity: FlashFileBrowserItemIdentity?,
-        descriptor: Int32
-    ) {
-        rollbackRename(
-            from: sourceName,
-            sourceDescriptor: descriptor,
-            to: destinationName,
-            destinationDescriptor: descriptor,
-            expectedIdentity: expectedIdentity
-        )
-    }
-
-    private func rollbackRename(
-        from sourceName: String,
-        sourceDescriptor: Int32,
-        to destinationName: String,
-        destinationDescriptor: Int32,
-        expectedIdentity: FlashFileBrowserItemIdentity?
-    ) {
-        guard let expectedIdentity,
-              entryIdentity(named: sourceName, in: sourceDescriptor) == expectedIdentity,
-              entryIdentity(named: destinationName, in: destinationDescriptor) == nil else {
-            return
-        }
-        _ = sourceName.withCString { source in
-            destinationName.withCString { destination in
-                Darwin.renameatx_np(
-                    sourceDescriptor,
-                    source,
-                    destinationDescriptor,
-                    destination,
-                    UInt32(RENAME_EXCL)
-                )
-            }
-        }
-    }
-
     private func destination(named name: String, in directory: URL) throws -> URL {
         guard isValidName(name) else {
             throw FlashFileBrowserFileSystemError.invalidName
@@ -885,7 +804,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
             !name.contains("\0")
     }
 
-    private func itemIdentity(at url: URL) -> FlashFileBrowserItemIdentity? {
+    func itemIdentity(at url: URL) -> FlashFileBrowserItemIdentity? {
         // `FileManager.attributesOfItem` also reads extended attributes on
         // recent macOS versions. A cloud-backed directory can block that work
         // indefinitely even though identity only needs the directory entry's
@@ -898,7 +817,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         return identity(from: metadata)
     }
 
-    private func directoryAnchor(at url: URL) throws -> DirectoryAnchor? {
+    func directoryAnchor(at url: URL) throws -> DirectoryAnchor? {
         let normalizedURL = FlashFileBrowserPathPolicy.standardized(url)
         var initialEntryMetadata = stat()
         let path = fileManager.fileSystemRepresentation(withPath: normalizedURL.path)
@@ -936,7 +855,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         )
     }
 
-    private func canonicalPath(for descriptor: Int32) -> String? {
+    func canonicalPath(for descriptor: Int32) -> String? {
         FlashFileBrowserDescriptorIO.canonicalPath(for: descriptor)
     }
 
@@ -947,7 +866,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         containsCanonicalPath(anchor.canonicalPath, in: root.canonicalPath)
     }
 
-    private func containsCanonicalPath(
+    func containsCanonicalPath(
         _ candidatePath: String,
         in rootPath: String
     ) -> Bool {
@@ -957,11 +876,11 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         )
     }
 
-    private func identity(from metadata: stat) -> FlashFileBrowserItemIdentity {
+    func identity(from metadata: stat) -> FlashFileBrowserItemIdentity {
         FlashFileBrowserDescriptorIO.identity(from: metadata)
     }
 
-    private struct TemporaryCopyContainer {
+    private struct TemporaryDirectoryContainer {
         let name: String
         let url: URL
         let identity: FlashFileBrowserItemIdentity
@@ -969,52 +888,73 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         let canonicalPath: String
     }
 
-    private func createTemporaryCopyContainer(
-        prefix: String,
-        descriptor: Int32
-    ) throws -> TemporaryCopyContainer {
+    private struct TemporaryDirectoryCreationOptions {
+        let prefix: String
+        let mode: mode_t
+        let preparationError: FlashFileBrowserFileSystemError
+        let identityMismatchError: FlashFileBrowserFileSystemError
+
+        static let folder = Self(
+            prefix: "folder",
+            mode: mode_t(0o777),
+            preparationError: .cannotCreateFolderSafely,
+            identityMismatchError: .itemIsNotCurrent
+        )
+    }
+
+    private func createTemporaryDirectoryContainer(
+        options: TemporaryDirectoryCreationOptions,
+        descriptor: Int32,
+        identityCaptured: ((String) throws -> Void)? = nil
+    ) throws -> TemporaryDirectoryContainer {
         for _ in 0..<100 {
-            let name = ".flash-ghostty-\(prefix)-\(UUID().uuidString)"
-            let createResult = name.withCString {
-                Darwin.mkdirat(descriptor, $0, mode_t(0o700))
+            let name = ".flash-ghostty-\(options.prefix)-\(UUID().uuidString)"
+            let createOutcome = name.withCString { entryName in
+                callCapturingErrno {
+                    Darwin.mkdirat(descriptor, entryName, options.mode)
+                }
             }
-            if createResult != 0 {
-                if errno == EEXIST { continue }
-                throw currentPOSIXError()
+            if createOutcome.result != 0 {
+                if createOutcome.errorCode == EEXIST { continue }
+                throw posixError(createOutcome.errorCode)
             }
 
             guard let identity = entryIdentity(named: name, in: descriptor) else {
-                _ = name.withCString {
-                    Darwin.unlinkat(descriptor, $0, AT_REMOVEDIR)
+                // No trustworthy identity means cleanup could remove a
+                // concurrent replacement. Leave the unpredictable orphan for
+                // inspection instead of deleting unknown data.
+                throw options.identityMismatchError
+            }
+            do {
+                try identityCaptured?(name)
+            } catch {
+                throw error
+            }
+            let openOutcome = name.withCString { entryName in
+                callCapturingErrno {
+                    Darwin.openat(
+                        descriptor,
+                        entryName,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                            O_RESOLVE_BENEATH | O_CLOEXEC
+                    )
                 }
-                throw FlashFileBrowserFileSystemError.cannotPrepareCopy
             }
-            let containerDescriptor = name.withCString {
-                Darwin.openat(
-                    descriptor,
-                    $0,
-                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-                )
-            }
+            let containerDescriptor = openOutcome.result
             guard containerDescriptor >= 0 else {
-                removeTemporaryDirectoryIfCurrent(
-                    named: name,
-                    identity: identity,
-                    descriptor: descriptor
-                )
-                throw FlashFileBrowserFileSystemError.cannotPrepareCopy
+                switch openOutcome.errorCode {
+                case ENOENT, ELOOP, ENOTDIR:
+                    throw options.identityMismatchError
+                default:
+                    throw options.preparationError
+                }
             }
 
             var metadata = stat()
             guard Darwin.fstat(containerDescriptor, &metadata) == 0,
                   self.identity(from: metadata) == identity else {
                 Darwin.close(containerDescriptor)
-                removeTemporaryDirectoryIfCurrent(
-                    named: name,
-                    identity: identity,
-                    descriptor: descriptor
-                )
-                throw FlashFileBrowserFileSystemError.cannotPrepareCopy
+                throw options.identityMismatchError
             }
 
             var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
@@ -1023,15 +963,10 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
             }
             guard pathResult == 0 else {
                 Darwin.close(containerDescriptor)
-                removeTemporaryDirectoryIfCurrent(
-                    named: name,
-                    identity: identity,
-                    descriptor: descriptor
-                )
-                throw FlashFileBrowserFileSystemError.cannotPrepareCopy
+                throw options.preparationError
             }
 
-            return TemporaryCopyContainer(
+            return TemporaryDirectoryContainer(
                 name: name,
                 url: URL(fileURLWithPath: String(cString: pathBuffer), isDirectory: true),
                 identity: identity,
@@ -1042,375 +977,7 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
             )
         }
 
-        throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-    }
-
-    private func removeTemporaryDirectoryIfCurrent(
-        named name: String,
-        identity: FlashFileBrowserItemIdentity,
-        descriptor: Int32
-    ) {
-        guard entryIdentity(named: name, in: descriptor) == identity else { return }
-        _ = name.withCString {
-            Darwin.unlinkat(descriptor, $0, AT_REMOVEDIR)
-        }
-    }
-
-    private func removeTemporaryCopyContainer(
-        _ container: TemporaryCopyContainer,
-        descriptor: Int32
-    ) {
-        var metadata = stat()
-        guard Darwin.fstat(container.descriptor, &metadata) == 0,
-              identity(from: metadata) == container.identity,
-              canonicalPath(for: container.descriptor) == container.canonicalPath,
-              entryIdentity(named: container.name, in: descriptor) == container.identity else {
-            return
-        }
-        removeDirectoryContents(
-            in: container.descriptor,
-            rootedAt: container.canonicalPath
-        )
-        guard canonicalPath(for: container.descriptor) == container.canonicalPath,
-              entryIdentity(named: container.name, in: descriptor) == container.identity else {
-            return
-        }
-        _ = container.name.withCString {
-            Darwin.unlinkat(descriptor, $0, AT_REMOVEDIR)
-        }
-    }
-
-    private struct AnchoredDirectoryPathComponent {
-        let name: String
-        let identity: FlashFileBrowserItemIdentity
-    }
-
-    private struct TemporaryRemovalEntry {
-        let name: String
-        let identity: FlashFileBrowserItemIdentity
-        let mode: mode_t
-    }
-
-    private enum TemporaryRemovalOperation {
-        case visitDirectory(
-            path: [AnchoredDirectoryPathComponent],
-            depth: Int
-        )
-        case removeDirectory(
-            parentPath: [AnchoredDirectoryPathComponent],
-            entry: TemporaryRemovalEntry
-        )
-        case removeFile(
-            parentPath: [AnchoredDirectoryPathComponent],
-            entry: TemporaryRemovalEntry
-        )
-    }
-
-    private func removeDirectoryContents(
-        in descriptor: Int32,
-        rootedAt rootPath: String
-    ) {
-        var operations: [TemporaryRemovalOperation] = [
-            .visitDirectory(path: [], depth: 0),
-        ]
-
-        while let operation = operations.popLast() {
-            switch operation {
-            case let .visitDirectory(path, depth):
-                guard depth < Self.maximumCopyCleanupDepth,
-                      let entries = temporaryRemovalEntries(
-                          in: path,
-                          rootDescriptor: descriptor,
-                          rootPath: rootPath
-                      ) else { continue }
-
-                for entry in entries.reversed() {
-                    if entry.mode == S_IFDIR {
-                        operations.append(
-                            .removeDirectory(parentPath: path, entry: entry)
-                        )
-                        operations.append(
-                            .visitDirectory(
-                                path: path + [
-                                    AnchoredDirectoryPathComponent(
-                                        name: entry.name,
-                                        identity: entry.identity
-                                    ),
-                                ],
-                                depth: depth + 1
-                            )
-                        )
-                    } else {
-                        operations.append(
-                            .removeFile(parentPath: path, entry: entry)
-                        )
-                    }
-                }
-
-            case let .removeDirectory(parentPath, entry):
-                removeTemporaryDirectory(
-                    entry,
-                    parentPath: parentPath,
-                    rootDescriptor: descriptor,
-                    rootPath: rootPath
-                )
-
-            case let .removeFile(parentPath, entry):
-                removeTemporaryFile(
-                    entry,
-                    parentPath: parentPath,
-                    rootDescriptor: descriptor,
-                    rootPath: rootPath
-                )
-            }
-        }
-    }
-
-    private func temporaryRemovalEntries(
-        in path: [AnchoredDirectoryPathComponent],
-        rootDescriptor: Int32,
-        rootPath: String
-    ) -> [TemporaryRemovalEntry]? {
-        guard let descriptor = openAnchoredDirectoryPath(
-            path,
-            rootDescriptor: rootDescriptor,
-            preparingForRemoval: true
-        ) else { return nil }
-        defer { Darwin.close(descriptor) }
-
-        guard let directoryPath = canonicalPath(for: descriptor),
-              containsCanonicalPath(directoryPath, in: rootPath) else {
-            return nil
-        }
-
-        var entries: [TemporaryRemovalEntry] = []
-        do {
-            try forEachDirectoryEntry(in: descriptor) { name in
-                guard canonicalPath(for: descriptor) == directoryPath,
-                      let metadata = entryMetadata(named: name, in: descriptor) else {
-                    return
-                }
-                let entry = TemporaryRemovalEntry(
-                    name: name,
-                    identity: identity(from: metadata),
-                    mode: metadata.st_mode & S_IFMT
-                )
-                if entry.mode == S_IFDIR {
-                    guard let childDescriptor = openTemporaryEntryForRemoval(
-                        named: name,
-                        expectedIdentity: entry.identity,
-                        expectedMode: S_IFDIR,
-                        in: descriptor
-                    ) else { return }
-                    Darwin.close(childDescriptor)
-                }
-                entries.append(entry)
-            }
-        } catch {
-            return nil
-        }
-        return entries
-    }
-
-    private func removeTemporaryDirectory(
-        _ entry: TemporaryRemovalEntry,
-        parentPath: [AnchoredDirectoryPathComponent],
-        rootDescriptor: Int32,
-        rootPath: String
-    ) {
-        guard let parentDescriptor = openAnchoredDirectoryPath(
-            parentPath,
-            rootDescriptor: rootDescriptor,
-            preparingForRemoval: true
-        ) else { return }
-        defer { Darwin.close(parentDescriptor) }
-
-        guard let parentCanonicalPath = canonicalPath(for: parentDescriptor),
-              containsCanonicalPath(parentCanonicalPath, in: rootPath),
-              entryIdentity(named: entry.name, in: parentDescriptor) == entry.identity else {
-            return
-        }
-        _ = entry.name.withCString {
-            Darwin.unlinkat(parentDescriptor, $0, AT_REMOVEDIR)
-        }
-    }
-
-    private func removeTemporaryFile(
-        _ entry: TemporaryRemovalEntry,
-        parentPath: [AnchoredDirectoryPathComponent],
-        rootDescriptor: Int32,
-        rootPath: String
-    ) {
-        guard let parentDescriptor = openAnchoredDirectoryPath(
-            parentPath,
-            rootDescriptor: rootDescriptor,
-            preparingForRemoval: true
-        ) else { return }
-        defer { Darwin.close(parentDescriptor) }
-
-        guard let parentCanonicalPath = canonicalPath(for: parentDescriptor),
-              containsCanonicalPath(parentCanonicalPath, in: rootPath),
-              let metadata = entryMetadata(named: entry.name, in: parentDescriptor),
-              identity(from: metadata) == entry.identity,
-              metadata.st_mode & S_IFMT == entry.mode else {
-            return
-        }
-        if metadata.st_flags & Self.removalBlockingFlags != 0 {
-            guard let childDescriptor = openTemporaryEntryForRemoval(
-                named: entry.name,
-                expectedIdentity: entry.identity,
-                expectedMode: entry.mode,
-                in: parentDescriptor
-            ) else { return }
-            Darwin.close(childDescriptor)
-        }
-        guard entryIdentity(named: entry.name, in: parentDescriptor) == entry.identity else {
-            return
-        }
-        _ = entry.name.withCString {
-            Darwin.unlinkat(parentDescriptor, $0, 0)
-        }
-    }
-
-    private func openAnchoredDirectoryPath(
-        _ path: [AnchoredDirectoryPathComponent],
-        rootDescriptor: Int32,
-        preparingForRemoval: Bool = false
-    ) -> Int32? {
-        var descriptor = Darwin.fcntl(rootDescriptor, F_DUPFD_CLOEXEC, 0)
-        guard descriptor >= 0 else { return nil }
-
-        for component in path {
-            guard entryIdentity(named: component.name, in: descriptor) ==
-                    component.identity else {
-                Darwin.close(descriptor)
-                return nil
-            }
-            let childDescriptor: Int32?
-            if preparingForRemoval {
-                childDescriptor = openTemporaryEntryForRemoval(
-                    named: component.name,
-                    expectedIdentity: component.identity,
-                    expectedMode: S_IFDIR,
-                    in: descriptor
-                )
-            } else {
-                childDescriptor = openDirectoryEntry(
-                    named: component.name,
-                    expectedIdentity: component.identity,
-                    in: descriptor
-                )
-            }
-            guard let childDescriptor else {
-                Darwin.close(descriptor)
-                return nil
-            }
-            Darwin.close(descriptor)
-            descriptor = childDescriptor
-        }
-        return descriptor
-    }
-
-    private func openDirectoryEntry(
-        named name: String,
-        expectedIdentity: FlashFileBrowserItemIdentity,
-        in descriptor: Int32
-    ) -> Int32? {
-        let entryDescriptor = name.withCString {
-            Darwin.openat(
-                descriptor,
-                $0,
-                O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                    O_RESOLVE_BENEATH | O_CLOEXEC
-            )
-        }
-        guard entryDescriptor >= 0 else { return nil }
-
-        var metadata = stat()
-        guard Darwin.fstat(entryDescriptor, &metadata) == 0,
-              identity(from: metadata) == expectedIdentity,
-              metadata.st_mode & S_IFMT == S_IFDIR,
-              entryIdentity(named: name, in: descriptor) == expectedIdentity else {
-            Darwin.close(entryDescriptor)
-            return nil
-        }
-        return entryDescriptor
-    }
-
-    /// Copy metadata can make a fully staged entry read-only or immutable.
-    /// Cleanup is limited to entries whose descriptor and parent name both
-    /// still identify the app-created object.
-    private func openTemporaryEntryForRemoval(
-        named name: String,
-        expectedIdentity: FlashFileBrowserItemIdentity,
-        expectedMode: mode_t,
-        in descriptor: Int32
-    ) -> Int32? {
-        let openFlags: Int32
-        switch expectedMode {
-        case S_IFDIR:
-            openFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                O_RESOLVE_BENEATH | O_CLOEXEC
-        case S_IFREG:
-            openFlags = O_RDONLY | O_NOFOLLOW | O_RESOLVE_BENEATH | O_CLOEXEC
-        case S_IFLNK:
-            openFlags = O_RDONLY | O_SYMLINK | O_RESOLVE_BENEATH | O_CLOEXEC
-        default:
-            return nil
-        }
-
-        let entryDescriptor = name.withCString {
-            Darwin.openat(descriptor, $0, openFlags)
-        }
-        guard entryDescriptor >= 0 else { return nil }
-
-        var metadata = stat()
-        guard Darwin.fstat(entryDescriptor, &metadata) == 0,
-              identity(from: metadata) == expectedIdentity,
-              metadata.st_mode & S_IFMT == expectedMode else {
-            Darwin.close(entryDescriptor)
-            return nil
-        }
-
-        let blockingFlags = metadata.st_flags & Self.removalBlockingFlags
-        if blockingFlags != 0,
-           Darwin.fchflags(
-               entryDescriptor,
-               metadata.st_flags & ~Self.removalBlockingFlags
-           ) != 0 {
-            Darwin.close(entryDescriptor)
-            return nil
-        }
-
-        if expectedMode == S_IFDIR {
-            let currentPermissions = metadata.st_mode & mode_t(0o7777)
-            let removalPermissions = currentPermissions | mode_t(0o700)
-            if currentPermissions != removalPermissions,
-               Darwin.fchmod(entryDescriptor, removalPermissions) != 0 {
-                Darwin.close(entryDescriptor)
-                return nil
-            }
-        }
-
-        guard Darwin.fstat(entryDescriptor, &metadata) == 0,
-              identity(from: metadata) == expectedIdentity,
-              metadata.st_mode & S_IFMT == expectedMode,
-              entryIdentity(named: name, in: descriptor) == expectedIdentity else {
-            Darwin.close(entryDescriptor)
-            return nil
-        }
-        return entryDescriptor
-    }
-
-    private func copyDestinationName(
-        for source: URL,
-        descriptor: Int32
-    ) throws -> String {
-        let preferred = source.lastPathComponent
-        guard entryIdentity(named: preferred, in: descriptor) != nil else {
-            return preferred
-        }
-        return try duplicateDestinationName(for: source, descriptor: descriptor)
+        throw options.preparationError
     }
 
     private func trashDestinationName(
@@ -1438,754 +1005,4 @@ actor LocalFlashFileBrowserFileSystem: FlashFileBrowserFileSystem {
         throw FlashFileBrowserFileSystemError.cannotPrepareTrash
     }
 
-    private func duplicateDestinationName(
-        for item: URL,
-        descriptor: Int32
-    ) throws -> String {
-        let extensionName = item.pathExtension
-        let baseName = extensionName.isEmpty
-            ? item.lastPathComponent
-            : item.deletingPathExtension().lastPathComponent
-
-        for index in 1...maximumCopyNameAttempts {
-            let suffix = index == 1 ? " copy" : " copy \(index)"
-            var candidateName = baseName + suffix
-            if !extensionName.isEmpty { candidateName += ".\(extensionName)" }
-            if entryIdentity(named: candidateName, in: descriptor) == nil {
-                return candidateName
-            }
-        }
-
-        throw FlashFileBrowserFileSystemError.cannotAllocateCopyName
-    }
-
-    private struct CopySource {
-        let url: URL
-        let identity: FlashFileBrowserItemIdentity
-        let entryName: String?
-    }
-
-    private struct CopySourceDirectory {
-        let descriptor: Int32
-        let anchor: DirectoryAnchor
-        let ownsDescriptor: Bool
-    }
-
-    private struct CopyTraversalContext {
-        let sourceDescriptor: Int32
-        let destinationDescriptor: Int32
-        let sourceURL: URL
-        let forbiddenDirectoryIdentities: Set<FlashFileBrowserItemIdentity>
-        let depth: Int
-    }
-
-    private struct PendingCopyEntry {
-        let sourceParentPath: [AnchoredDirectoryPathComponent]
-        let destinationParentPath: [AnchoredDirectoryPathComponent]
-        let sourceURL: URL
-        let sourceName: String
-        let destinationName: String
-        let expectedIdentity: FlashFileBrowserItemIdentity
-        let forbiddenDirectoryIdentities: Set<FlashFileBrowserItemIdentity>
-        let depth: Int
-        let isRoot: Bool
-    }
-
-    private struct PendingCopyDirectoryCompletion {
-        let entry: PendingCopyEntry
-        let destinationIdentity: FlashFileBrowserItemIdentity
-    }
-
-    private struct PreparedCopyDirectory {
-        let completion: PendingCopyDirectoryCompletion
-        let children: [PendingCopyEntry]
-    }
-
-    private enum PendingCopyOperation {
-        case copyEntry(PendingCopyEntry)
-        case finishDirectory(PendingCopyDirectoryCompletion)
-    }
-
-    private enum CopyEntryStep {
-        case completed(FlashFileBrowserItemIdentity)
-        case preparedDirectory(PreparedCopyDirectory)
-    }
-
-    private func stageAndPromoteCopy(
-        source: CopySource,
-        destinationName: String,
-        directory: URL,
-        allowedRoot: URL,
-        validated: ValidatedDirectoryDescriptor
-    ) throws -> URL {
-        try Task.checkCancellation()
-        try runMutationHook(.itemValidated, directory: directory)
-        try revalidateDirectoryDescriptor(
-            validated,
-            directory: directory,
-            allowedRoot: allowedRoot
-        )
-        let sourceDirectory = try openCopySourceDirectory(
-            for: source,
-            validated: validated
-        )
-        defer {
-            if sourceDirectory.ownsDescriptor {
-                Darwin.close(sourceDirectory.descriptor)
-            }
-        }
-        try runMutationHook(.copySourceOpened, directory: source.url)
-        try revalidateCopySource(source, directory: sourceDirectory)
-        try validateCopyTopology(
-            source,
-            sourceDescriptor: sourceDirectory.descriptor,
-            destination: validated.anchor
-        )
-
-        let temporary = try createTemporaryCopyContainer(
-            prefix: "copy",
-            descriptor: validated.descriptor
-        )
-        defer {
-            removeTemporaryCopyContainer(
-                temporary,
-                descriptor: validated.descriptor
-            )
-            Darwin.close(temporary.descriptor)
-        }
-        try runMutationHook(.copyDestinationOpened, directory: temporary.url)
-
-        let stagedName = source.url.lastPathComponent
-        let stagedIdentity = try copyEntry(
-            named: source.entryName ?? stagedName,
-            expectedIdentity: source.identity,
-            to: stagedName,
-            context: CopyTraversalContext(
-                sourceDescriptor: sourceDirectory.descriptor,
-                destinationDescriptor: temporary.descriptor,
-                sourceURL: source.url,
-                forbiddenDirectoryIdentities: [
-                    validated.anchor.directoryIdentity,
-                    temporary.identity,
-                ],
-                depth: 0
-            )
-        )
-
-        try runMutationHook(.copyDestinationFinished, directory: temporary.url)
-        try runMutationHook(.copySourceFinished, directory: source.url)
-        try runMutationHook(.stagedCopyReady, directory: directory)
-        try revalidateDirectoryDescriptor(
-            validated,
-            directory: directory,
-            allowedRoot: allowedRoot
-        )
-        guard entryIdentity(named: temporary.name, in: validated.descriptor) ==
-                temporary.identity,
-              canonicalPath(for: temporary.descriptor) == temporary.canonicalPath,
-              entryIdentity(named: stagedName, in: temporary.descriptor) == stagedIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        try revalidateCopySource(source, directory: sourceDirectory)
-
-        try Task.checkCancellation()
-        let promoteResult = stagedName.withCString { staged in
-            destinationName.withCString { destination in
-                Darwin.renameatx_np(
-                    temporary.descriptor,
-                    staged,
-                    validated.descriptor,
-                    destination,
-                    UInt32(RENAME_EXCL)
-                )
-            }
-        }
-        if promoteResult != 0 {
-            if errno == EEXIST {
-                throw FlashFileBrowserFileSystemError.itemAlreadyExists(destinationName)
-            }
-            throw currentPOSIXError()
-        }
-        guard entryIdentity(named: destinationName, in: validated.descriptor) == stagedIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-
-        do {
-            try revalidateDirectoryDescriptor(
-                validated,
-                directory: directory,
-                allowedRoot: allowedRoot
-            )
-        } catch {
-            rollbackRename(
-                from: destinationName,
-                sourceDescriptor: validated.descriptor,
-                to: stagedName,
-                destinationDescriptor: temporary.descriptor,
-                expectedIdentity: stagedIdentity,
-            )
-            throw error
-        }
-
-        return directory.appendingPathComponent(destinationName).standardizedFileURL
-    }
-
-    private func openCopySourceDirectory(
-        for source: CopySource,
-        validated: ValidatedDirectoryDescriptor
-    ) throws -> CopySourceDirectory {
-        if source.entryName != nil {
-            return CopySourceDirectory(
-                descriptor: validated.descriptor,
-                anchor: validated.anchor,
-                ownsDescriptor: false
-            )
-        }
-
-        let parent = FlashFileBrowserPathPolicy.standardized(
-            source.url.deletingLastPathComponent()
-        )
-        guard FlashFileBrowserPathPolicy.isDirectChild(source.url, of: parent),
-              let anchor = try directoryAnchor(at: parent) else {
-            throw copySourceChangedError(source)
-        }
-        let path = fileManager.fileSystemRepresentation(withPath: anchor.url.path)
-        let descriptor = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard descriptor >= 0 else { throw copySourceChangedError(source) }
-        guard directoryDescriptor(descriptor, matches: anchor),
-              entryIdentity(
-                  named: source.url.lastPathComponent,
-                  in: descriptor
-              ) == source.identity else {
-            Darwin.close(descriptor)
-            throw copySourceChangedError(source)
-        }
-        return CopySourceDirectory(
-            descriptor: descriptor,
-            anchor: anchor,
-            ownsDescriptor: true
-        )
-    }
-
-    private func revalidateCopySource(
-        _ source: CopySource,
-        directory: CopySourceDirectory
-    ) throws {
-        guard directoryDescriptor(directory.descriptor, matches: directory.anchor),
-              entryIdentity(
-                  named: source.entryName ?? source.url.lastPathComponent,
-                  in: directory.descriptor
-              ) == source.identity else {
-            throw copySourceChangedError(source)
-        }
-    }
-
-    private func copySourceChangedError(
-        _ source: CopySource
-    ) -> FlashFileBrowserFileSystemError {
-        if source.entryName == nil {
-            return .copySourceUnavailable(source.url.lastPathComponent)
-        }
-        return .itemIsNotCurrent
-    }
-
-    private func directoryDescriptor(
-        _ descriptor: Int32,
-        matches anchor: DirectoryAnchor
-    ) -> Bool {
-        var initialMetadata = stat()
-        guard Darwin.fstat(descriptor, &initialMetadata) == 0,
-              identity(from: initialMetadata) == anchor.directoryIdentity,
-              canonicalPath(for: descriptor) == anchor.canonicalPath else {
-            return false
-        }
-        var finalMetadata = stat()
-        return Darwin.fstat(descriptor, &finalMetadata) == 0 &&
-            identity(from: finalMetadata) == anchor.directoryIdentity &&
-            canonicalPath(for: descriptor) == anchor.canonicalPath
-    }
-
-    private func validateCopyTopology(
-        _ source: CopySource,
-        sourceDescriptor: Int32,
-        destination: DirectoryAnchor
-    ) throws {
-        let sourceName = source.entryName ?? source.url.lastPathComponent
-        guard let metadata = entryMetadata(named: sourceName, in: sourceDescriptor),
-              identity(from: metadata) == source.identity else {
-            throw copySourceChangedError(source)
-        }
-        guard metadata.st_mode & S_IFMT == S_IFDIR else { return }
-
-        let descriptor = sourceName.withCString {
-            Darwin.openat(
-                sourceDescriptor,
-                $0,
-                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_RESOLVE_BENEATH | O_CLOEXEC
-            )
-        }
-        guard descriptor >= 0 else { throw copySourceChangedError(source) }
-        defer { Darwin.close(descriptor) }
-        var currentMetadata = stat()
-        guard Darwin.fstat(descriptor, &currentMetadata) == 0,
-              identity(from: currentMetadata) == source.identity,
-              let sourcePath = canonicalPath(for: descriptor) else {
-            throw copySourceChangedError(source)
-        }
-        if containsCanonicalPath(destination.canonicalPath, in: sourcePath) {
-            throw FlashFileBrowserFileSystemError.cannotCopyIntoItself
-        }
-    }
-
-    private func copyEntry(
-        named sourceName: String,
-        expectedIdentity: FlashFileBrowserItemIdentity,
-        to destinationName: String,
-        context: CopyTraversalContext
-    ) throws -> FlashFileBrowserItemIdentity {
-        var operations: [PendingCopyOperation] = [
-            .copyEntry(
-                PendingCopyEntry(
-                    sourceParentPath: [],
-                    destinationParentPath: [],
-                    sourceURL: context.sourceURL,
-                    sourceName: sourceName,
-                    destinationName: destinationName,
-                    expectedIdentity: expectedIdentity,
-                    forbiddenDirectoryIdentities: context.forbiddenDirectoryIdentities,
-                    depth: context.depth,
-                    isRoot: true
-                )
-            ),
-        ]
-        var rootIdentity: FlashFileBrowserItemIdentity?
-
-        while let operation = operations.popLast() {
-            switch operation {
-            case let .copyEntry(entry):
-                switch try copyPendingEntry(
-                    entry,
-                    sourceRootDescriptor: context.sourceDescriptor,
-                    destinationRootDescriptor: context.destinationDescriptor
-                ) {
-                case let .completed(identity):
-                    if entry.isRoot { rootIdentity = identity }
-
-                case let .preparedDirectory(directory):
-                    operations.append(.finishDirectory(directory.completion))
-                    for child in directory.children.reversed() {
-                        operations.append(.copyEntry(child))
-                    }
-                }
-
-            case let .finishDirectory(completion):
-                let identity = try finishPendingCopyDirectory(
-                    completion,
-                    sourceRootDescriptor: context.sourceDescriptor,
-                    destinationRootDescriptor: context.destinationDescriptor
-                )
-                if completion.entry.isRoot { rootIdentity = identity }
-            }
-        }
-
-        guard let rootIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        return rootIdentity
-    }
-
-    private func copyPendingEntry(
-        _ entry: PendingCopyEntry,
-        sourceRootDescriptor: Int32,
-        destinationRootDescriptor: Int32
-    ) throws -> CopyEntryStep {
-        try Task.checkCancellation()
-        guard entry.depth < Self.maximumCopyDepth,
-              let sourceParentDescriptor = openAnchoredDirectoryPath(
-                  entry.sourceParentPath,
-                  rootDescriptor: sourceRootDescriptor
-              ) else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        defer { Darwin.close(sourceParentDescriptor) }
-        guard let destinationParentDescriptor = openAnchoredDirectoryPath(
-            entry.destinationParentPath,
-            rootDescriptor: destinationRootDescriptor
-        ) else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        defer { Darwin.close(destinationParentDescriptor) }
-
-        guard let metadata = entryMetadata(
-                  named: entry.sourceName,
-                  in: sourceParentDescriptor
-              ),
-              identity(from: metadata) == entry.expectedIdentity,
-              entryIdentity(
-                  named: entry.destinationName,
-                  in: destinationParentDescriptor
-              ) == nil else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-
-        let destinationIdentity: FlashFileBrowserItemIdentity
-        switch metadata.st_mode & S_IFMT {
-        case S_IFREG:
-            destinationIdentity = try copyRegularFile(
-                named: entry.sourceName,
-                from: sourceParentDescriptor,
-                expectedIdentity: entry.expectedIdentity,
-                to: entry.destinationName,
-                in: destinationParentDescriptor
-            )
-
-        case S_IFDIR:
-            guard !entry.forbiddenDirectoryIdentities.contains(entry.expectedIdentity) else {
-                throw FlashFileBrowserFileSystemError.cannotCopyIntoItself
-            }
-            return .preparedDirectory(
-                try prepareCopyDirectory(
-                    entry,
-                    sourceParentDescriptor: sourceParentDescriptor,
-                    destinationParentDescriptor: destinationParentDescriptor
-                )
-            )
-
-        case S_IFLNK:
-            destinationIdentity = try copySymbolicLink(
-                named: entry.sourceName,
-                from: sourceParentDescriptor,
-                expectedIdentity: entry.expectedIdentity,
-                to: entry.destinationName,
-                in: destinationParentDescriptor
-            )
-
-        default:
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-
-        try finishCopiedEntry(
-            entry,
-            destinationIdentity: destinationIdentity,
-            sourceParentDescriptor: sourceParentDescriptor,
-            destinationParentDescriptor: destinationParentDescriptor
-        )
-        return .completed(destinationIdentity)
-    }
-
-    private func prepareCopyDirectory(
-        _ entry: PendingCopyEntry,
-        sourceParentDescriptor: Int32,
-        destinationParentDescriptor: Int32
-    ) throws -> PreparedCopyDirectory {
-        guard let sourceDescriptor = openDirectoryEntry(
-            named: entry.sourceName,
-            expectedIdentity: entry.expectedIdentity,
-            in: sourceParentDescriptor
-        ) else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        defer { Darwin.close(sourceDescriptor) }
-
-        let createResult = entry.destinationName.withCString {
-            Darwin.mkdirat(destinationParentDescriptor, $0, mode_t(0o700))
-        }
-        guard createResult == 0 else { throw currentPOSIXError() }
-        let destinationDescriptor = entry.destinationName.withCString {
-            Darwin.openat(
-                destinationParentDescriptor,
-                $0,
-                O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
-                    O_RESOLVE_BENEATH | O_CLOEXEC
-            )
-        }
-        guard destinationDescriptor >= 0 else { throw currentPOSIXError() }
-        defer { Darwin.close(destinationDescriptor) }
-
-        var destinationMetadata = stat()
-        guard Darwin.fstat(destinationDescriptor, &destinationMetadata) == 0,
-              destinationMetadata.st_mode & S_IFMT == S_IFDIR else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        let destinationIdentity = identity(from: destinationMetadata)
-        guard entryIdentity(
-                  named: entry.destinationName,
-                  in: destinationParentDescriptor
-              ) == destinationIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-
-        let sourceComponent = AnchoredDirectoryPathComponent(
-            name: entry.sourceName,
-            identity: entry.expectedIdentity
-        )
-        let destinationComponent = AnchoredDirectoryPathComponent(
-            name: entry.destinationName,
-            identity: destinationIdentity
-        )
-        var children: [PendingCopyEntry] = []
-        try forEachDirectoryEntry(in: sourceDescriptor) { name in
-            try Task.checkCancellation()
-            guard let childMetadata = entryMetadata(named: name, in: sourceDescriptor) else {
-                throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-            }
-            children.append(
-                PendingCopyEntry(
-                    sourceParentPath: entry.sourceParentPath + [sourceComponent],
-                    destinationParentPath: entry.destinationParentPath + [
-                        destinationComponent,
-                    ],
-                    sourceURL: entry.sourceURL.appendingPathComponent(name),
-                    sourceName: name,
-                    destinationName: name,
-                    expectedIdentity: identity(from: childMetadata),
-                    forbiddenDirectoryIdentities: entry.forbiddenDirectoryIdentities,
-                    depth: entry.depth + 1,
-                    isRoot: false
-                )
-            )
-        }
-
-        var sourceMetadata = stat()
-        guard Darwin.fstat(sourceDescriptor, &sourceMetadata) == 0,
-              identity(from: sourceMetadata) == entry.expectedIdentity,
-              entryIdentity(named: entry.sourceName, in: sourceParentDescriptor) ==
-                entry.expectedIdentity,
-              entryIdentity(named: entry.destinationName, in: destinationParentDescriptor) ==
-                destinationIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        return PreparedCopyDirectory(
-            completion: PendingCopyDirectoryCompletion(
-                entry: entry,
-                destinationIdentity: destinationIdentity
-            ),
-            children: children
-        )
-    }
-
-    private func finishPendingCopyDirectory(
-        _ completion: PendingCopyDirectoryCompletion,
-        sourceRootDescriptor: Int32,
-        destinationRootDescriptor: Int32
-    ) throws -> FlashFileBrowserItemIdentity {
-        let entry = completion.entry
-        try Task.checkCancellation()
-        guard let sourceParentDescriptor = openAnchoredDirectoryPath(
-            entry.sourceParentPath,
-            rootDescriptor: sourceRootDescriptor
-        ) else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        defer { Darwin.close(sourceParentDescriptor) }
-        guard let destinationParentDescriptor = openAnchoredDirectoryPath(
-            entry.destinationParentPath,
-            rootDescriptor: destinationRootDescriptor
-        ) else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        defer { Darwin.close(destinationParentDescriptor) }
-
-        guard let sourceDescriptor = openDirectoryEntry(
-            named: entry.sourceName,
-            expectedIdentity: entry.expectedIdentity,
-            in: sourceParentDescriptor
-        ) else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        defer { Darwin.close(sourceDescriptor) }
-        guard let destinationDescriptor = openDirectoryEntry(
-            named: entry.destinationName,
-            expectedIdentity: completion.destinationIdentity,
-            in: destinationParentDescriptor
-        ) else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        defer { Darwin.close(destinationDescriptor) }
-
-        let flags = copyfile_flags_t(COPYFILE_METADATA)
-        guard Darwin.fcopyfile(
-            sourceDescriptor,
-            destinationDescriptor,
-            nil,
-            flags
-        ) == 0 else {
-            throw currentPOSIXError()
-        }
-        try Task.checkCancellation()
-        let destinationIdentity = try createdIdentity(
-            descriptor: destinationDescriptor,
-            expectedMode: S_IFDIR,
-            named: entry.destinationName,
-            in: destinationParentDescriptor
-        )
-        try finishCopiedEntry(
-            entry,
-            destinationIdentity: destinationIdentity,
-            sourceParentDescriptor: sourceParentDescriptor,
-            destinationParentDescriptor: destinationParentDescriptor
-        )
-        return destinationIdentity
-    }
-
-    private func finishCopiedEntry(
-        _ entry: PendingCopyEntry,
-        destinationIdentity: FlashFileBrowserItemIdentity,
-        sourceParentDescriptor: Int32,
-        destinationParentDescriptor: Int32
-    ) throws {
-        guard entryIdentity(named: entry.sourceName, in: sourceParentDescriptor) ==
-                entry.expectedIdentity,
-              entryIdentity(named: entry.destinationName, in: destinationParentDescriptor) ==
-                destinationIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        try runMutationHook(.copyEntryCopied, directory: entry.sourceURL)
-        try Task.checkCancellation()
-        guard entryIdentity(named: entry.sourceName, in: sourceParentDescriptor) ==
-                entry.expectedIdentity,
-              entryIdentity(named: entry.destinationName, in: destinationParentDescriptor) ==
-                destinationIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-    }
-
-    private func copyRegularFile(
-        named sourceName: String,
-        from sourceDescriptor: Int32,
-        expectedIdentity: FlashFileBrowserItemIdentity,
-        to destinationName: String,
-        in destinationDescriptor: Int32
-    ) throws -> FlashFileBrowserItemIdentity {
-        let source = sourceName.withCString {
-            Darwin.openat(
-                sourceDescriptor,
-                $0,
-                O_RDONLY | O_NOFOLLOW | O_RESOLVE_BENEATH | O_CLOEXEC
-            )
-        }
-        guard source >= 0 else { throw currentPOSIXError() }
-        defer { Darwin.close(source) }
-        var sourceMetadata = stat()
-        guard Darwin.fstat(source, &sourceMetadata) == 0,
-              identity(from: sourceMetadata) == expectedIdentity,
-              sourceMetadata.st_mode & S_IFMT == S_IFREG else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-
-        let destination = destinationName.withCString {
-            Darwin.openat(
-                destinationDescriptor,
-                $0,
-                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
-                    O_RESOLVE_BENEATH | O_CLOEXEC,
-                mode_t(0o600)
-            )
-        }
-        guard destination >= 0 else { throw currentPOSIXError() }
-        defer { Darwin.close(destination) }
-        let flags = copyfile_flags_t(COPYFILE_ALL | COPYFILE_DATA_SPARSE)
-        guard Darwin.fcopyfile(source, destination, nil, flags) == 0 else {
-            throw currentPOSIXError()
-        }
-        try Task.checkCancellation()
-        guard Darwin.fstat(source, &sourceMetadata) == 0,
-              identity(from: sourceMetadata) == expectedIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        return try createdIdentity(
-            descriptor: destination,
-            expectedMode: S_IFREG,
-            named: destinationName,
-            in: destinationDescriptor
-        )
-    }
-
-    private func copySymbolicLink(
-        named sourceName: String,
-        from sourceDescriptor: Int32,
-        expectedIdentity: FlashFileBrowserItemIdentity,
-        to destinationName: String,
-        in destinationDescriptor: Int32
-    ) throws -> FlashFileBrowserItemIdentity {
-        let source = sourceName.withCString {
-            Darwin.openat(
-                sourceDescriptor,
-                $0,
-                O_RDONLY | O_SYMLINK | O_RESOLVE_BENEATH | O_CLOEXEC
-            )
-        }
-        guard source >= 0 else { throw currentPOSIXError() }
-        defer { Darwin.close(source) }
-        var sourceMetadata = stat()
-        guard Darwin.fstat(source, &sourceMetadata) == 0,
-              identity(from: sourceMetadata) == expectedIdentity,
-              sourceMetadata.st_mode & S_IFMT == S_IFLNK else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-
-        var target = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
-        let targetLength = target.withUnsafeMutableBufferPointer {
-            Darwin.freadlink(source, $0.baseAddress!, $0.count - 1)
-        }
-        guard targetLength >= 0 else { throw currentPOSIXError() }
-        target[targetLength] = 0
-        let createResult = target.withUnsafeBufferPointer { targetPointer in
-            destinationName.withCString { destination in
-                Darwin.symlinkat(
-                    targetPointer.baseAddress!,
-                    destinationDescriptor,
-                    destination
-                )
-            }
-        }
-        guard createResult == 0 else { throw currentPOSIXError() }
-
-        let destination = destinationName.withCString {
-            Darwin.openat(
-                destinationDescriptor,
-                $0,
-                O_RDONLY | O_SYMLINK | O_RESOLVE_BENEATH | O_CLOEXEC
-            )
-        }
-        guard destination >= 0 else { throw currentPOSIXError() }
-        defer { Darwin.close(destination) }
-        let flags = copyfile_flags_t(COPYFILE_METADATA)
-        guard Darwin.fcopyfile(source, destination, nil, flags) == 0 else {
-            throw currentPOSIXError()
-        }
-        try Task.checkCancellation()
-        guard Darwin.fstat(source, &sourceMetadata) == 0,
-              identity(from: sourceMetadata) == expectedIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        return try createdIdentity(
-            descriptor: destination,
-            expectedMode: S_IFLNK,
-            named: destinationName,
-            in: destinationDescriptor
-        )
-    }
-
-    /// Capture the identity from the descriptor we created, then prove that
-    /// the parent directory still exposes that exact object under its staged
-    /// name. Reading identity from the name alone would accept an object that
-    /// replaced the staged entry after the descriptor-relative copy.
-    private func createdIdentity(
-        descriptor: Int32,
-        expectedMode: mode_t,
-        named name: String,
-        in parentDescriptor: Int32
-    ) throws -> FlashFileBrowserItemIdentity {
-        var metadata = stat()
-        guard Darwin.fstat(descriptor, &metadata) == 0,
-              metadata.st_mode & S_IFMT == expectedMode else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        let createdIdentity = identity(from: metadata)
-        guard entryIdentity(named: name, in: parentDescriptor) == createdIdentity else {
-            throw FlashFileBrowserFileSystemError.cannotPrepareCopy
-        }
-        return createdIdentity
-    }
 }

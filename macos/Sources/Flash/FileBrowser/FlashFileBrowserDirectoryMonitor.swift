@@ -36,10 +36,13 @@ protocol FlashFileBrowserDirectoryMonitoring: AnyObject {
 final class FlashFileBrowserDirectoryMonitor:
     FlashFileBrowserDirectoryMonitoring {
     nonisolated static let defaultDebounceNanoseconds: UInt64 = 500_000_000
+    nonisolated static let initialRebindRetryNanoseconds: UInt64 = 250_000_000
+    nonisolated static let maximumRebindRetryNanoseconds: UInt64 = 5_000_000_000
 
     private let debounceNanoseconds: UInt64
     private var registration: Registration?
     private var debounceTask: Task<Void, Never>?
+    private var rebindRetryTask: Task<Void, Never>?
     private var changeHandler: ChangeHandler?
     private var pendingRebind = false
     private var generation: UInt = 0
@@ -61,6 +64,12 @@ final class FlashFileBrowserDirectoryMonitor:
     /// actually pending before asserting that `stop()` invalidates it.
     var hasPendingDeliveryForTesting: Bool {
         debounceTask != nil
+    }
+
+    /// True after a WatchRoot delivery failed to reopen the lexical path and
+    /// the cancellable backoff loop owns recovery.
+    var hasPendingRebindRetryForTesting: Bool {
+        rebindRetryTask != nil
     }
 
     /// Captures the same directory and generation identity retained by an
@@ -189,14 +198,77 @@ final class FlashFileBrowserDirectoryMonitor:
 
             if self.pendingRebind {
                 self.pendingRebind = false
-                _ = self.reopenCurrentWatch(
+                let didReopen = self.reopenCurrentWatch(
                     directory,
                     generation: eventGeneration
                 )
+                if !didReopen {
+                    self.startRebindRetry(
+                        for: directory,
+                        generation: eventGeneration
+                    )
+                }
             }
 
             self.changeHandler?(directory)
         }
+    }
+
+    /// A watched directory can remain absent beyond the debounce window during
+    /// a remove/recreate operation. Keep retrying the lexical path with capped
+    /// exponential backoff; attempts are silent until a new registration is
+    /// live, at which point the model gets one refresh for changes missed while
+    /// no stream existed.
+    private func startRebindRetry(
+        for directory: URL,
+        generation watchGeneration: UInt
+    ) {
+        guard rebindRetryTask == nil,
+              watchGeneration == generation,
+              directory == watchedDirectory,
+              registration == nil else { return }
+
+        rebindRetryTask = Task { @MainActor [weak self] in
+            var delay = Self.initialRebindRetryNanoseconds
+
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
+
+                guard self?.retryRebind(
+                    directory,
+                    generation: watchGeneration
+                ) == true else { return }
+
+                delay = min(
+                    Self.maximumRebindRetryNanoseconds,
+                    delay &* 2
+                )
+            }
+        }
+    }
+
+    /// Returns true only when the retry loop should continue. The method does
+    /// not retain the monitor across the loop's sleep boundary.
+    private func retryRebind(
+        _ directory: URL,
+        generation watchGeneration: UInt
+    ) -> Bool {
+        guard watchGeneration == generation,
+              directory == watchedDirectory,
+              registration == nil else { return false }
+
+        guard reopenCurrentWatch(
+            directory,
+            generation: watchGeneration
+        ) else { return true }
+
+        rebindRetryTask = nil
+        changeHandler?(directory)
+        return false
     }
 
     @discardableResult
@@ -262,6 +334,8 @@ final class FlashFileBrowserDirectoryMonitor:
         generation &+= 1
         debounceTask?.cancel()
         debounceTask = nil
+        rebindRetryTask?.cancel()
+        rebindRetryTask = nil
         pendingRebind = false
         changeHandler = nil
         watchedDirectory = nil

@@ -33,21 +33,25 @@ struct FlashFileBrowserPresentationInput: Equatable, Sendable {
     var sort: FlashFileBrowserPresentationSort
 }
 
-/// An immutable projection consumed directly by the SwiftUI view. The lookup
-/// tables keep selection resolution proportional to the selected rows instead
-/// of rescanning a 10k-entry directory on every unrelated view update.
+/// An immutable projection consumed directly by the SwiftUI view. The row
+/// lookup keeps selection work proportional to the selected rows instead of
+/// rescanning a 10k-entry directory on every unrelated view update.
 struct FlashFileBrowserPresentationSnapshot: Equatable, Sendable {
     static let empty = Self(
         items: [],
         availableFileTypes: [],
-        itemIDs: [],
         rowByItemID: [:]
     )
 
     let items: [FlashFileBrowserItem]
     let availableFileTypes: [FlashFileBrowserFileType]
-    let itemIDs: [FlashFileBrowserItem.ID]
     let rowByItemID: [FlashFileBrowserItem.ID: Int]
+
+    func reconciledSelection(
+        _ selectedIDs: Set<FlashFileBrowserItem.ID>
+    ) -> Set<FlashFileBrowserItem.ID> {
+        Set(selectedIDs.lazy.filter { rowByItemID[$0] != nil })
+    }
 
     func resolveSelection(
         _ selectedIDs: Set<FlashFileBrowserItem.ID>
@@ -75,21 +79,28 @@ struct FlashFileBrowserPresentationProjection: Sendable {
 /// Pure, Sendable projection suitable for detached execution and unit tests.
 enum FlashFileBrowserPresentationProjector {
     static func project(
-        _ input: FlashFileBrowserPresentationInput
+        _ input: FlashFileBrowserPresentationInput,
+        fileTypeResolver: (FlashFileBrowserItem) -> FlashFileBrowserFileType? = {
+            FlashFileBrowserTypeFilter.fileType(for: $0)
+        }
     ) -> FlashFileBrowserPresentationProjection {
         var availableTypes = input.selectedTypes
         var visibleItems: [FlashFileBrowserItem] = []
         visibleItems.reserveCapacity(input.items.count)
         let normalizedQuery = FlashFileBrowserTypeFilter.normalizedQuery(input.query)
+        var sourceVisitCount = 0
 
         for item in input.items {
-            if let type = FlashFileBrowserTypeFilter.fileType(for: item) {
-                availableTypes.insert(type)
+            sourceVisitCount += 1
+            let fileType = fileTypeResolver(item)
+            if let fileType {
+                availableTypes.insert(fileType)
             }
             if FlashFileBrowserTypeFilter.isVisible(
                 item,
                 normalizedQuery: normalizedQuery,
                 selectedTypes: input.selectedTypes,
+                resolvedFileType: fileType,
                 revealing: input.revealedItemID
             ) {
                 visibleItems.append(item)
@@ -100,12 +111,9 @@ enum FlashFileBrowserPresentationProjector {
             isOrderedBefore(lhs, rhs, using: input.sort)
         }
 
-        var itemIDs: [FlashFileBrowserItem.ID] = []
         var rowByItemID: [FlashFileBrowserItem.ID: Int] = [:]
-        itemIDs.reserveCapacity(visibleItems.count)
         rowByItemID.reserveCapacity(visibleItems.count)
         for (row, item) in visibleItems.enumerated() {
-            itemIDs.append(item.id)
             rowByItemID[item.id] = row
         }
 
@@ -113,10 +121,9 @@ enum FlashFileBrowserPresentationProjector {
             snapshot: .init(
                 items: visibleItems,
                 availableFileTypes: availableTypes.sorted(),
-                itemIDs: itemIDs,
                 rowByItemID: rowByItemID
             ),
-            sourceVisitCount: input.items.count
+            sourceVisitCount: sourceVisitCount
         )
     }
 
@@ -203,7 +210,12 @@ actor FlashFileBrowserPresentationWorker {
 /// immediately. All expensive work runs outside the main actor.
 @MainActor
 final class FlashFileBrowserPresentationStore: ObservableObject {
-    @Published private(set) var snapshot = FlashFileBrowserPresentationSnapshot.empty
+    /// Keep the 10k-row payload out of SwiftUI's change-comparison path. Views
+    /// observe the scalar revision and read this immutable snapshot on demand.
+    private(set) var snapshot = FlashFileBrowserPresentationSnapshot.empty {
+        didSet { snapshotRevision &+= 1 }
+    }
+    @Published private(set) var snapshotRevision: UInt = 0
     private(set) var projectionStartCount = 0
     /// Diagnostic evidence for the one-replaceable-pending invariant.
     var pendingProjectionCount: Int { pendingProjection == nil ? 0 : 1 }
@@ -244,7 +256,7 @@ final class FlashFileBrowserPresentationStore: ObservableObject {
         let directoryPath = normalizedDirectoryPath(directory)
         if input.directoryPath != directoryPath {
             input.revealedItemID = nil
-            snapshot = .empty
+            clearSnapshotIfNeeded()
         }
         input.items = items
         input.directoryPath = directoryPath
@@ -260,7 +272,7 @@ final class FlashFileBrowserPresentationStore: ObservableObject {
         input.directoryPath = directoryPath
         input.items = []
         input.revealedItemID = nil
-        snapshot = .empty
+        clearSnapshotIfNeeded()
         scheduleImmediateProjection()
     }
 
@@ -299,7 +311,7 @@ final class FlashFileBrowserPresentationStore: ObservableObject {
     ) async -> FlashFileBrowserPresentationSnapshot? {
         let directoryPath = normalizedDirectoryPath(directory)
         if input.directoryPath != directoryPath {
-            snapshot = .empty
+            clearSnapshotIfNeeded()
         }
         input.items = items
         input.directoryPath = directoryPath
@@ -326,6 +338,11 @@ final class FlashFileBrowserPresentationStore: ObservableObject {
 
     private func normalizedDirectoryPath(_ directory: URL?) -> String? {
         directory.map { FlashFileBrowserPathPolicy.standardized($0).path }
+    }
+
+    private func clearSnapshotIfNeeded() {
+        guard snapshot != .empty else { return }
+        snapshot = .empty
     }
 
     private func scheduleImmediateProjection() {

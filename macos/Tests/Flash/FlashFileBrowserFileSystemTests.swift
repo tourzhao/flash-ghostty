@@ -6,6 +6,37 @@ import Testing
 @Suite
 struct FlashFileBrowserFileSystemTests {
     @Test
+    func repeatedDescriptorEnumerationStartsAtTheBeginning() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try makeFile(named: "first.txt", contents: "first", in: root)
+        let path = FileManager.default.fileSystemRepresentation(withPath: root.path)
+        let descriptor = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw FlashFileBrowserDescriptorIO.currentPOSIXError()
+        }
+        defer { Darwin.close(descriptor) }
+
+        var firstScan: [String] = []
+        try FlashFileBrowserDescriptorIO.forEachDirectoryEntry(in: descriptor) {
+            firstScan.append($0)
+        }
+        var secondScan: [String] = []
+        try FlashFileBrowserDescriptorIO.forEachDirectoryEntry(in: descriptor) {
+            secondScan.append($0)
+        }
+        _ = try makeFile(named: "second.txt", contents: "second", in: root)
+        var thirdScan: [String] = []
+        try FlashFileBrowserDescriptorIO.forEachDirectoryEntry(in: descriptor) {
+            thirdScan.append($0)
+        }
+
+        #expect(Set(firstScan) == ["first.txt"])
+        #expect(Set(secondScan) == ["first.txt"])
+        #expect(Set(thirdScan) == ["first.txt", "second.txt"])
+    }
+
+    @Test
     func contentsReadsItemsAndTreatsPackagesAsFiles() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -98,6 +129,10 @@ struct FlashFileBrowserFileSystemTests {
         )
         let names = Set(items.map(\.name))
 
+        // Keep the unit test deterministic under loaded CI and endpoint
+        // security software. Processing a real 10k directory still exercises
+        // the large-input path; wall-clock budgets require a dedicated
+        // benchmark where the runner class and warmup are controlled.
         #expect(items.count == entryCount)
         #expect(names.count == entryCount)
         #expect(names.contains("entry-0.txt"))
@@ -252,6 +287,374 @@ struct FlashFileBrowserFileSystemTests {
         )
         #expect(FileManager.default.fileExists(atPath: created.path, isDirectory: &isDirectory))
         #expect(isDirectory.boolValue)
+        #expect(
+            Set(try FileManager.default.contentsOfDirectory(atPath: root.path)) ==
+                ["New Folder"]
+        )
+        #expect(try FileManager.default.contentsOfDirectory(atPath: created.path).isEmpty)
+    }
+
+    @Test
+    func createPreservesAnEntryThatAlreadyOwnsTheFinalName() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requestedName = "New Folder"
+        let markerName = "installed-by-another-process.txt"
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, destination in
+                guard case .folderCreationReady = checkpoint else { return }
+                try FileManager.default.createDirectory(
+                    at: destination,
+                    withIntermediateDirectories: false
+                )
+                try Data("preserve".utf8).write(
+                    to: destination.appendingPathComponent(markerName)
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemAlreadyExists(requestedName)) {
+            _ = try await fileSystem.createFolder(
+                named: requestedName,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        try #expect(String(
+            contentsOf: root
+                .appendingPathComponent(requestedName)
+                .appendingPathComponent(markerName),
+            encoding: .utf8
+        ) == "preserve")
+        #expect(
+            Set(try FileManager.default.contentsOfDirectory(atPath: root.path)) ==
+                [requestedName]
+        )
+    }
+
+    @Test
+    func createRejectsAStagingReplacementBeforeDescriptorPinning() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archivedStaging = root.appendingPathComponent(
+            "Archived staged folder",
+            isDirectory: true
+        )
+        let recorder = LockedURLRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, stagedFolder in
+                guard case .folderStagingIdentityCaptured = checkpoint else { return }
+                recorder.append(stagedFolder)
+                try FileManager.default.moveItem(
+                    at: stagedFolder,
+                    to: archivedStaging
+                )
+                try FileManager.default.createDirectory(
+                    at: stagedFolder,
+                    withIntermediateDirectories: false
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            _ = try await fileSystem.createFolder(
+                named: "New Folder",
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        let stagedFolder = try #require(recorder.urls.first)
+        #expect(FileManager.default.fileExists(atPath: archivedStaging.path))
+        #expect(FileManager.default.fileExists(atPath: stagedFolder.path))
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("New Folder").path
+        ))
+    }
+
+    @Test
+    func createRejectsAStagingReplacementAfterDescriptorPinning() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archivedStaging = root.appendingPathComponent(
+            "Pinned staged folder",
+            isDirectory: true
+        )
+        let recorder = LockedURLRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, stagedFolder in
+                guard case .folderStaged = checkpoint else { return }
+                recorder.append(stagedFolder)
+                try FileManager.default.moveItem(
+                    at: stagedFolder,
+                    to: archivedStaging
+                )
+                try FileManager.default.createDirectory(
+                    at: stagedFolder,
+                    withIntermediateDirectories: false
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            _ = try await fileSystem.createFolder(
+                named: "New Folder",
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        let stagedFolder = try #require(recorder.urls.first)
+        #expect(FileManager.default.fileExists(atPath: archivedStaging.path))
+        #expect(FileManager.default.fileExists(atPath: stagedFolder.path))
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("New Folder").path
+        ))
+    }
+
+    @Test
+    func createRejectsASourceSwapImmediatelyBeforePromotion() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requestedName = "New Folder"
+        let markerName = "replacement-marker.txt"
+        let archivedStaging = root.appendingPathComponent(
+            "Original staged folder",
+            isDirectory: true
+        )
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, stagedFolder in
+                guard case .folderPromotionReady = checkpoint else { return }
+                try FileManager.default.moveItem(
+                    at: stagedFolder,
+                    to: archivedStaging
+                )
+                try FileManager.default.createDirectory(
+                    at: stagedFolder,
+                    withIntermediateDirectories: false
+                )
+                try Data("preserve".utf8).write(
+                    to: stagedFolder.appendingPathComponent(markerName)
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            _ = try await fileSystem.createFolder(
+                named: requestedName,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        let replacement = root.appendingPathComponent(
+            requestedName,
+            isDirectory: true
+        )
+        #expect(FileManager.default.fileExists(atPath: archivedStaging.path))
+        try #expect(String(
+            contentsOf: replacement.appendingPathComponent(markerName),
+            encoding: .utf8
+        ) == "preserve")
+    }
+
+    @Test
+    func createExclusivePromotionPreservesFinalNameInstalledAfterStaging() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requestedName = "New Folder"
+        let markerName = "unknown-marker.txt"
+        let stagingRecorder = LockedURLRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, stagedFolder in
+                guard case .folderPromotionReady = checkpoint else { return }
+                stagingRecorder.append(stagedFolder)
+                let destination = root.appendingPathComponent(
+                    requestedName,
+                    isDirectory: true
+                )
+                try FileManager.default.createDirectory(
+                    at: destination,
+                    withIntermediateDirectories: false
+                )
+                try Data("preserve".utf8).write(
+                    to: destination.appendingPathComponent(markerName)
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemAlreadyExists(requestedName)) {
+            _ = try await fileSystem.createFolder(
+                named: requestedName,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        let stagedFolder = try #require(stagingRecorder.urls.first)
+        #expect(FileManager.default.fileExists(atPath: stagedFolder.path))
+        try #expect(
+            String(
+                contentsOf: root
+                    .appendingPathComponent(requestedName)
+                    .appendingPathComponent(markerName),
+                encoding: .utf8
+            ) == "preserve"
+        )
+    }
+
+    @Test
+    func createRejectsContentInjectedAfterPromotionWithoutDeletingIt() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requestedName = "New Folder"
+        let markerName = "concurrent-marker.txt"
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, created in
+                guard case .folderPromoted = checkpoint else { return }
+                try Data("preserve".utf8).write(
+                    to: created.appendingPathComponent(markerName)
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            _ = try await fileSystem.createFolder(
+                named: requestedName,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        let preservedFolder = root.appendingPathComponent(
+            requestedName,
+            isDirectory: true
+        )
+        #expect(FileManager.default.fileExists(atPath: preservedFolder.path))
+        try #expect(String(
+            contentsOf: preservedFolder.appendingPathComponent(markerName),
+            encoding: .utf8
+        ) == "preserve")
+        #expect(
+            Set(try FileManager.default.contentsOfDirectory(atPath: root.path)) ==
+                [requestedName]
+        )
+    }
+
+    @Test
+    func createRejectsAReplacementInstalledAfterCommitWithoutDeletingIt() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archivedCreatedName = "Created by FLASH"
+        let requestedName = "New Folder"
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, created in
+                guard case .folderPromoted = checkpoint else { return }
+
+                let archivedCreated = root.appendingPathComponent(
+                    archivedCreatedName,
+                    isDirectory: true
+                )
+                try FileManager.default.moveItem(
+                    at: created,
+                    to: archivedCreated
+                )
+                try FileManager.default.createDirectory(
+                    at: created,
+                    withIntermediateDirectories: false
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            _ = try await fileSystem.createFolder(
+                named: requestedName,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        // The exclusive rename committed before the concurrent replacement.
+        // The pinned descriptor detects that its object left the requested
+        // name. No pathname rollback runs, so the unknown entry stays put.
+        var isDirectory = ObjCBool(false)
+        #expect(FileManager.default.fileExists(
+            atPath: root
+                .appendingPathComponent(archivedCreatedName)
+                .path,
+            isDirectory: &isDirectory
+        ))
+        #expect(isDirectory.boolValue)
+        isDirectory = false
+        #expect(FileManager.default.fileExists(
+            atPath: root
+                .appendingPathComponent(requestedName)
+                .path,
+            isDirectory: &isDirectory
+        ))
+        #expect(isDirectory.boolValue)
+        let rootEntries = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        #expect(!rootEntries.contains {
+            $0.hasPrefix(".flash-ghostty-folder-")
+        })
+    }
+
+    @Test
+    func createRejectsASymlinkInstalledAfterCommitWithoutFollowingIt() async throws {
+        let root = try makeTemporaryDirectory()
+        let outside = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let requestedName = "New Folder"
+        let archivedCreated = root.appendingPathComponent(
+            "Created by FLASH",
+            isDirectory: true
+        )
+        let sentinel = try makeFile(
+            named: "must-stay.txt",
+            contents: "outside",
+            in: outside
+        )
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, created in
+                guard case .folderPromoted = checkpoint else { return }
+                try FileManager.default.moveItem(
+                    at: created,
+                    to: archivedCreated
+                )
+                try FileManager.default.createSymbolicLink(
+                    at: created,
+                    withDestinationURL: outside
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            _ = try await fileSystem.createFolder(
+                named: requestedName,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        #expect(FileManager.default.fileExists(atPath: archivedCreated.path))
+        #expect(
+            try FileManager.default.destinationOfSymbolicLink(
+                atPath: root.appendingPathComponent(requestedName).path
+            ) == outside.path
+        )
+        try #expect(String(contentsOf: sentinel, encoding: .utf8) == "outside")
+        #expect(
+            Set(try FileManager.default.contentsOfDirectory(atPath: outside.path)) ==
+                [sentinel.lastPathComponent]
+        )
+        let rootEntries = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        #expect(!rootEntries.contains {
+            $0.hasPrefix(".flash-ghostty-folder-")
+        })
     }
 
     @Test
@@ -333,6 +736,83 @@ struct FlashFileBrowserFileSystemTests {
         ])
         try #expect(String(contentsOf: original, encoding: .utf8) == "preserved")
         try #expect(String(contentsOf: hardLink, encoding: .utf8) == "preserved")
+    }
+
+    @Test
+    func renameRejectsSourceReplacedAfterValidationWithoutMovingIt() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = try makeFile(
+            named: "before.txt",
+            contents: "original",
+            in: root
+        )
+        let originalIdentity = try itemIdentity(at: original)
+        let archived = root.appendingPathComponent("archived-before.txt")
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, _ in
+                guard case .itemValidated = checkpoint else { return }
+                try FileManager.default.moveItem(at: original, to: archived)
+                _ = try makeFile(
+                    named: original.lastPathComponent,
+                    contents: "replacement",
+                    in: root
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            _ = try await fileSystem.rename(
+                original,
+                expectedIdentity: originalIdentity,
+                to: "after.txt",
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("after.txt").path
+        ))
+        try #expect(String(contentsOf: archived, encoding: .utf8) == "original")
+        try #expect(String(contentsOf: original, encoding: .utf8) == "replacement")
+    }
+
+    @Test
+    func renameExclusiveCommitPreservesDestinationInstalledAfterValidation() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = try makeFile(
+            named: "before.txt",
+            contents: "original",
+            in: root
+        )
+        let destination = root.appendingPathComponent("after.txt")
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, _ in
+                guard case .itemValidated = checkpoint else { return }
+                _ = try makeFile(
+                    named: destination.lastPathComponent,
+                    contents: "unknown destination",
+                    in: root
+                )
+            }
+        )
+
+        await expectFileSystemError(.itemAlreadyExists(destination.lastPathComponent)) {
+            _ = try await fileSystem.rename(
+                original,
+                expectedIdentity: try itemIdentity(at: original),
+                to: destination.lastPathComponent,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        try #expect(String(contentsOf: original, encoding: .utf8) == "original")
+        try #expect(
+            String(contentsOf: destination, encoding: .utf8) == "unknown destination"
+        )
     }
 
     @Test
@@ -820,6 +1300,45 @@ struct FlashFileBrowserFileSystemTests {
     }
 
     @Test
+    func moveToTrashRejectsSourceReplacedAfterValidation() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = try makeFile(
+            named: "trash-me.txt",
+            contents: "original",
+            in: root
+        )
+        let originalIdentity = try itemIdentity(at: original)
+        let archived = root.appendingPathComponent("archived-trash-me.txt")
+        let recorder = LockedURLRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, _ in
+                guard case .itemValidated = checkpoint else { return }
+                try FileManager.default.moveItem(at: original, to: archived)
+                _ = try makeFile(
+                    named: original.lastPathComponent,
+                    contents: "replacement",
+                    in: root
+                )
+            },
+            trashHandler: { recorder.append($0) }
+        )
+
+        await expectFileSystemError(.itemIsNotCurrent) {
+            try await fileSystem.moveToTrash(
+                original,
+                expectedIdentity: originalIdentity,
+                in: root,
+                allowedRoot: root
+            )
+        }
+
+        #expect(recorder.urls.isEmpty)
+        try #expect(String(contentsOf: archived, encoding: .utf8) == "original")
+        try #expect(String(contentsOf: original, encoding: .utf8) == "replacement")
+    }
+
+    @Test
     func moveToTrashUsesAnchoredSameVolumeDirectory() async throws {
         let container = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: container) }
@@ -920,7 +1439,96 @@ struct FlashFileBrowserFileSystemTests {
         try #expect(String(contentsOf: secondCopy, encoding: .utf8) == "incoming")
         try #expect(String(contentsOf: source, encoding: .utf8) == "incoming")
         let remainingNames = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!remainingNames.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        #expect(!remainingNames.contains { $0.hasPrefix("FLASH Incomplete Copy ") })
+    }
+
+    @Test
+    func copyPostCommitFailurePreservesFinalReplacementWithoutPathCleanup() async throws {
+        let root = try makeTemporaryDirectory()
+        let outside = try makeTemporaryDirectory()
+        let source = try makeFile(
+            named: "source.txt",
+            contents: "intended",
+            in: outside
+        )
+        let archived = root.appendingPathComponent("committed-source.txt")
+        let destination = root.appendingPathComponent(source.lastPathComponent)
+        defer {
+            try? setFileFlags(0, at: source)
+            clearFileFlagsOfImmediateChildren(in: root)
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let protectedFlags = UInt32(UF_HIDDEN) | UInt32(UF_IMMUTABLE)
+        try setFileFlags(protectedFlags, at: source)
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, promoted in
+                guard case .copyPromoted = checkpoint else { return }
+                try FileManager.default.moveItem(at: promoted, to: archived)
+                try Data("unknown final".utf8).write(to: promoted)
+            }
+        )
+
+        await expectFileSystemError(.cannotPrepareCopy) {
+            _ = try await fileSystem.copyItem(source, to: root, allowedRoot: root)
+        }
+
+        try #expect(String(contentsOf: archived, encoding: .utf8) == "intended")
+        try #expect(
+            String(
+                contentsOf: destination,
+                encoding: .utf8
+            ) == "unknown final"
+        )
+        #expect((try fileFlags(at: archived) & protectedFlags) == 0)
+        #expect((try fileFlags(at: destination) & protectedFlags) == 0)
+        let remainingNames = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        #expect(!remainingNames.contains { $0.hasPrefix("FLASH Incomplete Copy ") })
+    }
+
+    @Test
+    func copyFinalNameRacePreservesDestinationAndVisibleStaging() async throws {
+        let root = try makeTemporaryDirectory()
+        let outside = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let source = try makeFile(
+            named: "source.txt",
+            contents: "intended",
+            in: outside
+        )
+        let destination = root.appendingPathComponent(source.lastPathComponent)
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, _ in
+                guard case .stagedCopyReady = checkpoint else { return }
+                try Data("unknown final".utf8).write(to: destination)
+            }
+        )
+
+        await expectFileSystemError(.itemAlreadyExists(source.lastPathComponent)) {
+            _ = try await fileSystem.copyItem(source, to: root, allowedRoot: root)
+        }
+
+        try #expect(String(contentsOf: destination, encoding: .utf8) == "unknown final")
+        let staged = try onlyIncompleteCopy(in: root)
+        try #expect(String(contentsOf: staged, encoding: .utf8) == "intended")
+        #expect(staged.lastPathComponent.hasSuffix(" - source.txt"))
+        let stagedItem = try #require(
+            try await fileSystem.contents(
+                of: root,
+                showingHiddenFiles: false,
+                allowedRoot: root
+            ).first { $0.name == staged.lastPathComponent }
+        )
+        let textType = FlashFileBrowserFileType(fileExtension: "txt")
+        #expect(FlashFileBrowserTypeFilter.fileType(for: stagedItem) == textType)
+        #expect(FlashFileBrowserTypeFilter.visibleItems(
+            in: [stagedItem],
+            query: "source.txt",
+            selectedTypes: [textType]
+        ) == [stagedItem])
     }
 
     @Test
@@ -958,7 +1566,7 @@ struct FlashFileBrowserFileSystemTests {
     }
 
     @Test
-    func cancellingRecursiveCopyCleansStagingWithoutPromoting() async throws {
+    func cancellingRecursiveCopyPreservesStagingWithoutPromoting() async throws {
         let root = try makeTemporaryDirectory()
         let outside = try makeTemporaryDirectory()
         defer {
@@ -1003,7 +1611,16 @@ struct FlashFileBrowserFileSystemTests {
             atPath: root.path
         )
         #expect(!remainingNames.contains(source.lastPathComponent))
-        #expect(!remainingNames.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        let staging = try onlyIncompleteCopy(in: root)
+        let stagedPayload = staging
+            .appendingPathComponent("payload.txt")
+        try #expect(String(contentsOf: stagedPayload, encoding: .utf8) == "payload")
+        let visibleItems = try await fileSystem.contents(
+            of: root,
+            showingHiddenFiles: false,
+            allowedRoot: root
+        )
+        #expect(visibleItems.contains { $0.name == staging.lastPathComponent })
     }
 
     @Test
@@ -1083,6 +1700,87 @@ struct FlashFileBrowserFileSystemTests {
     }
 
     @Test
+    func copyDefersHiddenDirectoryMetadataUntilAfterPromotion() async throws {
+        let root = try makeTemporaryDirectory()
+        let outside = try makeTemporaryDirectory()
+        let source = try makeDirectory(named: "Hidden", in: outside)
+        _ = try makeFile(named: "payload.txt", contents: "payload", in: source)
+        let expectedDestination = root.appendingPathComponent(source.lastPathComponent)
+        defer {
+            try? setFileFlags(0, at: source)
+            try? setFileFlags(0, at: expectedDestination)
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try setFileFlags(UInt32(UF_HIDDEN), at: source)
+        let stagedWasHidden = LockedBoolRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, _ in
+                guard case .stagedCopyReady = checkpoint else { return }
+                let staged = try onlyIncompleteCopy(in: root)
+                let flags = try fileFlags(at: staged)
+                stagedWasHidden.set(flags & UInt32(UF_HIDDEN) != 0)
+            }
+        )
+
+        let copied = try await fileSystem.copyItem(
+            source,
+            to: root,
+            allowedRoot: root
+        )
+
+        #expect(!stagedWasHidden.value)
+        #expect((try fileFlags(at: copied) & UInt32(UF_HIDDEN)) != 0)
+        try #expect(
+            String(
+                contentsOf: copied.appendingPathComponent("payload.txt"),
+                encoding: .utf8
+            ) == "payload"
+        )
+        let remainingNames = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        #expect(!remainingNames.contains { $0.hasPrefix("FLASH Incomplete Copy ") })
+    }
+
+    @Test
+    func copyDefersImmutableFileMetadataUntilAfterPromotion() async throws {
+        let root = try makeTemporaryDirectory()
+        let outside = try makeTemporaryDirectory()
+        let source = try makeFile(
+            named: "immutable.txt",
+            contents: "immutable",
+            in: outside
+        )
+        let expectedDestination = root.appendingPathComponent(source.lastPathComponent)
+        defer {
+            try? setFileFlags(0, at: source)
+            clearFileFlagsOfImmediateChildren(in: root)
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try setFileFlags(UInt32(UF_IMMUTABLE), at: source)
+        let stagedWasImmutable = LockedBoolRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, _ in
+                guard case .stagedCopyReady = checkpoint else { return }
+                let staged = try onlyIncompleteCopy(in: root)
+                let flags = try fileFlags(at: staged)
+                stagedWasImmutable.set(flags & UInt32(UF_IMMUTABLE) != 0)
+            }
+        )
+
+        let copied = try await fileSystem.copyItem(
+            source,
+            to: root,
+            allowedRoot: root
+        )
+
+        #expect(copied == expectedDestination.standardizedFileURL)
+        #expect(!stagedWasImmutable.value)
+        #expect((try fileFlags(at: copied) & UInt32(UF_IMMUTABLE)) != 0)
+        try #expect(String(contentsOf: copied, encoding: .utf8) == "immutable")
+    }
+
+    @Test
     func copyUsesAnchoredSourceDuringAncestorSwapReturn() async throws {
         let container = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: container) }
@@ -1128,7 +1826,7 @@ struct FlashFileBrowserFileSystemTests {
     }
 
     @Test
-    func copyUsesAnchoredStagingDirectoryDuringSwapReturn() async throws {
+    func copyDoesNotOverwriteStagingNameClaimedBeforeCopy() async throws {
         let root = try makeTemporaryDirectory()
         let outside = try makeTemporaryDirectory()
         defer {
@@ -1136,38 +1834,64 @@ struct FlashFileBrowserFileSystemTests {
             try? FileManager.default.removeItem(at: outside)
         }
         let source = try makeFile(named: "source.txt", contents: "source", in: outside)
-        let leakRecorder = LockedBoolRecorder()
+        let stagedURLRecorder = LockedURLRecorder()
         let fileSystem = LocalFlashFileBrowserFileSystem(
-            mutationHook: { checkpoint, temporary in
-                let archived = temporary.deletingLastPathComponent()
-                    .appendingPathComponent(".archived-copy-stage")
-                switch checkpoint {
-                case .copyDestinationOpened:
-                    try FileManager.default.moveItem(at: temporary, to: archived)
-                    try FileManager.default.createDirectory(
-                        at: temporary,
-                        withIntermediateDirectories: false
-                    )
-                case .copyDestinationFinished:
-                    leakRecorder.set(FileManager.default.fileExists(
-                        atPath: temporary.appendingPathComponent("source.txt").path
-                    ))
-                    try FileManager.default.removeItem(at: temporary)
-                    try FileManager.default.moveItem(at: archived, to: temporary)
-                default:
-                    break
-                }
+            mutationHook: { checkpoint, stagedURL in
+                guard case .copyDestinationOpened = checkpoint else { return }
+                stagedURLRecorder.append(stagedURL)
+                try Data("unknown staging entry".utf8).write(to: stagedURL)
             }
         )
 
-        let copied = try await fileSystem.copyItem(
-            source,
-            to: root,
-            allowedRoot: root
+        await expectFileSystemError(.cannotPrepareCopy) {
+            _ = try await fileSystem.copyItem(source, to: root, allowedRoot: root)
+        }
+
+        let stagedURL = try #require(stagedURLRecorder.urls.first)
+        #expect(stagedURL.lastPathComponent.hasPrefix("FLASH Incomplete Copy "))
+        #expect(stagedURL.lastPathComponent.hasSuffix(" - source.txt"))
+        try #expect(
+            String(contentsOf: stagedURL, encoding: .utf8) == "unknown staging entry"
+        )
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(source.lastPathComponent).path
+        ))
+    }
+
+    @Test
+    func incompleteCopyNameRespectsNameMaxAtUnicodeBoundaries() async throws {
+        let root = try makeTemporaryDirectory()
+        let outside = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let sourceName = String(repeating: "界", count: 60) +
+            String(repeating: "🙂", count: 10) + ".txt"
+        let source = try makeFile(named: sourceName, contents: "source", in: outside)
+        let stagedURLRecorder = LockedURLRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            mutationHook: { checkpoint, stagedURL in
+                guard case .copyDestinationOpened = checkpoint else { return }
+                stagedURLRecorder.append(stagedURL)
+                try Data("preserve".utf8).write(to: stagedURL)
+            }
         )
 
-        try #expect(String(contentsOf: copied, encoding: .utf8) == "source")
-        #expect(!leakRecorder.value)
+        await expectFileSystemError(.cannotPrepareCopy) {
+            _ = try await fileSystem.copyItem(source, to: root, allowedRoot: root)
+        }
+
+        let stagedURL = try #require(stagedURLRecorder.urls.first)
+        let nameMaximum = root.path.withCString {
+            Darwin.pathconf($0, _PC_NAME_MAX)
+        }
+        #expect(nameMaximum > 0)
+        #expect(stagedURL.lastPathComponent.utf8.count <= nameMaximum)
+        #expect(stagedURL.lastPathComponent.hasPrefix("FLASH Incomplete Copy "))
+        #expect(stagedURL.lastPathComponent.hasSuffix(".txt"))
+        #expect(!stagedURL.lastPathComponent.hasSuffix(" - \(sourceName)"))
+        try #expect(String(contentsOf: stagedURL, encoding: .utf8) == "preserve")
     }
 
     @Test
@@ -1187,13 +1911,7 @@ struct FlashFileBrowserFileSystemTests {
                       !didReplace.value else {
                     return
                 }
-                let stagingName = try #require(
-                    FileManager.default.contentsOfDirectory(atPath: root.path)
-                        .first { $0.hasPrefix(".flash-ghostty-copy-") }
-                )
-                let stagedItem = root
-                    .appendingPathComponent(stagingName, isDirectory: true)
-                    .appendingPathComponent(source.lastPathComponent)
+                let stagedItem = try onlyIncompleteCopy(in: root)
                 try FileManager.default.removeItem(at: stagedItem)
                 try "replacement".write(
                     to: stagedItem,
@@ -1212,8 +1930,10 @@ struct FlashFileBrowserFileSystemTests {
         #expect(!FileManager.default.fileExists(
             atPath: root.appendingPathComponent(source.lastPathComponent).path
         ))
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!names.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        let stagedReplacement = try onlyIncompleteCopy(in: root)
+        try #expect(
+            String(contentsOf: stagedReplacement, encoding: .utf8) == "replacement"
+        )
     }
 
     @Test
@@ -1233,17 +1953,14 @@ struct FlashFileBrowserFileSystemTests {
                       !didReplace.value else {
                     return
                 }
-                let stagingName = try #require(
-                    FileManager.default.contentsOfDirectory(atPath: root.path)
-                        .first { $0.hasPrefix(".flash-ghostty-copy-") }
-                )
-                let stagedItem = root
-                    .appendingPathComponent(stagingName, isDirectory: true)
-                    .appendingPathComponent(source.lastPathComponent, isDirectory: true)
+                let stagedItem = try onlyIncompleteCopy(in: root)
                 try FileManager.default.removeItem(at: stagedItem)
                 try FileManager.default.createDirectory(
                     at: stagedItem,
                     withIntermediateDirectories: false
+                )
+                try Data("unknown replacement".utf8).write(
+                    to: stagedItem.appendingPathComponent("unknown.txt")
                 )
                 didReplace.set(true)
             }
@@ -1257,8 +1974,19 @@ struct FlashFileBrowserFileSystemTests {
         #expect(!FileManager.default.fileExists(
             atPath: root.appendingPathComponent(source.lastPathComponent).path
         ))
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!names.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        let stagedReplacement = try onlyIncompleteCopy(in: root)
+        var isDirectory = ObjCBool(false)
+        #expect(FileManager.default.fileExists(
+            atPath: stagedReplacement.path,
+            isDirectory: &isDirectory
+        ))
+        #expect(isDirectory.boolValue)
+        try #expect(
+            String(
+                contentsOf: stagedReplacement.appendingPathComponent("unknown.txt"),
+                encoding: .utf8
+            ) == "unknown replacement"
+        )
     }
 
     @Test
@@ -1285,13 +2013,7 @@ struct FlashFileBrowserFileSystemTests {
                       !didReplace.value else {
                     return
                 }
-                let stagingName = try #require(
-                    FileManager.default.contentsOfDirectory(atPath: root.path)
-                        .first { $0.hasPrefix(".flash-ghostty-copy-") }
-                )
-                let stagedItem = root
-                    .appendingPathComponent(stagingName, isDirectory: true)
-                    .appendingPathComponent(source.lastPathComponent)
+                let stagedItem = try onlyIncompleteCopy(in: root)
                 try FileManager.default.removeItem(at: stagedItem)
                 try FileManager.default.createSymbolicLink(
                     at: stagedItem,
@@ -1309,12 +2031,16 @@ struct FlashFileBrowserFileSystemTests {
         #expect(!FileManager.default.fileExists(
             atPath: root.appendingPathComponent(source.lastPathComponent).path
         ))
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!names.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        let stagedReplacement = try onlyIncompleteCopy(in: root)
+        #expect(
+            try FileManager.default.destinationOfSymbolicLink(
+                atPath: stagedReplacement.path
+            ) == replacementTarget.path
+        )
     }
 
     @Test
-    func partialDescriptorCopyFailureCleansAnchoredStaging() async throws {
+    func partialDescriptorCopyFailurePreservesVisibleSiblingStaging() async throws {
         let root = try makeTemporaryDirectory()
         let outside = try makeTemporaryDirectory()
         defer {
@@ -1343,13 +2069,16 @@ struct FlashFileBrowserFileSystemTests {
             Issue.record("Unexpected error: \(error)")
         }
 
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!names.contains("Sources"))
-        #expect(!names.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("Sources").path
+        ))
+        let stagedFailure = try onlyIncompleteCopy(in: root)
+            .appendingPathComponent("fail-after.txt")
+        try #expect(String(contentsOf: stagedFailure, encoding: .utf8) == "second")
     }
 
     @Test
-    func copyCleanupTraversesTheTemporaryWrapperAtMaximumDepth() async throws {
+    func failedMaximumDepthCopyPreservesInjectedStagingContent() async throws {
         let root = try makeTemporaryDirectory()
         let outside = try makeTemporaryDirectory()
         defer {
@@ -1374,23 +2103,13 @@ struct FlashFileBrowserFileSystemTests {
                       copiedSource.standardizedFileURL.path ==
                         deepestSourceURL.standardizedFileURL.path else { return }
 
-                let stagingName = try #require(
-                    FileManager.default.contentsOfDirectory(atPath: root.path)
-                        .first { $0.hasPrefix(".flash-ghostty-copy-") }
-                )
-                var stagedDeepest = root
-                    .appendingPathComponent(stagingName, isDirectory: true)
-                    .appendingPathComponent(
-                        source.lastPathComponent,
-                        isDirectory: true
-                    )
+                var stagedDeepest = try onlyIncompleteCopy(in: root)
                 for _ in 1..<maximumCopyDepth {
                     stagedDeepest.appendPathComponent("d", isDirectory: true)
                 }
 
                 // Simulate a late same-user mutation inside the app-owned
-                // deepest directory, then fail so deferred cleanup must walk
-                // through both the copy tree and its temporary wrapper.
+                // deepest directory. Failed-copy cleanup must preserve it.
                 try Data("injected".utf8).write(
                     to: stagedDeepest.appendingPathComponent("injected.txt")
                 )
@@ -1411,11 +2130,20 @@ struct FlashFileBrowserFileSystemTests {
             atPath: root.path
         )
         #expect(!remainingNames.contains(source.lastPathComponent))
-        #expect(!remainingNames.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        var stagedDeepest = try onlyIncompleteCopy(in: root)
+        for _ in 1..<maximumCopyDepth {
+            stagedDeepest.appendPathComponent("d", isDirectory: true)
+        }
+        try #expect(
+            String(
+                contentsOf: stagedDeepest.appendingPathComponent("injected.txt"),
+                encoding: .utf8
+            ) == "injected"
+        )
     }
 
     @Test
-    func lateCopyFailureCleansStagingWithReadOnlyDirectory() async throws {
+    func lateCopyFailurePreservesStagingWithReadOnlyDirectory() async throws {
         let root = try makeTemporaryDirectory()
         let outside = try makeTemporaryDirectory()
         defer {
@@ -1449,36 +2177,43 @@ struct FlashFileBrowserFileSystemTests {
             Issue.record("Unexpected error: \(error)")
         }
 
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!names.contains("Read Only"))
-        #expect(!names.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("Read Only").path
+        ))
+        let stagedPayload = try onlyIncompleteCopy(in: root)
+            .appendingPathComponent("payload.txt")
+        try #expect(String(contentsOf: stagedPayload, encoding: .utf8) == "payload")
     }
 
     @Test
-    func lateCopyFailureCleansStagingWithImmutableFile() async throws {
-        let root = try makeTemporaryDirectory()
-        let outside = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.removeItem(at: root)
-            try? FileManager.default.removeItem(at: outside)
-        }
+    func protectedRootFailureLeavesVisibleMovableStaging() async throws {
+        let container = try makeTemporaryDirectory()
+        let root = try makeDirectory(named: "Root", in: container)
+        let outside = try makeDirectory(named: "Outside", in: container)
+        let trash = try makeDirectory(named: "Trash", in: container)
         let source = try makeFile(
-            named: "immutable.txt",
-            contents: "immutable",
+            named: "protected.txt",
+            contents: "protected",
             in: outside
         )
-        let chflagsResult = source.path.withCString {
-            Darwin.chflags($0, UInt32(UF_IMMUTABLE))
-        }
-        guard chflagsResult == 0 else { throw POSIXError(.EIO) }
         defer {
-            _ = source.path.withCString { Darwin.chflags($0, 0) }
+            try? setFileFlags(0, at: source)
+            clearFileFlagsOfImmediateChildren(in: root)
+            clearFileFlagsOfImmediateChildren(in: trash)
+            try? FileManager.default.removeItem(at: container)
         }
+        let protectedFlags = UInt32(UF_HIDDEN) | UInt32(UF_IMMUTABLE)
+        try setFileFlags(protectedFlags, at: source)
+        let stagedHadProtectedMetadata = LockedBoolRecorder()
         let fileSystem = LocalFlashFileBrowserFileSystem(
             mutationHook: { checkpoint, _ in
                 guard case .stagedCopyReady = checkpoint else { return }
+                let staged = try onlyIncompleteCopy(in: root)
+                let flags = try fileFlags(at: staged)
+                stagedHadProtectedMetadata.set(flags & protectedFlags != 0)
                 throw InjectedCopyError.failed
-            }
+            },
+            trashDirectoryProvider: { _ in trash }
         )
 
         do {
@@ -1490,13 +2225,38 @@ struct FlashFileBrowserFileSystemTests {
             Issue.record("Unexpected error: \(error)")
         }
 
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!names.contains("immutable.txt"))
-        #expect(!names.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent(source.lastPathComponent).path
+        ))
+        let stagedFile = try onlyIncompleteCopy(in: root)
+        #expect(!stagedHadProtectedMetadata.value)
+        #expect((try fileFlags(at: stagedFile) & protectedFlags) == 0)
+        try #expect(String(contentsOf: stagedFile, encoding: .utf8) == "protected")
+        let visibleItems = try await fileSystem.contents(
+            of: root,
+            showingHiddenFiles: false,
+            allowedRoot: root
+        )
+        #expect(visibleItems.contains { $0.name == stagedFile.lastPathComponent })
+
+        try await fileSystem.moveToTrash(
+            stagedFile,
+            expectedIdentity: try itemIdentity(at: stagedFile),
+            in: root,
+            allowedRoot: root
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: stagedFile.path))
+        try #expect(
+            String(
+                contentsOf: trash.appendingPathComponent(stagedFile.lastPathComponent),
+                encoding: .utf8
+            ) == "protected"
+        )
     }
 
     @Test
-    func descriptorCopyRejectsSpecialFilesAndCleansStaging() async throws {
+    func descriptorCopyRejectsSpecialFilesAndPreservesStaging() async throws {
         let root = try makeTemporaryDirectory()
         let outside = try makeTemporaryDirectory()
         defer {
@@ -1513,8 +2273,13 @@ struct FlashFileBrowserFileSystemTests {
             _ = try await fileSystem.copyItem(source, to: root, allowedRoot: root)
         }
 
-        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
-        #expect(!names.contains { $0.hasPrefix(".flash-ghostty-copy-") })
+        let stagedSource = try onlyIncompleteCopy(in: root)
+        var isDirectory = ObjCBool(false)
+        #expect(FileManager.default.fileExists(
+            atPath: stagedSource.path,
+            isDirectory: &isDirectory
+        ))
+        #expect(isDirectory.boolValue)
     }
 
     @Test
@@ -1547,6 +2312,100 @@ struct FlashFileBrowserFileSystemTests {
             )
         }
         #expect(recorder.urls.isEmpty)
+    }
+
+    @Test
+    func batchTrashPropagatesCancellationFromCurrentItemWithoutStartingAnother() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try makeFile(named: "first.txt", contents: "first", in: root)
+        let second = try makeFile(named: "second.txt", contents: "second", in: root)
+        let recorder = LockedURLRecorder()
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            trashHandler: { url in
+                recorder.append(url)
+                throw CancellationError()
+            }
+        )
+        let targets = try [first, second].map { url in
+            FlashFileBrowserMutationTarget(
+                url: url,
+                expectedIdentity: try itemIdentity(at: url)
+            )
+        }
+
+        do {
+            try await fileSystem.moveToTrash(
+                targets,
+                in: root,
+                allowedRoot: root
+            )
+            Issue.record("Expected the batch Trash operation to be cancelled")
+        } catch is CancellationError {
+            // Cancellation is intentionally not wrapped as a batch failure.
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(recorder.urls == [first])
+        try #expect(String(contentsOf: first, encoding: .utf8) == "first")
+        try #expect(String(contentsOf: second, encoding: .utf8) == "second")
+    }
+
+    @Test
+    func cancellingBatchTrashAfterACompletedItemPreservesItAndSkipsTheRest() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try makeFile(named: "first.txt", contents: "first", in: root)
+        let second = try makeFile(named: "second.txt", contents: "second", in: root)
+        let third = try makeFile(named: "third.txt", contents: "third", in: root)
+        let recorder = LockedURLRecorder()
+        let barrier = TrashCancellationBarrier()
+        defer { barrier.resumeTrash() }
+        let fileSystem = LocalFlashFileBrowserFileSystem(
+            trashHandler: { url in
+                recorder.append(url)
+                try FileManager.default.removeItem(at: url)
+                if url.standardizedFileURL == first.standardizedFileURL {
+                    barrier.pauseAfterTrash()
+                }
+            }
+        )
+        let targets = try [first, second, third].map { url in
+            FlashFileBrowserMutationTarget(
+                url: url,
+                expectedIdentity: try itemIdentity(at: url)
+            )
+        }
+
+        let trashTask = Task {
+            try await fileSystem.moveToTrash(
+                targets,
+                in: root,
+                allowedRoot: root
+            )
+        }
+        let trashPaused = await Task.detached {
+            barrier.waitUntilTrashPauses()
+        }.value
+        #expect(trashPaused)
+
+        trashTask.cancel()
+        barrier.resumeTrash()
+
+        do {
+            try await trashTask.value
+            Issue.record("Expected cancellation before the second Trash item")
+        } catch is CancellationError {
+            // The first commit remains complete; later items are not started.
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(recorder.urls == [first])
+        #expect(!FileManager.default.fileExists(atPath: first.path))
+        try #expect(String(contentsOf: second, encoding: .utf8) == "second")
+        try #expect(String(contentsOf: third, encoding: .utf8) == "third")
     }
 
     @Test
@@ -1931,12 +2790,23 @@ struct FlashFileBrowserFileSystemTests {
         #expect(!FileManager.default.fileExists(
             atPath: secondRoot.appendingPathComponent("source.txt").path
         ))
-        let firstNames = try FileManager.default.contentsOfDirectory(atPath: firstRoot.path)
-        #expect(!firstNames.contains { $0.hasPrefix(".flash-ghostty-") })
+        let stagedSource = try onlyIncompleteCopy(in: firstRoot)
+        try #expect(String(contentsOf: stagedSource, encoding: .utf8) == "source")
     }
 }
 
 private extension FlashFileBrowserFileSystemTests {
+    func onlyIncompleteCopy(in directory: URL) throws -> URL {
+        let stagingNames = try FileManager.default
+            .contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("FLASH Incomplete Copy ") }
+        #expect(stagingNames.count == 1)
+        let stagingName = try #require(stagingNames.first)
+        return directory
+            .appendingPathComponent(stagingName)
+            .standardizedFileURL
+    }
+
     func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("FlashFileBrowserFileSystemTests-\(UUID().uuidString)")
@@ -2057,6 +2927,37 @@ private extension FlashFileBrowserFileSystemTests {
         )
     }
 
+    func fileFlags(at url: URL) throws -> UInt32 {
+        var metadata = stat()
+        let path = FileManager.default.fileSystemRepresentation(withPath: url.path)
+        let outcome = FlashFileBrowserDescriptorIO.callCapturingErrno {
+            Darwin.lstat(path, &metadata)
+        }
+        guard outcome.result == 0 else {
+            throw FlashFileBrowserDescriptorIO.posixError(outcome.errorCode)
+        }
+        return metadata.st_flags
+    }
+
+    func setFileFlags(_ flags: UInt32, at url: URL) throws {
+        let path = FileManager.default.fileSystemRepresentation(withPath: url.path)
+        let outcome = FlashFileBrowserDescriptorIO.callCapturingErrno {
+            Darwin.chflags(path, flags)
+        }
+        guard outcome.result == 0 else {
+            throw FlashFileBrowserDescriptorIO.posixError(outcome.errorCode)
+        }
+    }
+
+    func clearFileFlagsOfImmediateChildren(in directory: URL) {
+        guard let names = try? FileManager.default.contentsOfDirectory(
+            atPath: directory.path
+        ) else { return }
+        for name in names {
+            try? setFileFlags(0, at: directory.appendingPathComponent(name))
+        }
+    }
+
     func itemIdentity(at url: URL) throws -> FlashFileBrowserItemIdentity {
         var metadata = stat()
         let path = FileManager.default.fileSystemRepresentation(withPath: url.path)
@@ -2145,5 +3046,23 @@ private final class CopyMutationBarrier: @unchecked Sendable {
 
     func resumeCopy() {
         copyMayResume.signal()
+    }
+}
+
+private final class TrashCancellationBarrier: @unchecked Sendable {
+    private let trashPaused = DispatchSemaphore(value: 0)
+    private let trashMayResume = DispatchSemaphore(value: 0)
+
+    func pauseAfterTrash() {
+        trashPaused.signal()
+        _ = trashMayResume.wait(timeout: .now() + 30)
+    }
+
+    func waitUntilTrashPauses() -> Bool {
+        trashPaused.wait(timeout: .now() + 5) == .success
+    }
+
+    func resumeTrash() {
+        trashMayResume.signal()
     }
 }

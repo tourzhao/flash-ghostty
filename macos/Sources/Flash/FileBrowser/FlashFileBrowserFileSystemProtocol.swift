@@ -5,6 +5,7 @@ enum FlashFileBrowserFileSystemError: LocalizedError, Equatable {
     case outsideWorkingDirectory
     case itemIsNotCurrent
     case itemAlreadyExists(String)
+    case cannotCreateFolderSafely
     case copySourceUnavailable(String)
     case cannotCopyIntoItself
     case cannotPrepareCopy
@@ -23,6 +24,8 @@ enum FlashFileBrowserFileSystemError: LocalizedError, Equatable {
             "The item changed on disk. Refresh the sidebar and try again."
         case .itemAlreadyExists(let name):
             "An item named “\(name)” already exists."
+        case .cannotCreateFolderSafely:
+            "This volume or permission mode cannot create the folder safely."
         case .copySourceUnavailable(let name):
             "“\(name)” is no longer available to copy."
         case .cannotCopyIntoItself:
@@ -122,6 +125,7 @@ extension FlashFileBrowserFileSystem {
         var completed = 0
         for target in targets {
             do {
+                try Task.checkCancellation()
                 try await moveToTrash(
                     target.url,
                     expectedIdentity: target.expectedIdentity,
@@ -129,6 +133,8 @@ extension FlashFileBrowserFileSystem {
                     allowedRoot: allowedRoot
                 )
                 completed += 1
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 throw FlashFileBrowserFileSystemError.batchOperationFailed(
                     completed: completed,
