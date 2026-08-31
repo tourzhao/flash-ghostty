@@ -24,6 +24,15 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
         )
     }
 
+    private struct RestoredSessionExpectation {
+        let directory: URL
+        let fileExtension: String
+        let visibleFile: String
+        let hiddenFile: String
+        let probeName: String
+        let paneLabel: String?
+    }
+
     private var testRoot: URL!
     private var initialDirectory: URL!
     private var restoredDirectory: URL!
@@ -320,12 +329,14 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
         try assertRestoredSession(
             at: 0,
             count: 2,
-            directory: firstFocusedDirectory,
-            fileExtension: "swift",
-            visibleFile: "focused.swift",
-            hiddenFile: "not-selected.md",
-            probeName: "actual-shell-cwd-a.txt",
-            paneLabel: "Right pane",
+            expectation: .init(
+                directory: firstFocusedDirectory,
+                fileExtension: "swift",
+                visibleFile: "focused.swift",
+                hiddenFile: "not-selected.md",
+                probeName: "actual-shell-cwd-a.txt",
+                paneLabel: "Right pane"
+            ),
             in: app
         )
         try assertShellWorkingDirectory(
@@ -350,11 +361,14 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
         try assertRestoredSession(
             at: 1,
             count: 2,
-            directory: secondDirectory,
-            fileExtension: "md",
-            visibleFile: "restored.md",
-            hiddenFile: "not-selected.swift",
-            probeName: "actual-shell-cwd-b.txt",
+            expectation: .init(
+                directory: secondDirectory,
+                fileExtension: "md",
+                visibleFile: "restored.md",
+                hiddenFile: "not-selected.swift",
+                probeName: "actual-shell-cwd-b.txt",
+                paneLabel: nil
+            ),
             in: app
         )
         XCTAssertTrue(
@@ -813,12 +827,7 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
     private func assertRestoredSession(
         at index: Int,
         count expectedCount: Int,
-        directory: URL,
-        fileExtension: String,
-        visibleFile: String,
-        hiddenFile: String,
-        probeName: String,
-        paneLabel: String? = nil,
+        expectation: RestoredSessionExpectation,
         in app: XCUIApplication
     ) throws {
         selectSession(at: index, count: expectedCount, in: app)
@@ -827,20 +836,20 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
             "Shared sidebar visibility did not follow session \(index + 1)"
         )
         XCTAssertTrue(
-            waitForWorkingDirectory(directory.path, in: app),
+            waitForWorkingDirectory(expectation.directory.path, in: app),
             "Session \(index + 1) did not restore its working directory"
         )
         try assertShellWorkingDirectory(
-            directory,
-            probeName: probeName,
-            paneLabel: paneLabel,
+            expectation.directory,
+            probeName: expectation.probeName,
+            paneLabel: expectation.paneLabel,
             in: app
         )
         XCTAssertTrue(
             waitForFileFilter(
-                fileExtension,
-                visibleFile: visibleFile,
-                hiddenFile: hiddenFile,
+                expectation.fileExtension,
+                visibleFile: expectation.visibleFile,
+                hiddenFile: expectation.hiddenFile,
                 in: app
             ),
             "Session \(index + 1) did not restore its file-type filter"

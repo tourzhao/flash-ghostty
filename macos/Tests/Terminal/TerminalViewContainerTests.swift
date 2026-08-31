@@ -49,7 +49,7 @@ struct SessionMetadataObservationIsolationTests {
 
 @MainActor
 @Suite
-struct TerminalSessionMetadataMonitorBindingTests {
+struct SessionMetadataMonitorBindingTests {
     @Test
     func transientOrInvalidFocusKeepsTheContainedCurrentSource() {
         let first = SessionMetadataBindingSourceProbe(
@@ -114,8 +114,7 @@ struct TerminalSessionMetadataMonitorBindingTests {
         )
         let monitor = TerminalSessionMetadataMonitor()
         var removedIsContained = true
-        let contains: (any TerminalSessionMetadataBindingSource) -> Bool = {
-            source in
+        let contains: (any TerminalSessionMetadataBindingSource) -> Bool = { source in
             source === removed ? removedIsContained : source === previous
         }
 
@@ -153,8 +152,7 @@ struct TerminalSessionMetadataMonitorBindingTests {
         let monitor = TerminalSessionMetadataMonitor()
         var sourcesAreContained = true
         var reportedTitles: [(String, Bool)] = []
-        let contains: (any TerminalSessionMetadataBindingSource) -> Bool = {
-            source in
+        let contains: (any TerminalSessionMetadataBindingSource) -> Bool = { source in
             sourcesAreContained && (source === first || source === second)
         }
         let titleDidChange: (String, Bool) -> Void = {
