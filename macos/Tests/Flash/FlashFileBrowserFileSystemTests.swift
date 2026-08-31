@@ -103,12 +103,16 @@ struct FlashFileBrowserFileSystemTests {
     }
 
     @Test
-    func contentsEnumeratesTenThousandRealFilesystemEntries() async throws {
+    func contentsEnumeratesTenThousandRealFilesystemEntriesWithinBudget() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let entryCount = 10_000
         let fileManager = FileManager.default
 
+        // Fixture setup is intentionally outside the measurement. Creating
+        // 10k files exercises the test host and filesystem rather than the
+        // File Browser read path, and would make the budget depend on runner
+        // provisioning instead of the production operation under test.
         // Empty, non-atomic files keep this a real directory enumeration while
         // avoiding duplicate temporary-file writes during fixture creation.
         for index in 0..<entryCount {
@@ -122,17 +126,33 @@ struct FlashFileBrowserFileSystemTests {
             }
         }
 
-        let items = try await LocalFlashFileBrowserFileSystem().contents(
+        let fileSystem = LocalFlashFileBrowserFileSystem()
+        // This is a regression ceiling for the deterministic newly-created
+        // fixture, not a cold-storage benchmark: CI cannot safely flush global
+        // APFS caches. Healthy reads are subsecond, including under local
+        // four-way load. Three seconds leaves virtualized CI and filesystem
+        // scanners ample headroom while still rejecting a user-visible stall.
+        let wallClockBudget: Duration = .seconds(3)
+        let clock = ContinuousClock()
+
+        // Measure the first production read end to end: actor scheduling,
+        // root/descriptor validation, descriptor-relative enumeration and
+        // metadata reads, item identity construction, and final revalidation.
+        // Correctness assertions and collection materialization below are not
+        // charged to the filesystem budget.
+        let measurementStart = clock.now
+        let items = try await fileSystem.contents(
             of: root,
             showingHiddenFiles: false,
             allowedRoot: root
         )
+        let elapsed = measurementStart.duration(to: clock.now)
         let names = Set(items.map(\.name))
 
-        // Keep the unit test deterministic under loaded CI and endpoint
-        // security software. Processing a real 10k directory still exercises
-        // the large-input path; wall-clock budgets require a dedicated
-        // benchmark where the runner class and warmup are controlled.
+        #expect(
+            elapsed < wallClockBudget,
+            "Reading 10k real entries took \(elapsed); budget is \(wallClockBudget)"
+        )
         #expect(items.count == entryCount)
         #expect(names.count == entryCount)
         #expect(names.contains("entry-0.txt"))

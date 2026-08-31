@@ -551,6 +551,9 @@ enum FlashTerminalFileActionExecutor {
         completion: @escaping Completion
     ) {
         (queue ?? validationQueue).async {
+            #if DEBUG
+            waitForUITestRevalidationBarrierIfConfigured()
+            #endif
             let current = revalidator(target)
             DispatchQueue.main.async { @MainActor in
                 completion(current)
@@ -578,6 +581,51 @@ enum FlashTerminalFileActionExecutor {
             }
         }
     }
+
+    #if DEBUG
+    /// Gives UI automation a deterministic point at which to change split
+    /// focus while the real filesystem revalidation remains in flight. The
+    /// seam is inert unless the launched test app opts in with a fresh
+    /// temporary directory.
+    private static func waitForUITestRevalidationBarrierIfConfigured() {
+        let environmentKey =
+            "GHOSTTY_TEST_TERMINAL_FILE_REVALIDATION_BARRIER"
+        let uiTestBundleIdentifier =
+            FlashGhosttyProductProfile.uiTestBundleIdentifier
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier,
+              bundleIdentifier ==
+                FlashGhosttyProductProfile.debugBundleIdentifier ||
+                bundleIdentifier == uiTestBundleIdentifier ||
+                bundleIdentifier.hasPrefix("\(uiTestBundleIdentifier).run-"),
+              let directoryPath = ProcessInfo.processInfo
+            .environment[environmentKey],
+              !directoryPath.isEmpty else { return }
+
+        let directory = URL(
+            fileURLWithPath: directoryPath,
+            isDirectory: true
+        )
+        let entered = directory.appendingPathComponent("entered")
+        let resume = directory.appendingPathComponent("resume")
+        let fileManager = FileManager.default
+        _ = fileManager.createFile(
+            atPath: entered.path,
+            contents: Data()
+        )
+
+        let deadline = Date().addingTimeInterval(60)
+        while !fileManager.fileExists(atPath: resume.path),
+              Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if !fileManager.fileExists(atPath: resume.path) {
+            _ = fileManager.createFile(
+                atPath: directory.appendingPathComponent("timed-out").path,
+                contents: Data()
+            )
+        }
+    }
+    #endif
 }
 
 private final class FlashTerminalFileActionPayload: NSObject, @unchecked Sendable {

@@ -139,6 +139,164 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         }
     }
 
+    /// Uses a real OSC 8 file link and the native file-action menu. The
+    /// revalidation barrier proves the second split receives focus before the
+    /// originating split's reveal request is delivered back to the main actor.
+    @MainActor
+    func testRevealKeepsOriginatingSplitAfterFocusChangesDuringRevalidation() throws {
+        let originDirectory = workingDirectory.appendingPathComponent(
+            "origin",
+            isDirectory: true
+        )
+        let focusedDirectory = workingDirectory.appendingPathComponent(
+            "focused",
+            isDirectory: true
+        )
+        let barrierDirectory = workingDirectory.appendingPathComponent(
+            ".terminal-file-revalidation-barrier",
+            isDirectory: true
+        )
+        for directory in [originDirectory, focusedDirectory, barrierDirectory] {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+        }
+
+        let targetName = "reveal-target.txt"
+        let focusedName = "focused-split-only.txt"
+        let targetURL = originDirectory.appendingPathComponent(targetName)
+        try Data("origin".utf8).write(to: targetURL)
+        try Data("focused".utf8).write(
+            to: focusedDirectory.appendingPathComponent(focusedName)
+        )
+
+        let resumeURL = barrierDirectory.appendingPathComponent("resume")
+        defer {
+            _ = FileManager.default.createFile(
+                atPath: resumeURL.path,
+                contents: Data()
+            )
+        }
+
+        let app = try ghosttyApplication(
+            defaultsSuite:
+                "\(Self.defaultsSuiteName).FileBrowserSplitReveal.\(UUID().uuidString)"
+        )
+        app.launchEnvironment[
+            "GHOSTTY_TEST_TERMINAL_FILE_REVALIDATION_BARRIER"
+        ] = barrierDirectory.path
+        app.launch()
+
+        let terminal = app.groups["Terminal pane"]
+        XCTAssertTrue(terminal.waitForExistence(timeout: 5))
+        terminal.typeKey("d", modifierFlags: .command)
+
+        let leftPane = app.groups["Left pane"]
+        let rightPane = app.groups["Right pane"]
+        XCTAssertTrue(leftPane.waitForExistence(timeout: 5))
+        XCTAssertTrue(rightPane.waitForExistence(timeout: 5))
+
+        try moveShell(
+            to: originDirectory,
+            expectedFile: targetName,
+            in: leftPane,
+            app: app
+        )
+        try moveShell(
+            to: focusedDirectory,
+            expectedFile: focusedName,
+            in: rightPane,
+            app: app
+        )
+
+        leftPane.click()
+        XCTAssertTrue(waitForFileRow(targetName, in: app))
+        XCTAssertTrue(
+            app.buttons[focusedName].waitForNonExistence(timeout: 10),
+            "The sidebar must finish switching back to the originating split"
+        )
+        let leftSurface = leftPane.textViews.firstMatch
+        XCTAssertTrue(leftSurface.waitForExistence(timeout: 5))
+        XCTAssertTrue(leftSurface.isHittable)
+
+        // Keep the OSC 8 target fixed while its visible label fills far more
+        // cells than the largest CI terminal viewport. The center is therefore
+        // a deterministic hyperlink hit point regardless of font metrics.
+        pasteText(
+            "clear; printf '\\033]8;;%s\\033\\\\' " +
+                "\(shellQuoted(targetURL.absoluteString)); " +
+                "printf 'X%.0s' {1..5000}; " +
+                "printf '\\033]8;;\\033\\\\\\nFLASH_%s\\n' 'LINKS_READY'",
+            into: leftSurface
+        )
+        leftSurface.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(
+            waitForTerminalText("FLASH_LINKS_READY", in: leftSurface),
+            "The originating split must finish rendering the OSC 8 file link"
+        )
+
+        let linkPoint = leftSurface.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
+        )
+        XCUIElement.perform(withKeyModifiers: .command) {
+            linkPoint.hover()
+            linkPoint.click()
+        }
+
+        let revealItem = app.menuItems["Show in File Browser"]
+        XCTAssertTrue(
+            revealItem.waitForExistence(timeout: 10),
+            "Command-clicking the OSC 8 file link must present the native reveal menu"
+        )
+        revealItem.click()
+        XCTAssertTrue(
+            revealItem.waitForNonExistence(timeout: 5),
+            "The native file-action menu must dismiss before split focus changes"
+        )
+
+        let enteredURL = barrierDirectory.appendingPathComponent("entered")
+        XCTAssertTrue(
+            waitForFile(at: enteredURL),
+            "The reveal must reach background filesystem revalidation"
+        )
+
+        rightPane.click()
+        XCTAssertTrue(
+            waitForWorkingDirectory(focusedDirectory.path, in: app),
+            "The second split must own focus before revalidation resumes"
+        )
+        XCTAssertTrue(
+            waitForFileRow(focusedName, in: app),
+            "The sidebar must first follow the newly-focused split"
+        )
+
+        _ = FileManager.default.createFile(
+            atPath: resumeURL.path,
+            contents: Data()
+        )
+
+        XCTAssertTrue(
+            waitForRevealedSelection(
+                targetName: targetName,
+                displacedName: focusedName,
+                in: app
+            ),
+            "The completed reveal must select the originating split's target"
+        )
+        XCTAssertTrue(
+            waitForWorkingDirectory(focusedDirectory.path, in: app),
+            "Completing the reveal must not steal terminal focus from the second split"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: barrierDirectory
+                    .appendingPathComponent("timed-out").path
+            ),
+            "The UI-test barrier must be resumed explicitly, not time out"
+        )
+    }
+
     @MainActor
     private func waitForSelectedSession(
         at index: Int,
@@ -173,6 +331,142 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         }
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: app)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func moveShell(
+        to directory: URL,
+        expectedFile: String,
+        in pane: XCUIElement,
+        app: XCUIApplication
+    ) throws {
+        pane.click()
+        pasteText(
+            "cd \(shellQuoted(directory.path)) && " +
+                "printf '\\033]7;file://localhost%s\\007' \"$PWD\"",
+            into: pane
+        )
+        pane.typeKey(.return, modifierFlags: [])
+
+        XCTAssertTrue(
+            waitForWorkingDirectory(directory.path, in: app),
+            "The terminal did not publish \(directory.path)"
+        )
+        XCTAssertTrue(
+            waitForFileRow(expectedFile, in: app),
+            "The file browser did not load \(expectedFile)"
+        )
+    }
+
+    @MainActor
+    private func waitForWorkingDirectory(
+        _ expectedPath: String,
+        in app: XCUIApplication,
+        timeout: TimeInterval = 15
+    ) -> Bool {
+        let workingDirectory = element(
+            "terminal-session-working-directory.text",
+            in: app
+        )
+        let standardizedPath = URL(fileURLWithPath: expectedPath)
+            .standardizedFileURL.path
+        let predicate = NSPredicate(format: "value == %@", standardizedPath)
+        let expectation = XCTNSPredicateExpectation(
+            predicate: predicate,
+            object: workingDirectory
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func waitForFileRow(
+        _ name: String,
+        in app: XCUIApplication,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        app.buttons[name].waitForExistence(timeout: timeout)
+    }
+
+    @MainActor
+    private func waitForTerminalText(
+        _ text: String,
+        in surface: XCUIElement,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        let predicate = NSPredicate { _, _ in
+            (surface.value as? String)?.contains(text) == true
+        }
+        let expectation = XCTNSPredicateExpectation(
+            predicate: predicate,
+            object: surface
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func waitForFile(
+        at url: URL,
+        timeout: TimeInterval = 5
+    ) -> Bool {
+        let predicate = NSPredicate { _, _ in
+            FileManager.default.fileExists(atPath: url.path)
+        }
+        let expectation = XCTNSPredicateExpectation(
+            predicate: predicate,
+            object: self
+        )
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func waitForRevealedSelection(
+        targetName: String,
+        displacedName: String,
+        in app: XCUIApplication,
+        timeout: TimeInterval = 15
+    ) -> Bool {
+        let target = app.buttons[targetName]
+        let displaced = app.buttons[displacedName]
+        let copyButton = element("terminal-file-sidebar.copy", in: app)
+        let predicate = NSPredicate { _, _ in
+            target.exists &&
+                !displaced.exists &&
+                copyButton.isEnabled &&
+                app.staticTexts["1 of 1 selected"].exists
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: app)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    @MainActor
+    private func pasteText(_ value: String, into element: XCUIElement) {
+        let pasteboard = NSPasteboard.general
+        let originalItems = pasteboard.pasteboardItems?.map { item in
+            item.types.compactMap { type in
+                item.data(forType: type).map { (type, $0) }
+            }
+        }
+        defer {
+            pasteboard.clearContents()
+            if let originalItems {
+                let restoredItems = originalItems.map { values in
+                    let item = NSPasteboardItem()
+                    for (type, data) in values {
+                        item.setData(data, forType: type)
+                    }
+                    return item
+                }
+                pasteboard.writeObjects(restoredItems)
+            }
+        }
+
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString(value, forType: .string))
+        element.typeKey("v", modifierFlags: .command)
+    }
+
+    private func shellQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     @MainActor
