@@ -8,6 +8,7 @@ enum FlashGhosttyProductProfile {
     static let displayName = "FLASH-Ghostty"
     static let releaseBundleIdentifier = "com.flashghostty.app"
     static let debugBundleIdentifier = "com.flashghostty.app.debug"
+    static let uiTestBundleIdentifier = "com.flashghostty.app.debug.ui-tests"
     static let filesystemNamespace = "flash-ghostty"
 
     static var defaultCustomIconPath: String {
@@ -40,6 +41,12 @@ enum FlashGhosttyProductProfile {
 
     static func defaultsSuiteIdentifier(forBundleIdentifier bundleIdentifier: String?) -> String {
         if let bundleIdentifier {
+            if let uiTestHostIdentifier = uiTestHostIdentifier(
+                forBundleIdentifier: bundleIdentifier
+            ) {
+                return uiTestHostIdentifier
+            }
+
             switch bundleIdentifier {
             case releaseBundleIdentifier, debugBundleIdentifier:
                 return bundleIdentifier
@@ -61,5 +68,19 @@ enum FlashGhosttyProductProfile {
 
     static func namespacedIdentifier(_ component: String) -> String {
         "\(defaultsSuiteIdentifier).\(component)"
+    }
+
+    private static func uiTestHostIdentifier(
+        forBundleIdentifier bundleIdentifier: String
+    ) -> String? {
+        let pluginSuffix = ".dock-tile"
+        let candidate = bundleIdentifier.hasSuffix(pluginSuffix)
+            ? String(bundleIdentifier.dropLast(pluginSuffix.count))
+            : bundleIdentifier
+        guard candidate == uiTestBundleIdentifier ||
+                candidate.hasPrefix("\(uiTestBundleIdentifier).run-") else {
+            return nil
+        }
+        return candidate
     }
 }

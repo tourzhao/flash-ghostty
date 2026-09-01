@@ -1,0 +1,331 @@
+name: FLASH-Ghostty Branch Validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - "flash/**"
+
+permissions:
+  contents: read
+
+defaults:
+  # The explicit bash shell enables the runner's -eo pipefail invocation;
+  # architecture checks must observe every pipeline failure.
+  run:
+    shell: bash
+
+# Feature branches deliberately stop before signing and notarization. Those
+# trust-boundary steps remain restricted to protected main in flash-release.yml.
+
+concurrency:
+  group: flash-branch-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    if: github.repository == 'tourzhao/flash-ghostty'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+      XCODE_XCCONFIG_FILE: ${{ github.workspace }}/macos/Configurations/FlashGhostty.Release.xcconfig
+      FLASH_NUSHELL_VERSION: 0.115.1
+      FLASH_NUSHELL_SHA256: 2e6ed1eb043869ff05b5f2448a8c443e4d3a93557ba4303b21008a0523c96734
+      FLASH_SWIFTLINT_VERSION: 0.65.1
+      FLASH_SWIFTLINT_SHA256: c1e429b0599cf1b516f369a2d9ec04eaf0e436f3c12b637df8851fa52ff694d0
+      FLASH_XCODE_VERSION: 26.6
+      FLASH_XCODE_BUILD: 17F113
+      FLASH_MACOS_MINIMUM_VERSION: "13.0"
+      FLASH_GHOSTTY_UI_TEST_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout branch without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load product manifest
+        run: |
+          set -a
+          source flash/product.env
+          set +a
+          env | grep '^FLASH_GHOSTTY_' >> "$GITHUB_ENV"
+
+      - name: Verify fork product overlay
+        run: flash/verify-product-overlay.sh
+
+      - name: Verify release configuration statics
+        run: |
+          project="macos/Ghostty.xcodeproj/project.pbxproj"
+          shared_config="macos/Configurations/FlashGhostty.Shared.xcconfig"
+          release_config="macos/Configurations/FlashGhostty.Release.xcconfig"
+          source_plist="macos/FlashGhostty-Info.plist"
+
+          grep -Fqx '#include "FlashGhostty.Shared.xcconfig"' "$release_config"
+          grep -Fqx 'FLASH_GHOSTTY_MAIN_NIB = FlashMainMenu' "$shared_config"
+          grep -Fq '<string>$(FLASH_GHOSTTY_APP_DISPLAY_NAME)</string>' "$source_plist"
+          grep -Fq '<key>GhosttyCommit</key>' "$source_plist"
+          grep -Fq '<string>FlashGhostty.sdef</string>' "$source_plist"
+          grep -Fq '<key>LSMultipleInstancesProhibited</key>' "$source_plist"
+
+          app_release_settings="$(
+            awk '
+              /A5B30542299BEAAB0047F10C \/\* Release \*\/ = \{/ { capture = 1 }
+              capture { print }
+              capture && /name = Release;/ { exit }
+            ' "$project"
+          )"
+          test -n "$app_release_settings"
+          grep -Fq 'CODE_SIGN_ENTITLEMENTS = Ghostty.entitlements;' <<< "$app_release_settings"
+          grep -Fq 'INFOPLIST_FILE = "FlashGhostty-Info.plist";' <<< "$app_release_settings"
+          grep -Fq 'INFOPLIST_KEY_NSMainNibFile = "$(FLASH_GHOSTTY_MAIN_NIB)";' <<< "$app_release_settings"
+          grep -Fq 'INFOPLIST_PREPROCESSOR_DEFINITIONS = "FLASH_GHOSTTY_PROHIBIT_MULTIPLE_INSTANCES=1";' \
+            <<< "$app_release_settings"
+          grep -Fq 'MACOSX_DEPLOYMENT_TARGET = 13.0;' <<< "$app_release_settings"
+          grep -Fq 'PRODUCT_BUNDLE_IDENTIFIER = "$(FLASH_GHOSTTY_APP_BUNDLE_IDENTIFIER)";' \
+            <<< "$app_release_settings"
+
+          plugin_release_settings="$(
+            awk '
+              /8193244F2F24E6C000A9ED8F \/\* Release \*\/ = \{/ { capture = 1 }
+              capture { print }
+              capture && /name = Release;/ { exit }
+            ' "$project"
+          )"
+          test -n "$plugin_release_settings"
+          grep -Fq 'INFOPLIST_KEY_CFBundleDisplayName = "FLASH-Ghostty Dock Tile Plugin";' \
+            <<< "$plugin_release_settings"
+          grep -Fq 'MACOSX_DEPLOYMENT_TARGET = 13.0;' <<< "$plugin_release_settings"
+          grep -Fq 'PRODUCT_BUNDLE_IDENTIFIER = "$(FLASH_GHOSTTY_APP_BUNDLE_IDENTIFIER).dock-tile";' \
+            <<< "$plugin_release_settings"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Select and verify Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcode_version="$(xcodebuild -version)"
+          grep -Fx "Xcode $FLASH_XCODE_VERSION" <<< "$xcode_version"
+          grep -Fx "Build version $FLASH_XCODE_BUILD" <<< "$xcode_version"
+
+      - name: Verify and build universal GhosttyKit
+        run: |
+          expected_zig_version="$(
+            sed -n -E \
+              's/^[[:space:]]*\.?minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+              build.zig.zon
+          )"
+          test -n "$expected_zig_version"
+          test "$(zig version)" = "$expected_zig_version"
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Dxcframework-target=universal
+
+      - name: Install pinned macOS build tools
+        run: |
+          tools_directory="$RUNNER_TEMP/flash-pinned-tools"
+          nu_archive="$RUNNER_TEMP/nu-$FLASH_NUSHELL_VERSION.tar.gz"
+          swiftlint_archive="$RUNNER_TEMP/swiftlint-$FLASH_SWIFTLINT_VERSION.zip"
+          mkdir -p "$tools_directory"
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --show-error \
+            --output "$nu_archive" \
+            "https://github.com/nushell/nushell/releases/download/$FLASH_NUSHELL_VERSION/nu-$FLASH_NUSHELL_VERSION-aarch64-apple-darwin.tar.gz"
+          printf '%s  %s\n' "$FLASH_NUSHELL_SHA256" "$nu_archive" \
+            | shasum -a 256 --check
+          tar \
+            -xzf "$nu_archive" \
+            -C "$tools_directory" \
+            --strip-components=1 \
+            "nu-$FLASH_NUSHELL_VERSION-aarch64-apple-darwin/nu"
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --show-error \
+            --output "$swiftlint_archive" \
+            "https://github.com/realm/SwiftLint/releases/download/$FLASH_SWIFTLINT_VERSION/portable_swiftlint.zip"
+          printf '%s  %s\n' "$FLASH_SWIFTLINT_SHA256" "$swiftlint_archive" \
+            | shasum -a 256 --check
+          unzip -q "$swiftlint_archive" swiftlint -d "$tools_directory"
+
+          echo "$tools_directory" >> "$GITHUB_PATH"
+          test "$("$tools_directory/nu" --version)" = "$FLASH_NUSHELL_VERSION"
+          test "$("$tools_directory/swiftlint" version)" = "$FLASH_SWIFTLINT_VERSION"
+
+      - name: Run Zig and Swift quality gates
+        run: |
+          zig build test \
+            -Demit-xcframework=false \
+            -Demit-macos-app=false
+          zig build test-lib-vt \
+            -Demit-xcframework=false \
+            -Demit-macos-app=false
+          swiftlint lint --strict --no-cache
+
+      - name: Run macOS unit tests
+        id: macos_unit
+        run: |
+          macos/build.nu \
+            --configuration Debug \
+            --locked-packages \
+            --action test
+          git diff --exit-code -- \
+            macos/Ghostty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+      - name: Upload macOS unit test diagnostics
+        if: failure() && steps.macos_unit.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-macos-unit-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: macos/build/DerivedData/Logs/Test/*.xcresult
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Run critical FLASH UI tests
+        id: macos_ui
+        run: |
+          for suite in \
+            GhosttySessionSidebarUITests \
+            GhosttyFileBrowserUITests \
+            GhosttySurfaceNavigationUITests \
+            GhosttySessionRestorationUITests; do
+            macos/build.nu \
+              --configuration Debug \
+              --locked-packages \
+              --include-ui-tests \
+              --only-testing "GhosttyUITests/$suite" \
+              --action test
+          done
+
+      - name: Upload critical FLASH UI test diagnostics
+        if: failure() && steps.macos_ui.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-macos-ui-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: macos/build/DerivedData/Logs/Test/*.xcresult
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Build universal release candidate
+        run: |
+          macos/build.nu \
+            --configuration Release \
+            --xcconfig "$XCODE_XCCONFIG_FILE" \
+            --architectures "arm64 x86_64" \
+            --locked-packages \
+            --action build
+
+      - name: Verify release identity and universal architectures
+        run: |
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
+          app="macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
+          plist="$app/Contents/Info.plist"
+          plugin="$app/Contents/PlugIns/DockTilePlugin.plugin"
+          plugin_plist="$plugin/Contents/Info.plist"
+          test -d "$app"
+          test -f "$plist"
+          test -d "$plugin"
+          test -f "$plugin_plist"
+
+          assert_plist_value() {
+            local plist_path="$1"
+            local key="$2"
+            local expected="$3"
+            local actual
+            if ! actual="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist_path")"; then
+              echo "$plist_path is missing required key $key" >&2
+              exit 1
+            fi
+            if [[ "$actual" != "$expected" ]]; then
+              echo "$plist_path has $key=$actual; expected $expected" >&2
+              exit 1
+            fi
+          }
+
+          assert_plist_absent() {
+            local plist_path="$1"
+            local key="$2"
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$plist_path" >/dev/null 2>&1; then
+              echo "$plist_path must not contain $key" >&2
+              exit 1
+            fi
+          }
+
+          assert_plist_value "$plist" CFBundleIdentifier "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID"
+          assert_plist_value "$plist" CFBundleName "$FLASH_GHOSTTY_DISPLAY_NAME"
+          assert_plist_value "$plist" CFBundleDisplayName "$FLASH_GHOSTTY_DISPLAY_NAME"
+          assert_plist_value "$plist" CFBundleExecutable ghostty
+          assert_plist_value "$plist" NSMainNibFile FlashMainMenu
+          assert_plist_value "$plist" OSAScriptingDefinition FlashGhostty.sdef
+          assert_plist_value "$plist" LSMultipleInstancesProhibited true
+          assert_plist_value \
+            "$plist" \
+            LSMinimumSystemVersion \
+            "$FLASH_MACOS_MINIMUM_VERSION"
+          assert_plist_value "$plist" SUEnableAutomaticChecks false
+          assert_plist_absent "$plist" SUFeedURL
+          assert_plist_absent "$plist" SUPublicEDKey
+
+          assert_plist_value \
+            "$plugin_plist" \
+            CFBundleIdentifier \
+            "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID.dock-tile"
+          assert_plist_value "$plugin_plist" CFBundleName DockTilePlugin
+          assert_plist_value \
+            "$plugin_plist" \
+            CFBundleDisplayName \
+            "$FLASH_GHOSTTY_DISPLAY_NAME Dock Tile Plugin"
+          assert_plist_value "$plugin_plist" CFBundleExecutable DockTilePlugin
+          assert_plist_value \
+            "$plugin_plist" \
+            LSMinimumSystemVersion \
+            "$FLASH_MACOS_MINIMUM_VERSION"
+
+          candidate_manifest="$(
+            mktemp "$RUNNER_TEMP/flash-branch-app-files.XXXXXX"
+          )"
+          trap 'rm -f "$candidate_manifest"' EXIT
+          if ! find "$app" -type f -print0 > "$candidate_manifest"; then
+            echo "Failed to enumerate every release-app file" >&2
+            exit 1
+          fi
+          mach_o_count=0
+          while IFS= read -r -d '' candidate; do
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
+              ((mach_o_count += 1))
+              if ! architectures="$(
+                  lipo -archs "$candidate" \
+                    | tr ' ' '\n' \
+                    | LC_ALL=C sort \
+                    | paste -sd ' ' -
+                )"; then
+                echo "Failed to inspect release-app architectures: $candidate" >&2
+                exit 1
+              fi
+              if [[ "$architectures" != "arm64 x86_64" ]]; then
+                echo "$candidate has architectures '$architectures'; expected exactly arm64 x86_64" >&2
+                exit 1
+              fi
+            fi
+          done < "$candidate_manifest"
+          if ((mach_o_count == 0)); then
+            echo "release app contains no Mach-O binaries" >&2
+            exit 1
+          fi

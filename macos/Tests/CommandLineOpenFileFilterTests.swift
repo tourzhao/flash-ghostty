@@ -9,12 +9,13 @@ struct CommandLineOpenFileFilterTests {
         defer { defaults.removeVolatileDomain(forName: domainName) }
         defaults.setVolatileDomain(["ExistingArgument": "kept"], forName: domainName)
 
-        CommandLinePersistencePolicy.installIfNeeded(
+        let installed = CommandLinePersistencePolicy.installIfNeeded(
             arguments: ["ghostty", "-e", "echo", "hello"],
             defaults: defaults,
             argumentDomainName: domainName
         )
 
+        #expect(installed)
         let domain = defaults.volatileDomain(forName: domainName)
         #expect(domain["ExistingArgument"] as? String == "kept")
         #expect(domain[CommandLinePersistencePolicy.ignoreStateKey] as? Bool == true)
@@ -25,13 +26,44 @@ struct CommandLineOpenFileFilterTests {
         let domainName = "CommandLinePersistencePolicyTests-\(UUID())"
         defer { defaults.removeVolatileDomain(forName: domainName) }
 
-        CommandLinePersistencePolicy.installIfNeeded(
+        let installed = CommandLinePersistencePolicy.installIfNeeded(
             arguments: ["ghostty"],
             defaults: defaults,
             argumentDomainName: domainName
         )
 
+        #expect(!installed)
         #expect(defaults.volatileDomain(forName: domainName).isEmpty)
+    }
+
+    @Test func unitTestHostInstallsVolatilePersistenceOverride() {
+        let defaults = UserDefaults.standard
+        let domainName = "CommandLinePersistencePolicyTests-\(UUID())"
+        defer { defaults.removeVolatileDomain(forName: domainName) }
+
+        let installed = CommandLinePersistencePolicy.installIfNeeded(
+            arguments: ["ghostty"],
+            isUnitTestHost: true,
+            defaults: defaults,
+            argumentDomainName: domainName
+        )
+
+        #expect(installed)
+        #expect(
+            defaults.volatileDomain(forName: domainName)[
+                CommandLinePersistencePolicy.ignoreStateKey
+            ] as? Bool == true
+        )
+    }
+
+    @Test func hostedUnitTestProcessWasIsolatedBeforeAppKitStarted() {
+        #expect(SessionRestorationProcessRole.isUnitTestHost())
+        #expect(appKitOuterArchiveIsolation != nil)
+        #expect(
+            UserDefaults.standard.volatileDomain(
+                forName: UserDefaults.argumentDomain
+            )[CommandLinePersistencePolicy.ignoreStateKey] as? Bool == true
+        )
     }
 
     @Test func requiresExecuteFlag() {

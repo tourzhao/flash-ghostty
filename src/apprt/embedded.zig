@@ -1970,6 +1970,31 @@ pub const CAPI = struct {
         };
     }
 
+    /// Return geometry and history identity from one renderer-locked sample.
+    export fn ghostty_surface_scrollbar(
+        surface: *Surface,
+    ) terminal.Scrollbar.SnapshotC {
+        return surface.core_surface.scrollbarSnapshot().snapshotCval();
+    }
+
+    /// Scroll only if the saved row still belongs to the same active history.
+    export fn ghostty_surface_scroll_to_row_if_history_matches(
+        surface: *Surface,
+        row: u64,
+        content_generation: u64,
+        screen_identity: u64,
+    ) bool {
+        const native_row = std.math.cast(usize, row) orelse return false;
+        return surface.core_surface.scrollToRowIfHistoryMatches(
+            native_row,
+            content_generation,
+            screen_identity,
+        ) catch |err| {
+            log.err("error performing conditional history scroll err={}", .{err});
+            return false;
+        };
+    }
+
     /// Returns the PID of the foreground process for the surface PTY.
     export fn ghostty_surface_foreground_pid(surface: *Surface) u64 {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;

@@ -5,6 +5,15 @@ enum SessionRestorationDecision: Equatable {
     case startFresh
 }
 
+/// Launch-wide authority for the shared restoration archive. Preservation is
+/// deliberately independent from the user's restore decision and carries proof
+/// that AppKit's outer archive was isolated before AppKit startup.
+enum SessionRestorationArchiveWritePolicy: Equatable {
+    case unresolved
+    case preserveExisting(AppKitOuterArchiveIsolation)
+    case ownCurrent
+}
+
 /// Holds restoration work until one launch-wide user decision is available.
 /// Actions are returned to the caller so executing one can safely enqueue more
 /// work without overlapping a mutation of this value.
@@ -48,25 +57,18 @@ struct StartupRestorationGate {
     }
 }
 
-/// Pure launch policy. In particular, a one-shot `-e` process skips restored
-/// windows for this launch while leaving the previous interactive archive
-/// untouched for the next normal launch.
+/// Pure policy for an ordinary interactive launch. Pre-isolated one-shot and
+/// test-host launches are resolved by the coordinator before consulting this.
 enum StartupRestorationPolicy {
     enum Plan: Equatable {
         case awaitUserDecision
-        case startFreshPreservingArchive
         case startFreshDiscardingArchive
     }
 
     static func plan(
-        launchedWithExecuteCommand: Bool,
         restorationEnabled: Bool,
         archiveMarker: SessionRestorationArchiveMarker
     ) -> Plan {
-        if launchedWithExecuteCommand {
-            return .startFreshPreservingArchive
-        }
-
         guard restorationEnabled else {
             return .startFreshDiscardingArchive
         }
@@ -115,6 +117,20 @@ enum SessionRestorationLaunchMilestonePolicy {
     }
 }
 
+/// Keeps an XCTest host from presenting production startup UI or replacing a
+/// developer's saved workspace before the test bundle has begun executing.
+/// UI-tested applications are separate processes and do not load XCTest, so
+/// their restoration flows remain available to XCUIApplication tests.
+enum SessionRestorationProcessRole {
+    static func isUnitTestHost(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        loadedBundlePaths: [String] = Bundle.allBundles.map(\.bundlePath)
+    ) -> Bool {
+        environment["XCTestConfigurationFilePath"] != nil ||
+            loadedBundlePaths.contains { $0.hasSuffix(".xctest") }
+    }
+}
+
 /// Owns the launch-wide restoration decision and all persistence side effects.
 /// AppKit adapters only enqueue passive materialization requests here.
 @MainActor
@@ -124,15 +140,29 @@ final class SessionRestorationCoordinator {
     private let didResolveFromPrompt: (SessionRestorationDecision) -> Void
 
     private var gate = StartupRestorationGate()
+    private var deferredTerminalLaunches: [() -> Void] = []
     private var promptIsActive = false
     private var didPrepareLaunch = false
+    private var applicationLaunchIsReady = false
 
-    private(set) var preservesArchiveForLaunch = false
+    private(set) var archiveWritePolicy:
+        SessionRestorationArchiveWritePolicy = .unresolved
     private(set) var shouldInvalidateSavedState = false
 
     var decision: SessionRestorationDecision? { gate.decision }
     var hasPendingRequests: Bool { gate.hasPendingRequests }
     var isPromptActive: Bool { promptIsActive }
+    var hasDeferredTerminalLaunches: Bool {
+        !deferredTerminalLaunches.isEmpty
+    }
+    var isTerminalLaunchDeferred: Bool {
+        decision == nil || !applicationLaunchIsReady
+    }
+
+    var preservesArchiveForLaunch: Bool {
+        if case .preserveExisting = archiveWritePolicy { return true }
+        return false
+    }
 
     /// True while AppKit restoration data belongs to the previous launch and
     /// the user has not decided what to do with it. The current workspace is
@@ -146,7 +176,15 @@ final class SessionRestorationCoordinator {
     /// This covers both one-shot `-e` launches and the interval between AppKit
     /// delivering restoration payloads and the user's explicit choice.
     var preservesExistingArchive: Bool {
-        preservesArchiveForLaunch || isAwaitingUserDecision
+        archiveWritePolicy != .ownCurrent
+    }
+
+    /// Restored windows may participate in the archive as soon as the user has
+    /// accepted them. An outer-archive-isolated process must keep every window
+    /// non-restorable for its entire launch.
+    var allowsRestorableWindowCreation: Bool {
+        if case .preserveExisting = archiveWritePolicy { return false }
+        return archiveWritePolicy == .ownCurrent || decision == .restore
     }
 
     /// AppKit has no API for allowing an empty, gated restoration graph to
@@ -167,28 +205,49 @@ final class SessionRestorationCoordinator {
     }
 
     func prepareLaunch(
-        launchedWithExecuteCommand: Bool,
+        outerArchiveIsolation: AppKitOuterArchiveIsolation? = nil,
         restorationEnabled: Bool
     ) {
         guard !didPrepareLaunch else { return }
         didPrepareLaunch = true
 
+        // This token can only be minted after ApplePersistenceIgnoreState has
+        // been installed before NSApplicationMain. Carry it in the state so a
+        // future caller cannot request preservation from a process snapshot or
+        // another late, unverified observation.
+        if let outerArchiveIsolation {
+            archiveWritePolicy = .preserveExisting(outerArchiveIsolation)
+            resolve(
+                .startFresh,
+                discardArchive: false,
+                invalidateSavedState: false
+            )
+            return
+        }
+
         let plan = StartupRestorationPolicy.plan(
-            launchedWithExecuteCommand: launchedWithExecuteCommand,
             restorationEnabled: restorationEnabled,
             archiveMarker: archiveStore.marker
         )
 
         switch plan {
         case .awaitUserDecision:
+            // An explicit marker is reliable enough to put the decision window
+            // on screen before AppKit disables the application while waiting on
+            // asynchronous window-restoration completion handlers. Legacy
+            // installs still wait until a real payload is observed.
+            if archiveStore.marker == .available {
+                presentPromptIfNeeded()
+            }
             return
 
-        case .startFreshPreservingArchive:
-            preservesArchiveForLaunch = true
-            resolve(.startFresh, discardArchive: false, invalidateSavedState: false)
-
         case .startFreshDiscardingArchive:
-            resolve(.startFresh, discardArchive: true, invalidateSavedState: true)
+            archiveWritePolicy = .ownCurrent
+            resolve(
+                .startFresh,
+                discardArchive: true,
+                invalidateSavedState: true
+            )
         }
     }
 
@@ -204,21 +263,61 @@ final class SessionRestorationCoordinator {
         presentPromptIfNeeded()
     }
 
+    /// Queue terminal-producing external work until the restoration decision
+    /// has materialized or discarded every saved window. Returns true when the
+    /// action was deferred; ready launches execute their action at the caller so
+    /// synchronous APIs can retain their normal return value.
+    func deferTerminalLaunchIfNeeded(_ action: @escaping () -> Void) -> Bool {
+        guard isTerminalLaunchDeferred else { return false }
+        deferredTerminalLaunches.append(action)
+        return true
+    }
+
+    /// AppDelegate calls this only after configuration, menus, notifications,
+    /// and signal handlers have been initialized. A launch request that arrived
+    /// early must not construct a controller from partially initialized app
+    /// state even if restoration policy resolved synchronously.
+    func applicationLaunchCompleted() {
+        applicationLaunchIsReady = true
+        drainDeferredTerminalLaunchesIfReady()
+    }
+
     /// Resolve a launch that had no actual AppKit restoration payload. Returns
-    /// false while a real payload is still waiting for user input.
+    /// false while a real payload is still waiting for user input. An isolated
+    /// launch already resolved during preparation; no late process observation
+    /// may turn an ordinary launch into an archive-preserving launch.
     func resolveNoPayloadIfPossible() -> Bool {
         if decision != nil { return true }
         guard !promptIsActive, !hasPendingRequests else { return false }
 
-        resolve(.startFresh, discardArchive: true, invalidateSavedState: false)
+        archiveWritePolicy = .ownCurrent
+        resolve(
+            .startFresh,
+            discardArchive: true,
+            invalidateSavedState: true
+        )
         return true
+    }
+
+    /// AppKit has delivered every restoration completion handler. A restored
+    /// workspace becomes the current process's archive only at this milestone,
+    /// never while individual windows are still being decoded.
+    func restorationMilestoneCompleted() {
+        guard decision == .restore else { return }
+        archiveWritePolicy = .ownCurrent
+    }
+
+    /// `willEncodeRestorableState` is the only normal lifecycle callback that
+    /// grants permission to publish current-workspace availability.
+    func mayEncodeCurrentArchive() -> Bool {
+        archiveWritePolicy == .ownCurrent
     }
 
     /// Record whether the current interactive workspace has restorable state.
     /// One-shot and decision-pending launches deliberately ignore this so an
     /// empty, not-yet-materialized workspace cannot replace the prior marker.
     func recordArchiveAvailability(_ isAvailable: Bool) {
-        guard !preservesExistingArchive else { return }
+        guard archiveWritePolicy == .ownCurrent else { return }
         archiveStore.store(isAvailable ? .available : .discarded)
     }
 
@@ -232,7 +331,6 @@ final class SessionRestorationCoordinator {
 
     private func presentPromptIfNeeded() {
         guard decision == nil,
-              hasPendingRequests,
               !promptIsActive else { return }
 
         promptIsActive = true
@@ -241,6 +339,9 @@ final class SessionRestorationCoordinator {
             self.promptIsActive = false
 
             let discardArchive = decision == .startFresh
+            if discardArchive {
+                self.archiveWritePolicy = .ownCurrent
+            }
             self.resolve(
                 decision,
                 discardArchive: discardArchive,
@@ -257,12 +358,21 @@ final class SessionRestorationCoordinator {
     ) {
         guard gate.decision == nil else { return }
 
-        if discardArchive && !preservesArchiveForLaunch {
+        if discardArchive && archiveWritePolicy == .ownCurrent {
             archiveStore.store(.discarded)
         }
         shouldInvalidateSavedState = invalidateSavedState && !preservesArchiveForLaunch
 
         let actions = gate.resolve(decision)
+        actions.forEach { $0() }
+
+        drainDeferredTerminalLaunchesIfReady()
+    }
+
+    private func drainDeferredTerminalLaunchesIfReady() {
+        guard !isTerminalLaunchDeferred else { return }
+        let actions = deferredTerminalLaunches
+        deferredTerminalLaunches.removeAll()
         actions.forEach { $0() }
     }
 }

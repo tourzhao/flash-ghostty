@@ -4,6 +4,25 @@ import SwiftUI
 
 @Suite
 struct ConfigTests {
+    @Test func cliArgumentsLoadOutsideXcodeAndTests() {
+        #expect(Ghostty.Config.shouldLoadCLIArguments(environment: [:]))
+    }
+
+    @Test func cliArgumentsDoNotLoadInsideXcode() {
+        #expect(!Ghostty.Config.shouldLoadCLIArguments(environment: [
+            "__XCODE_BUILT_PRODUCTS_DIR_PATHS": "/tmp/build",
+        ]))
+    }
+
+    @Test func uiHarnessCanDisableCLIArgumentLoading() {
+        #expect(!Ghostty.Config.shouldLoadCLIArguments(environment: [
+            "GHOSTTY_TEST_DISABLE_CLI_ARGS": "true",
+        ]))
+        #expect(Ghostty.Config.shouldLoadCLIArguments(environment: [
+            "GHOSTTY_TEST_DISABLE_CLI_ARGS": "false",
+        ]))
+    }
+
     // MARK: - Boolean Properties
 
     @Test func initialWindowDefaultsToTrue() throws {

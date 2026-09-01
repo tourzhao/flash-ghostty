@@ -14,9 +14,19 @@ extension Ghostty {
         @Published var pwd: String? {
             didSet {
                 guard pwd != oldValue else { return }
+                if let pwd, !pwd.isEmpty {
+                    lastKnownWorkingDirectory = pwd
+                }
                 invalidateRestorableState()
             }
         }
+
+        /// The last non-empty working directory reported by the terminal.
+        ///
+        /// OSC 7 permits an empty value to mean that the current directory is
+        /// unknown. Keep that UI state in `pwd`, but don't let a transient reset
+        /// erase the directory used for session restoration.
+        private(set) var lastKnownWorkingDirectory: String?
 
         // The cell size of this surface. This is set by the core when the
         // surface is first created and any time the cell size changes (i.e.
@@ -64,8 +74,17 @@ extension Ghostty {
             nil
         }
 
-        init(id: UUID?, frame: CGRect) {
+        init(
+            id: UUID?,
+            frame: CGRect,
+            initialWorkingDirectory: String? = nil
+        ) {
             self.id = id ?? UUID()
+            let initialWorkingDirectory = initialWorkingDirectory.flatMap {
+                $0.isEmpty ? nil : $0
+            }
+            self.pwd = initialWorkingDirectory
+            self.lastKnownWorkingDirectory = initialWorkingDirectory
             super.init(frame: frame)
 
             // Before we initialize the surface we want to register our notifications

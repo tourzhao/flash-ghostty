@@ -2,86 +2,6 @@ import AppKit
 import Foundation
 import SwiftUI
 
-/// Global, user-adjustable presentation preferences for the session sidebar.
-/// These are AppKit UI preferences rather than terminal configuration, so they
-/// live in Ghostty's UserDefaults domain and apply to every sidebar window.
-enum TerminalSessionSidebarPreferences {
-    static let store = UserDefaults.ghostty
-
-    static let sessionFontSizeKey = "SessionSidebarSessionFontSize"
-    static let sidebarWidthKey = "SessionSidebarWidth"
-
-    static let defaultSessionFontSize = 13.0
-    static let defaultSidebarWidth = 260.0
-    static let sessionFontSizeRange = 9.0...18.0
-    static let sidebarWidthRange = 220.0...360.0
-    static let fontSizeStep = 0.5
-
-    static func sessionFontSize(_ value: Double) -> Double {
-        sanitized(value, defaultValue: defaultSessionFontSize, range: sessionFontSizeRange)
-    }
-
-    static func sidebarWidth(_ value: Double) -> Double {
-        sanitized(value, defaultValue: defaultSidebarWidth, range: sidebarWidthRange)
-    }
-
-    static var storedSessionFontSize: Double {
-        let value = (store.object(forKey: sessionFontSizeKey) as? NSNumber)?.doubleValue
-            ?? defaultSessionFontSize
-        return sessionFontSize(value)
-    }
-
-    static var storedSidebarWidth: Double {
-        let value = (store.object(forKey: sidebarWidthKey) as? NSNumber)?.doubleValue
-            ?? defaultSidebarWidth
-        return sidebarWidth(value)
-    }
-
-    static func label(for value: Double) -> String {
-        value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
-    }
-
-    private static func sanitized(
-        _ value: Double,
-        defaultValue: Double,
-        range: ClosedRange<Double>
-    ) -> Double {
-        guard value.isFinite else { return defaultValue }
-        return min(max(value, range.lowerBound), range.upperBound)
-    }
-}
-
-/// The name shown in a session-sidebar row. Terminal-generated window titles
-/// often contain the working directory, so only an explicit user override is
-/// treated as a session name.
-enum TerminalSessionName {
-    static let unnamed = "Blank"
-    static let sidebarWindowTitle = "FLASH-Ghostty"
-
-    static func windowTitle(isSidebar: Bool, regularTitle: String) -> String {
-        isSidebar ? sidebarWindowTitle : regularTitle
-    }
-
-    static func displayName(for titleOverride: String?) -> String {
-        guard let title = titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !title.isEmpty else { return unnamed }
-        return title
-    }
-}
-
-private enum TerminalSessionToolIcons {
-    static let codex = applicationIcon(bundleIdentifier: "com.openai.codex")
-    static let claudeCode = applicationIcon(bundleIdentifier: "com.anthropic.claudefordesktop")
-
-    private static func applicationIcon(bundleIdentifier: String) -> NSImage? {
-        guard let url = NSWorkspace.shared.urlForApplication(
-            withBundleIdentifier: bundleIdentifier
-        ) else { return nil }
-
-        return NSWorkspace.shared.icon(forFile: url.path)
-    }
-}
-
 /// The terminal content root used by the macOS session-sidebar window style.
 ///
 /// Native AppKit tabs each own a separate window and content view. The sidebar
@@ -91,14 +11,50 @@ struct TerminalSessionRootView: View {
     static let minimumSidebarWidth: CGFloat = 220
     static let maximumSidebarWidth: CGFloat = 360
     static let sidebarDividerWidth: CGFloat = 7
+    static let fileBrowserDividerWidth: CGFloat = 7
     static let terminalMetadataHeight: CGFloat = 30
+    static let minimumTerminalContentWidth: CGFloat = 240
 
     static var configuredSidebarWidth: CGFloat {
         CGFloat(TerminalSessionSidebarPreferences.storedSidebarWidth)
     }
 
+    static var configuredFileBrowserWidth: CGFloat {
+        CGFloat(FlashFileBrowserPreferences.storedWidth)
+    }
+
     static func sidebarChromeWidth(isVisible: Bool) -> CGFloat {
         isVisible ? configuredSidebarWidth + sidebarDividerWidth : 0
+    }
+
+    static func fileBrowserChromeWidth(isVisible: Bool) -> CGFloat {
+        isVisible ? configuredFileBrowserWidth + fileBrowserDividerWidth : 0
+    }
+
+    static func minimumContentWidth(
+        isSidebarVisible: Bool,
+        isFileBrowserVisible: Bool,
+        sidebarWidth: CGFloat,
+        fileBrowserWidth: CGFloat
+    ) -> CGFloat {
+        minimumTerminalContentWidth +
+            (isSidebarVisible ? sidebarWidth + sidebarDividerWidth : 0) +
+            (isFileBrowserVisible ? fileBrowserWidth + fileBrowserDividerWidth : 0)
+    }
+
+    static func constrainedMinimumContentWidth(
+        _ requestedWidth: CGFloat,
+        visibleFrameWidth: CGFloat?
+    ) -> CGFloat {
+        guard let visibleFrameWidth, visibleFrameWidth > 0 else {
+            return requestedWidth
+        }
+
+        // Keep a standard half-screen tile available even when both fixed
+        // sidebars are visible. The sidebars remain independently closable if
+        // the user wants a larger terminal viewport in that compact layout.
+        let tiledWidth = max(minimumTerminalContentWidth, visibleFrameWidth * 0.5)
+        return min(requestedWidth, tiledWidth)
     }
 
     @ObservedObject var ghostty: Ghostty.App
@@ -129,30 +85,43 @@ struct TerminalSessionRootView: View {
         store: TerminalSessionSidebarPreferences.store
     ) private var storedSidebarWidth = TerminalSessionSidebarPreferences.defaultSidebarWidth
 
+    @AppStorage(
+        FlashFileBrowserPreferences.widthKey,
+        store: FlashFileBrowserPreferences.store
+    ) private var storedFileBrowserWidth = FlashFileBrowserPreferences.defaultWidth
+
     @State private var sidebarWidthAtDragStart: Double?
+    @State private var fileBrowserWidthAtDragStart: Double?
+    @State private var liveSidebarWidth: Double?
+    @State private var liveFileBrowserWidth: Double?
 
     private var sessionFontSize: Double {
         TerminalSessionSidebarPreferences.sessionFontSize(storedSessionFontSize)
     }
 
     private var sidebarWidth: Double {
-        TerminalSessionSidebarPreferences.sidebarWidth(storedSidebarWidth)
+        liveSidebarWidth ??
+            TerminalSessionSidebarPreferences.sidebarWidth(storedSidebarWidth)
+    }
+
+    private var fileBrowserWidth: Double {
+        liveFileBrowserWidth ??
+            FlashFileBrowserPreferences.width(storedFileBrowserWidth)
+    }
+
+    /// Native tabs retain one root view per AppKit window. Only the selected
+    /// root needs live sidebar trees; every root keeps its terminal mounted.
+    private var mountsLiveSidebars: Bool {
+        // Workspace snapshots publish this compatibility revision whenever
+        // native selection changes. Make that invalidation dependency explicit
+        // even though selection itself is read through the coordinator.
+        _ = controller.sessionSidebarRevision
+        return controller.flashSessionTabCoordinator.isSelected(controller)
     }
 
     var body: some View {
-        let _ = refreshGeneration
         HStack(spacing: 0) {
-            if controller.sessionSidebarIsVisible {
-                TerminalSessionSidebar(
-                    controller: controller,
-                    sessionFontSize: $storedSessionFontSize,
-                    refreshGeneration: refreshGeneration
-                )
-                .frame(width: CGFloat(sidebarWidth))
-                .frame(maxHeight: .infinity)
-
-                sidebarDivider
-            }
+            sessionSidebarChrome
 
             TerminalView(
                 ghostty: ghostty,
@@ -165,6 +134,8 @@ struct TerminalSessionRootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .layoutPriority(1)
+
+            fileBrowserChrome
         }
         // Without an explicit AX container, SwiftUI propagates an identifier
         // applied to a layout-only HStack into its accessible descendants.
@@ -172,6 +143,70 @@ struct TerminalSessionRootView: View {
         // stable identifier, label, and value.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("terminal-session-root")
+        .background {
+            TerminalSessionWindowMinimumWidth(
+                minimumWidth: Self.minimumContentWidth(
+                    isSidebarVisible: controller.sessionSidebarIsVisible,
+                    isFileBrowserVisible: controller.fileBrowserIsVisible,
+                    sidebarWidth: CGFloat(sidebarWidth),
+                    fileBrowserWidth: CGFloat(fileBrowserWidth)
+                )
+            )
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+    }
+
+    /// This helper is one stable sibling of `TerminalView`. Switching between
+    /// live and inert sidebar content cannot replace the terminal subtree.
+    @ViewBuilder
+    private var sessionSidebarChrome: some View {
+        if controller.sessionSidebarIsVisible {
+            if mountsLiveSidebars {
+                TerminalSessionSidebar(
+                    controller: controller,
+                    sessionFontSize: $storedSessionFontSize,
+                    refreshGeneration: refreshGeneration
+                )
+                .frame(width: CGFloat(sidebarWidth))
+                .frame(maxHeight: .infinity)
+
+                sidebarDivider
+            } else {
+                TerminalSidebarPlaceholder()
+                    .frame(width: CGFloat(sidebarWidth))
+                    .frame(maxHeight: .infinity)
+
+                TerminalSidebarPlaceholder()
+                    .frame(width: Self.sidebarDividerWidth)
+                    .frame(maxHeight: .infinity)
+            }
+        }
+    }
+
+    /// Mirrors the selected root's exact right-side chrome width without
+    /// retaining the Finder-style list model in background native tabs.
+    @ViewBuilder
+    private var fileBrowserChrome: some View {
+        if controller.fileBrowserIsVisible {
+            if mountsLiveSidebars {
+                fileBrowserDivider
+
+                TerminalFileBrowserContainer(controller: controller)
+                    .equatable()
+                    .frame(width: CGFloat(fileBrowserWidth))
+                    .frame(maxHeight: .infinity)
+            } else {
+                TerminalSidebarPlaceholder()
+                    .frame(width: Self.fileBrowserDividerWidth)
+                    .frame(maxHeight: .infinity)
+
+                TerminalSidebarPlaceholder()
+                    .frame(width: CGFloat(fileBrowserWidth))
+                    .frame(maxHeight: .infinity)
+            }
+        }
     }
 
     private var sidebarDivider: some View {
@@ -185,6 +220,7 @@ struct TerminalSessionRootView: View {
             .contentShape(Rectangle())
             .gesture(sidebarResizeGesture)
             .onTapGesture(count: 2) {
+                liveSidebarWidth = nil
                 storedSidebarWidth = TerminalSessionSidebarPreferences.defaultSidebarWidth
             }
             .backport.pointerStyle(.resizeLeftRight)
@@ -215,11 +251,15 @@ struct TerminalSessionRootView: View {
                 }
 
                 let start = sidebarWidthAtDragStart ?? sidebarWidth
-                storedSidebarWidth = TerminalSessionSidebarPreferences.sidebarWidth(
+                liveSidebarWidth = TerminalSessionSidebarPreferences.sidebarWidth(
                     start + Double(gesture.translation.width)
                 )
             }
             .onEnded { _ in
+                if let liveSidebarWidth {
+                    storedSidebarWidth = liveSidebarWidth
+                }
+                liveSidebarWidth = nil
                 sidebarWidthAtDragStart = nil
             }
     }
@@ -228,27 +268,106 @@ struct TerminalSessionRootView: View {
         storedSidebarWidth = TerminalSessionSidebarPreferences.sidebarWidth(sidebarWidth + amount)
     }
 
+    private var fileBrowserDivider: some View {
+        ZStack {
+            Color.clear
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(width: 1)
+        }
+            .frame(width: Self.fileBrowserDividerWidth)
+            .contentShape(Rectangle())
+            .gesture(fileBrowserResizeGesture)
+            .onTapGesture(count: 2) {
+                liveFileBrowserWidth = nil
+                storedFileBrowserWidth = FlashFileBrowserPreferences.defaultWidth
+            }
+            .backport.pointerStyle(.resizeLeftRight)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("File Sidebar Divider")
+            .accessibilityValue("\(Int(fileBrowserWidth)) points")
+            .accessibilityHint("Drag to resize the file sidebar. Double-click to reset.")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment:
+                    adjustFileBrowserWidth(by: 10)
+                case .decrement:
+                    adjustFileBrowserWidth(by: -10)
+                @unknown default:
+                    break
+                }
+            }
+            .accessibilityIdentifier("terminal-file-sidebar.divider")
+            .zIndex(1)
+    }
+
+    private var fileBrowserResizeGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { gesture in
+                if fileBrowserWidthAtDragStart == nil {
+                    fileBrowserWidthAtDragStart = fileBrowserWidth
+                }
+
+                let start = fileBrowserWidthAtDragStart ?? fileBrowserWidth
+                liveFileBrowserWidth = FlashFileBrowserPreferences.width(
+                    start - Double(gesture.translation.width)
+                )
+            }
+            .onEnded { _ in
+                if let liveFileBrowserWidth {
+                    storedFileBrowserWidth = liveFileBrowserWidth
+                }
+                liveFileBrowserWidth = nil
+                fileBrowserWidthAtDragStart = nil
+            }
+    }
+
+    private func adjustFileBrowserWidth(by amount: Double) {
+        storedFileBrowserWidth = FlashFileBrowserPreferences.width(
+            fileBrowserWidth + amount
+        )
+    }
+
     @ViewBuilder
     private var workingDirectoryHeader: some View {
-        let url = controller.sessionWorkingDirectory
+        TerminalWorkingDirectoryHeader(
+            controller: controller,
+            metadata: controller.sessionMetadata,
+            fontSize: sessionFontSize,
+            height: Self.terminalMetadataHeight
+        )
+    }
+}
+
+/// Observes only the metadata needed by the titlebar. Provider polling can
+/// update this view without rebuilding the terminal renderer or both sidebars.
+private struct TerminalWorkingDirectoryHeader: View {
+    @ObservedObject var controller: TerminalController
+    @ObservedObject var metadata: TerminalSessionMetadataMonitor
+    let fontSize: Double
+    let height: CGFloat
+
+    var body: some View {
+        let url = metadata.workingDirectory
         let displayPath = SessionWorkingDirectory.displayPath(for: url)
 
         HStack(spacing: 6) {
             Spacer(minLength: 8)
 
             Image(systemName: "folder")
-                .font(.system(size: sessionFontSize, weight: .regular))
+                .font(.system(size: fontSize, weight: .regular))
                 .foregroundStyle(Color(nsColor: .systemTeal))
                 .accessibilityHidden(true)
 
             Text("Directory")
-                .font(.system(size: sessionFontSize, weight: .regular))
+                .font(.system(size: fontSize, weight: .regular))
                 .foregroundStyle(Color(nsColor: .systemTeal))
                 .lineLimit(1)
 
             Text(displayPath ?? "Loading…")
                 .font(.system(
-                    size: sessionFontSize,
+                    size: fontSize,
                     weight: .regular,
                     design: .monospaced
                 ))
@@ -261,10 +380,35 @@ struct TerminalSessionRootView: View {
                 .accessibilityLabel("Working Directory")
                 .accessibilityValue(url?.standardizedFileURL.path ?? "Loading")
                 .accessibilityIdentifier("terminal-session-working-directory.text")
+
+            Button {
+                controller.toggleFileBrowser()
+            } label: {
+                Image(systemName: "sidebar.right")
+                    .font(.system(size: fontSize, weight: .regular))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(
+                controller.fileBrowserIsVisible
+                    ? Color(nsColor: .systemTeal)
+                    : Color.secondary
+            )
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color.primary.opacity(0.06))
+            )
+            .help(controller.fileBrowserIsVisible ? "Hide File Sidebar" : "Show File Sidebar")
+            .accessibilityLabel(
+                controller.fileBrowserIsVisible ? "Hide File Sidebar" : "Show File Sidebar"
+            )
+            .accessibilityValue(controller.fileBrowserIsVisible ? "Shown" : "Hidden")
+            .accessibilityIdentifier("terminal-file-sidebar.toggle")
         }
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, alignment: .trailing)
-        .frame(height: Self.terminalMetadataHeight)
+        .frame(height: height)
         .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .bottom) {
             Divider()
@@ -277,847 +421,98 @@ struct TerminalSessionRootView: View {
     }
 }
 
-enum SessionWorkingDirectory {
-    static func displayPath(for url: URL?) -> String? {
-        guard let url else { return nil }
+/// Prevents high-frequency terminal metadata changes from rebuilding the
+/// Finder-style file list. The browser observes its narrow session state and
+/// model directly, so equal controller identity is the only parent input that
+/// matters while this sidebar remains mounted.
+private struct TerminalFileBrowserContainer: View, Equatable {
+    let controller: TerminalController
 
-        let path = url.standardizedFileURL.path
-        guard !path.isEmpty else { return nil }
-        return path
-    }
-}
-
-private struct TerminalSessionSidebar: View {
-    @ObservedObject var controller: TerminalController
-    @Binding var sessionFontSize: Double
-    let refreshGeneration: UInt
-    @State private var searchText = ""
-    @State private var isFontSizePopoverPresented = false
-
-    private var effectiveSessionFontSize: Double {
-        TerminalSessionSidebarPreferences.sessionFontSize(sessionFontSize)
-    }
-
-    private var sessionControllers: [TerminalController] {
-        // Reading the revision makes tab membership and ordering mutations an
-        // explicit dependency of this view, even though the rows are computed.
-        _ = refreshGeneration
-        _ = controller.sessionSidebarRevision
-        return controller.sessionSidebarControllers
+    static func == (
+        lhs: TerminalFileBrowserContainer,
+        rhs: TerminalFileBrowserContainer
+    ) -> Bool {
+        lhs.controller === rhs.controller
     }
 
     var body: some View {
-        let sessions = sessionControllers
-        let visibleSessions = filteredSessions(sessions)
-
-        VStack(spacing: 0) {
-            header(sessionCount: sessions.count)
-            searchField
-
-            Divider()
-                .padding(.top, 10)
-
-            if visibleSessions.isEmpty {
-                emptySearchResult
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 4) {
-                        ForEach(visibleSessions, id: \.sessionSidebarIdentity) { session in
-                            TerminalSessionSidebarRow(
-                                hostController: controller,
-                                sessionController: session,
-                                allControllers: sessions,
-                                isSelected: isSessionSelected(session),
-                                fontSize: effectiveSessionFontSize
-                            )
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 8)
-                }
-                .accessibilityIdentifier("terminal-session-sidebar.list")
-            }
+        FlashFileBrowserSidebar(controller: controller) {
+            controller.toggleFileBrowser()
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .controlBackgroundColor))
-        // Establish a semantic boundary before assigning the identifier.
-        // Without this, SwiftUI flattens the VStack and the outer
-        // `terminal-session-root` identifier propagates to its children,
-        // leaving no accessibility element for the sidebar itself.
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Session Sidebar")
-        .accessibilityIdentifier("terminal-session-sidebar")
-    }
-
-    @ViewBuilder
-    private func header(sessionCount: Int) -> some View {
-        HStack(spacing: 8) {
-            Text("Sessions")
-                .font(.system(size: 15, weight: .regular))
-
-            Text("\(sessionCount)")
-                .font(.caption2.weight(.regular))
-                .monospacedDigit()
-                .foregroundStyle(Color(nsColor: .systemPurple))
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(
-                    Capsule()
-                        .fill(Color(nsColor: .systemPurple).opacity(0.14))
-                )
-                .accessibilityLabel("\(sessionCount) sessions")
-                .accessibilityIdentifier("terminal-session-sidebar.count")
-
-            Spacer(minLength: 8)
-
-            fontSizeButton
-
-            Button {
-                controller.newSessionFromSidebar()
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundStyle(Color(nsColor: .systemBlue))
-                    .frame(width: 24, height: 24)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color(nsColor: .systemBlue).opacity(0.14))
-                    )
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("New Session")
-            .accessibilityLabel("New Session")
-            .accessibilityIdentifier("terminal-session-sidebar.new")
-        }
-        .padding(.horizontal, 12)
-        .padding(.top, 12)
-        .padding(.bottom, 10)
-    }
-
-    private var fontSizeButton: some View {
-        Button {
-            isFontSizePopoverPresented.toggle()
-        } label: {
-            Image(systemName: "textformat.size")
-                .font(.system(size: 11, weight: .regular))
-                .foregroundStyle(Color(nsColor: .systemPurple))
-                .frame(width: 24, height: 24)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color(nsColor: .systemPurple).opacity(0.14))
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .popover(isPresented: $isFontSizePopoverPresented, arrowEdge: .bottom) {
-            TerminalSessionFontSizePopover(
-                value: effectiveSessionFontSize,
-                onCommit: { value in
-                    sessionFontSize = value
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak controller] in
-                        controller?.sessionSidebarFontSizeDidChange()
-                    }
-                }
-            )
-        }
-        .help("Adjust Session Text Size")
-        .accessibilityLabel("Adjust Session Text Size")
-        .accessibilityIdentifier("terminal-session-sidebar.font-size")
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 7) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 11, weight: .regular))
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-
-            TextField("Search sessions", text: $searchText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .accessibilityLabel("Search Sessions")
-                .accessibilityIdentifier("terminal-session-sidebar.search")
-
-            if !searchText.isEmpty {
-                Button {
-                    searchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Clear Search")
-                .accessibilityLabel("Clear Search")
-                .accessibilityIdentifier("terminal-session-sidebar.clear-search")
-            }
-        }
-        .padding(.horizontal, 9)
-        .frame(height: 30)
-        .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color.primary.opacity(0.065))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 7)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-        )
-        .padding(.horizontal, 10)
-    }
-
-    private var emptySearchResult: some View {
-        VStack(spacing: 9) {
-            Spacer()
-
-            Image(systemName: "magnifyingglass.circle")
-                .font(.system(size: 25, weight: .light))
-                .foregroundStyle(.tertiary)
-                .accessibilityHidden(true)
-
-            Text("No matching sessions")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-
-            if !searchText.isEmpty {
-                Button("Clear Search") {
-                    searchText = ""
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.accentColor)
-                .accessibilityIdentifier("terminal-session-sidebar.empty-clear-search")
-            }
-
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("terminal-session-sidebar.empty")
-    }
-
-    private func filteredSessions(_ sessions: [TerminalController]) -> [TerminalController] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return sessions }
-
-        return sessions.filter { session in
-            let title = TerminalSessionName.displayName(for: session.titleOverride)
-            return title.localizedCaseInsensitiveContains(query)
-        }
-    }
-
-    private func isSessionSelected(_ session: TerminalController) -> Bool {
-        controller.isSessionSelectedFromSidebar(session)
     }
 }
 
-/// Keeps font-size adjustments inside the popover's own AttributeGraph. The
-/// main sidebar receives one committed value only after the popover has fully
-/// closed, so changing text metrics cannot re-enter the presenting layout.
-private struct TerminalSessionFontSizePopover: View {
-    @Environment(\.dismiss) private var dismiss
-
-    private let initialValue: Double
-    private let onCommit: (Double) -> Void
-    @State private var draftValue: Double
-
-    init(value: Double, onCommit: @escaping (Double) -> Void) {
-        let value = TerminalSessionSidebarPreferences.sessionFontSize(value)
-        self.initialValue = value
-        self.onCommit = onCommit
-        _draftValue = State(initialValue: value)
-    }
-
-    private var effectiveValue: Double {
-        TerminalSessionSidebarPreferences.sessionFontSize(draftValue)
-    }
-
+/// Preserves native-tab geometry while omitting the expensive sidebar view
+/// trees from background roots. It deliberately exposes no interaction or AX
+/// nodes because the corresponding AppKit window is not selected.
+private struct TerminalSidebarPlaceholder: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Session Text Size")
-                .font(.system(size: 13, weight: .regular))
-
-            HStack(spacing: 8) {
-                Text("Session text")
-                    .font(.system(size: 11, weight: .regular))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                controlButton(
-                    systemName: "textformat.size.smaller",
-                    help: "Decrease Session text font size",
-                    identifier: "terminal-session-sidebar.font-size.session.decrease"
-                ) {
-                    adjust(by: -TerminalSessionSidebarPreferences.fontSizeStep)
-                }
-                .disabled(
-                    effectiveValue <=
-                        TerminalSessionSidebarPreferences.sessionFontSizeRange.lowerBound
-                )
-
-                Text("\(TerminalSessionSidebarPreferences.label(for: effectiveValue)) pt")
-                    .font(.system(size: 10.5, weight: .regular, design: .monospaced))
-                    .monospacedDigit()
-                    .frame(width: 45)
-                    .accessibilityLabel("Session text font size")
-                    .accessibilityValue(
-                        "\(TerminalSessionSidebarPreferences.label(for: effectiveValue)) points"
-                    )
-                    .accessibilityIdentifier(
-                        "terminal-session-sidebar.font-size.session.value"
-                    )
-
-                controlButton(
-                    systemName: "textformat.size.larger",
-                    help: "Increase Session text font size",
-                    identifier: "terminal-session-sidebar.font-size.session.increase"
-                ) {
-                    adjust(by: TerminalSessionSidebarPreferences.fontSizeStep)
-                }
-                .disabled(
-                    effectiveValue >=
-                        TerminalSessionSidebarPreferences.sessionFontSizeRange.upperBound
-                )
-
-                controlButton(
-                    systemName: "arrow.counterclockwise",
-                    help: "Reset Session text font size",
-                    identifier: "terminal-session-sidebar.font-size.session.reset"
-                ) {
-                    draftValue = TerminalSessionSidebarPreferences.defaultSessionFontSize
-                }
-                .disabled(
-                    effectiveValue ==
-                        TerminalSessionSidebarPreferences.defaultSessionFontSize
-                )
-            }
-
-            Text(
-                "Applies to session names, working directory, and window title " +
-                    "in every sidebar window after this popover closes."
-            )
-            .font(.system(size: 10, weight: .regular))
-            .foregroundStyle(.secondary)
-
-            HStack {
-                Spacer()
-                Button("Done") {
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-                .accessibilityIdentifier("terminal-session-sidebar.font-size.done")
-            }
-        }
-        .padding(14)
-        .frame(width: 290)
-        .accessibilityIdentifier("terminal-session-sidebar.font-size.popover")
-        .onDisappear {
-            let value = effectiveValue
-            guard value != initialValue else { return }
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                onCommit(value)
-            }
-        }
-    }
-
-    private func controlButton(
-        systemName: String,
-        help: String,
-        identifier: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 10, weight: .regular))
-                .frame(width: 22, height: 22)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.primary.opacity(0.08))
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-        .accessibilityLabel(help)
-        .accessibilityIdentifier(identifier)
-    }
-
-    private func adjust(by amount: Double) {
-        draftValue = TerminalSessionSidebarPreferences.sessionFontSize(
-            effectiveValue + amount
-        )
+        Color(nsColor: .controlBackgroundColor)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
-private struct TerminalSessionSidebarRow: View {
-    private static let contentHeight: CGFloat = 56
-    private static let terminalAccentColors: [NSColor] = [
-        .systemIndigo,
-        .systemPurple,
-        .systemTeal,
-        .systemPink,
-        .systemBlue,
-    ]
+/// Keeps both fixed-width sidebars and a usable terminal viewport on screen.
+/// AppKit applies this constraint during live resizing and when a sidebar is
+/// shown or resized. The requested width is capped so ordinary half-screen
+/// tiling remains available, and any pre-existing AppKit minimum is preserved.
+private struct TerminalSessionWindowMinimumWidth: NSViewRepresentable {
+    let minimumWidth: CGFloat
 
-    let hostController: TerminalController
-    @ObservedObject var sessionController: TerminalController
-    let allControllers: [TerminalController]
-    let isSelected: Bool
-    let fontSize: Double
-
-    @State private var isHovered = false
-    @State private var isRenaming = false
-    @State private var draftTitle = ""
-    @FocusState private var isRenameFieldFocused: Bool
-
-    private var rowIdentifier: String {
-        "terminal-session-sidebar.row.\(sessionController.sessionSidebarIdentity)"
+    func makeNSView(context: Context) -> WindowMinimumWidthView {
+        let view = WindowMinimumWidthView()
+        view.minimumWidth = minimumWidth
+        return view
     }
 
-    private var title: String {
-        TerminalSessionName.displayName(for: sessionController.titleOverride)
+    func updateNSView(_ nsView: WindowMinimumWidthView, context: Context) {
+        guard nsView.minimumWidth != minimumWidth else { return }
+        nsView.minimumWidth = minimumWidth
     }
 
-    private var tabColor: NSColor? {
-        (sessionController.window as? TerminalWindow)?.tabColor.displayColor
-    }
+    final class WindowMinimumWidthView: NSView {
+        private weak var trackedWindow: NSWindow?
+        private var baselineMinimumWidth: CGFloat = 0
 
-    private var sessionTool: TerminalSessionTool {
-        sessionController.sessionTool
-    }
-
-    private var activityStatus: TerminalSessionActivityStatus {
-        sessionController.sessionActivityStatus
-    }
-
-    private var instruction: String {
-        sessionController.sessionLastInstruction ?? "No previous instruction"
-    }
-
-    private var hasInstruction: Bool {
-        sessionController.sessionLastInstruction != nil
-    }
-
-    private var sessionNameFontSize: Double {
-        min(12, max(9, fontSize * 0.75))
-    }
-
-    private var sessionAccentColor: Color {
-        switch sessionTool {
-        case .codex:
-            return Color(nsColor: .systemTeal)
-        case .claudeCode:
-            return Color(nsColor: .systemOrange)
-        case .terminal:
-            let index = allControllers.firstIndex(where: { $0 === sessionController }) ?? 0
-            let color = Self.terminalAccentColors[index % Self.terminalAccentColors.count]
-            return Color(nsColor: color)
-        }
-    }
-
-    private var rowBackground: Color {
-        if isSelected {
-            return sessionAccentColor.opacity(0.20)
-        }
-
-        return isHovered ? sessionAccentColor.opacity(0.09) : .clear
-    }
-
-    private var canCloseOtherSessions: Bool {
-        allControllers.count > 1
-    }
-
-    private var canCloseSessionsToRight: Bool {
-        guard let index = allControllers.firstIndex(where: { $0 === sessionController }) else {
-            return false
-        }
-
-        return index < allControllers.count - 1
-    }
-
-    var body: some View {
-        HStack(spacing: 6) {
-            sessionNameControl
-            trailingControls
-        }
-        // The name owns the first line; the icon and last instruction share
-        // the second. This fixed height keeps spacing stable across 9...18 pt.
-        .frame(height: Self.contentHeight)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(rowBackground)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(
-                    isSelected ? sessionAccentColor.opacity(0.50) : Color.clear,
-                    lineWidth: 1
-                )
-        )
-        .overlay(alignment: .leading) {
-            if isSelected {
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(sessionAccentColor)
-                    .frame(width: 3)
-                    .padding(.vertical, 8)
+        var minimumWidth: CGFloat = 0 {
+            didSet {
+                guard minimumWidth != oldValue else { return }
+                applyMinimumWidth()
             }
         }
-        .contentShape(Rectangle())
-        .onHover { isHovered = $0 }
-        .onChange(of: isRenameFieldFocused) { focused in
-            guard !focused, isRenaming else { return }
 
-            // Defer so a cancel-button click can exit editing before focus
-            // loss is interpreted as a commit.
-            DispatchQueue.main.async {
-                guard isRenaming, !isRenameFieldFocused else { return }
-                commitRename(restoreTerminalFocus: false)
-            }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            applyMinimumWidth()
         }
-        .contextMenu { contextMenu }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier(rowIdentifier)
-    }
 
-    @ViewBuilder
-    private var sessionNameControl: some View {
-        if isRenaming {
-            VStack(alignment: .leading, spacing: 3) {
-                TextField("Session name", text: $draftTitle)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: sessionNameFontSize, weight: .regular))
-                    .focused($isRenameFieldFocused)
-                    .onSubmit {
-                        commitRename(restoreTerminalFocus: true)
-                    }
-                    .onExitCommand {
-                        cancelRename(restoreTerminalFocus: true)
-                    }
-                    .padding(.horizontal, 6)
-                    .frame(height: 22)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(Color(nsColor: .textBackgroundColor))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 5)
-                            .strokeBorder(sessionAccentColor.opacity(0.75), lineWidth: 1)
-                    )
-                    .accessibilityLabel("Session Name")
-                    .accessibilityHint("Leave blank to display Blank in the sidebar")
-                    .accessibilityIdentifier("\(rowIdentifier).name-field")
-
-                HStack(spacing: 10) {
-                    sessionIcon
-                    instructionText
-                }
+        private func applyMinimumWidth() {
+            guard let window, minimumWidth > 0 else { return }
+            if trackedWindow !== window {
+                trackedWindow = window
+                baselineMinimumWidth = window.contentMinSize.width
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            Button {
-                hostController.selectSessionFromSidebar(sessionController)
-            } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
-                        .font(.system(size: sessionNameFontSize, weight: .regular))
-                        .foregroundStyle(isSelected ? sessionAccentColor : .secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
 
-                    HStack(spacing: 10) {
-                        sessionIcon
-                        instructionText
-                    }
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .help("\(title)\n\(instruction)")
-            .accessibilityLabel("Select \(title)")
-            .accessibilityValue(
-                accessibilityValue
+            let constrainedWidth = TerminalSessionRootView.constrainedMinimumContentWidth(
+                minimumWidth,
+                visibleFrameWidth: window.screen?.visibleFrame.width
             )
-            .accessibilityHint("Select session")
-            .accessibilityIdentifier("\(rowIdentifier).select")
-        }
-    }
+            let appliedWidth = max(baselineMinimumWidth, constrainedWidth)
 
-    private var instructionText: some View {
-        Text(instruction)
-            .font(.system(size: fontSize, weight: .regular))
-            .foregroundStyle(hasInstruction ? .primary : .tertiary)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
-            .help(instruction)
-    }
-
-    private var accessibilityValue: String {
-        var parts: [String] = []
-        if isSelected { parts.append("Selected") }
-        parts.append(activityStatusLabel)
-        parts.append("Last instruction: \(instruction)")
-        return parts.joined(separator: ", ")
-    }
-
-    private var activityStatusLabel: String {
-        switch activityStatus {
-        case .ready: return "Ready"
-        case .active: return "Active"
-        case .paused: return "Needs input"
-        case .completed: return "Complete"
-        case .failed: return "Failed"
-        }
-    }
-
-    private var activityStatusSystemName: String {
-        switch activityStatus {
-        case .ready: return "circle.fill"
-        case .active: return "bolt.fill"
-        case .paused: return "pause.fill"
-        case .completed: return "checkmark"
-        case .failed: return "exclamationmark"
-        }
-    }
-
-    private var activityStatusColor: Color {
-        switch activityStatus {
-        case .ready: return Color(nsColor: .systemGray)
-        case .active: return Color(nsColor: .systemBlue)
-        case .paused: return Color(nsColor: .systemOrange)
-        case .completed: return Color(nsColor: .systemGreen)
-        case .failed: return Color(nsColor: .systemRed)
-        }
-    }
-
-    private var sessionIcon: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(sessionIconBackground)
-                .frame(width: 30, height: 30)
-
-            sessionIconGlyph
-                .frame(width: 30, height: 30)
-        }
-        .frame(width: 30, height: 30)
-        .overlay(alignment: .topTrailing) {
-            if let tabColor {
-                Circle()
-                    .fill(Color(nsColor: tabColor))
-                    .frame(width: 7, height: 7)
-                    .overlay(
-                        Circle()
-                            .stroke(Color(nsColor: .controlBackgroundColor), lineWidth: 1)
-                    )
-                    .offset(x: 2, y: -2)
-                    .accessibilityLabel("Tab color")
+            var minimumSize = window.contentMinSize
+            if minimumSize.width != appliedWidth {
+                minimumSize.width = appliedWidth
+                window.contentMinSize = minimumSize
             }
+
+            // Only correct an undersized window before it is presented. Never
+            // jump a visible/tiled window when the user toggles a sidebar.
+            guard !window.isVisible,
+                  window.contentLayoutRect.width < appliedWidth else { return }
+            var contentSize = window.contentLayoutRect.size
+            contentSize.width = appliedWidth
+            window.setContentSize(contentSize)
         }
-        .overlay(alignment: .bottomTrailing) {
-            Circle()
-                .fill(activityStatusColor.opacity(0.18))
-                .frame(width: 13, height: 13)
-                .overlay(
-                    Circle()
-                        .stroke(activityStatusColor.opacity(0.85), lineWidth: 1)
-                )
-                .overlay(
-                    Image(systemName: activityStatusSystemName)
-                        .font(.system(size: 7, weight: .regular))
-                        .foregroundStyle(activityStatusColor)
-                )
-                .offset(x: 2, y: 2)
-        }
-        .accessibilityHidden(true)
-    }
-
-    private var sessionIconBackground: Color {
-        sessionAccentColor.opacity(isSelected ? 0.28 : 0.16)
-    }
-
-    @ViewBuilder
-    private var sessionIconGlyph: some View {
-        switch sessionTool {
-        case .codex:
-            if let icon = TerminalSessionToolIcons.codex {
-                Image(nsImage: icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 24, height: 24)
-            } else {
-                Text("C")
-                    .font(.system(size: 14, weight: .regular, design: .rounded))
-                    .foregroundStyle(sessionAccentColor)
-            }
-        case .claudeCode:
-            if let icon = TerminalSessionToolIcons.claudeCode {
-                Image(nsImage: icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 24, height: 24)
-            } else {
-                Text("✳")
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(sessionAccentColor)
-            }
-        case .terminal:
-            ghosttyIconImage()
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 24, height: 24)
-        }
-    }
-
-    private var trailingControls: some View {
-        HStack(spacing: 2) {
-            if isRenaming {
-                rowActionButton(
-                    systemName: "checkmark",
-                    help: "Save Session Name",
-                    identifier: "\(rowIdentifier).save-name"
-                ) {
-                    commitRename(restoreTerminalFocus: true)
-                }
-
-                rowActionButton(
-                    systemName: "xmark",
-                    help: "Cancel Rename",
-                    identifier: "\(rowIdentifier).cancel-name"
-                ) {
-                    cancelRename(restoreTerminalFocus: true)
-                }
-            } else if isHovered || isSelected {
-                rowActionButton(
-                    systemName: "pencil",
-                    help: "Rename Session",
-                    identifier: "\(rowIdentifier).rename",
-                    action: beginRename
-                )
-
-                if isHovered {
-                    rowActionButton(
-                        systemName: "xmark",
-                        help: "Close Session",
-                        identifier: "\(rowIdentifier).close"
-                    ) {
-                        hostController.closeSessionFromSidebar(sessionController)
-                    }
-                } else if sessionController.bell {
-                    Image(systemName: "bell.fill")
-                        .font(.system(size: 10, weight: .regular))
-                        .foregroundColor(.orange)
-                        .frame(width: 20, height: 20)
-                        .accessibilityLabel("Bell active")
-                }
-            } else if sessionController.bell {
-                Image(systemName: "bell.fill")
-                    .font(.system(size: 10, weight: .regular))
-                    .foregroundColor(.orange)
-                    .frame(width: 20, height: 20)
-                    .accessibilityLabel("Bell active")
-            }
-        }
-        .frame(width: 46, height: Self.contentHeight, alignment: .trailing)
-    }
-
-    private func rowActionButton(
-        systemName: String,
-        help: String,
-        identifier: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 9, weight: .regular))
-                .frame(width: 20, height: 20)
-                .background(
-                    Circle()
-                        .fill(Color.primary.opacity(0.09))
-                )
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-        .accessibilityLabel(help)
-        .accessibilityIdentifier(identifier)
-    }
-
-    @ViewBuilder
-    private var contextMenu: some View {
-        Button("Rename Session") {
-            // Wait for the context menu to dismiss before requesting focus.
-            DispatchQueue.main.async {
-                beginRename()
-            }
-        }
-
-        Divider()
-
-        Button("Close Other Sessions") {
-            hostController.closeOtherSessionsFromSidebar(sessionController)
-        }
-        .disabled(!canCloseOtherSessions)
-
-        Button("Close Sessions to the Right") {
-            hostController.closeSessionsToRightFromSidebar(sessionController)
-        }
-        .disabled(!canCloseSessionsToRight)
-
-        Divider()
-
-        Button("Close Session", role: .destructive) {
-            hostController.closeSessionFromSidebar(sessionController)
-        }
-    }
-
-    private func beginRename() {
-        guard !isRenaming else { return }
-
-        draftTitle = sessionController.titleOverride ?? ""
-        isRenaming = true
-
-        DispatchQueue.main.async {
-            guard isRenaming else { return }
-            isRenameFieldFocused = true
-        }
-    }
-
-    private func commitRename(restoreTerminalFocus: Bool) {
-        guard isRenaming else { return }
-
-        let newTitle = draftTitle
-        isRenaming = false
-        isRenameFieldFocused = false
-        hostController.setSessionNameFromSidebar(sessionController, name: newTitle)
-
-        if restoreTerminalFocus {
-            DispatchQueue.main.async {
-                hostController.restoreTerminalFocusAfterSidebarRename()
-            }
-        }
-    }
-
-    private func cancelRename(restoreTerminalFocus: Bool) {
-        guard isRenaming else { return }
-
-        isRenaming = false
-        isRenameFieldFocused = false
-
-        if restoreTerminalFocus {
-            DispatchQueue.main.async {
-                hostController.restoreTerminalFocusAfterSidebarRename()
-            }
-        }
-    }
-}
-
-private extension TerminalController {
-    var sessionSidebarIdentity: SessionWorkspace.SessionID {
-        sessionID
     }
 }

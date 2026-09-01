@@ -3448,6 +3448,129 @@ const ScrollAmount = struct {
     }
 };
 
+/// A single platform scroll event should never represent thousands of whole
+/// cells. Bounding it also prevents malformed embedded-API input from turning
+/// into an unbounded mouse-report loop.
+const max_scroll_delta_per_event: f64 = 4096;
+
+/// Convert pixel scroll input into whole-cell movement while preserving the
+/// sub-cell remainder for the next event.
+fn accumulatePixelScroll(
+    pending: *f64,
+    offset: f64,
+    cell_size: f64,
+) ScrollAmount {
+    if (!std.math.isFinite(pending.*) or
+        !std.math.isFinite(offset) or
+        !std.math.isFinite(cell_size) or
+        cell_size <= 0)
+    {
+        pending.* = 0;
+        return .{};
+    }
+
+    const poff = pending.* + offset;
+    if (!std.math.isFinite(poff)) {
+        pending.* = 0;
+        return .{};
+    }
+    if (@abs(poff) < cell_size) {
+        pending.* = poff;
+        return .{};
+    }
+
+    // Round towards zero so a direction change can cancel the pending
+    // remainder before producing movement in the opposite direction.
+    const amount = poff / cell_size;
+    if (!std.math.isFinite(amount) or
+        @abs(amount) > max_scroll_delta_per_event)
+    {
+        pending.* = 0;
+        return .{};
+    }
+    assert(@abs(amount) >= 1);
+    const delta: isize = @intFromFloat(@trunc(amount));
+    assert(@abs(delta) >= 1);
+
+    const consumed: f64 = @floatFromInt(delta);
+    pending.* = poff - (consumed * cell_size);
+    return .{ .delta = delta };
+}
+
+test "pixel scroll preserves sub-cell remainder" {
+    const testing = std.testing;
+
+    var pending: f64 = 0;
+    try testing.expectEqual(
+        @as(isize, 1),
+        accumulatePixelScroll(&pending, 13, 10).delta,
+    );
+    try testing.expectEqual(@as(f64, 3), pending);
+
+    try testing.expectEqual(
+        @as(isize, 0),
+        accumulatePixelScroll(&pending, 6, 10).delta,
+    );
+    try testing.expectEqual(@as(f64, 9), pending);
+
+    try testing.expectEqual(
+        @as(isize, 1),
+        accumulatePixelScroll(&pending, 1, 10).delta,
+    );
+    try testing.expectEqual(@as(f64, 0), pending);
+}
+
+test "pixel scroll preserves negative remainder and direction changes" {
+    const testing = std.testing;
+
+    var pending: f64 = 6;
+    try testing.expectEqual(
+        @as(isize, 0),
+        accumulatePixelScroll(&pending, -13, 10).delta,
+    );
+    try testing.expectEqual(@as(f64, -7), pending);
+
+    try testing.expectEqual(
+        @as(isize, -1),
+        accumulatePixelScroll(&pending, -5, 10).delta,
+    );
+    try testing.expectEqual(@as(f64, -2), pending);
+
+    try testing.expectEqual(
+        @as(isize, 0),
+        accumulatePixelScroll(&pending, 8, 10).delta,
+    );
+    try testing.expectEqual(@as(f64, 6), pending);
+}
+
+test "pixel scroll rejects invalid and unbounded embedded input" {
+    const testing = std.testing;
+
+    var pending: f64 = 4;
+    try testing.expectEqual(
+        @as(isize, 0),
+        accumulatePixelScroll(&pending, std.math.nan(f64), 10).delta,
+    );
+    try testing.expectEqual(@as(f64, 0), pending);
+
+    pending = 4;
+    try testing.expectEqual(
+        @as(isize, 0),
+        accumulatePixelScroll(&pending, 10, 0).delta,
+    );
+    try testing.expectEqual(@as(f64, 0), pending);
+
+    try testing.expectEqual(
+        @as(isize, 0),
+        accumulatePixelScroll(
+            &pending,
+            (max_scroll_delta_per_event + 1) * 10,
+            10,
+        ).delta,
+    );
+    try testing.expectEqual(@as(f64, 0), pending);
+}
+
 /// Mouse scroll event. Negative is down, left. Positive is up, right.
 ///
 /// "Natural scrolling" is a macOS term for inverting the scroll direction.
@@ -3464,6 +3587,17 @@ pub fn scrollCallback(
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
+
+    // The embedded API accepts doubles directly. Reject non-finite or
+    // implausibly large values before any float-to-integer conversion or
+    // per-cell mouse-report loop can trap or monopolize the GUI thread.
+    if (!std.math.isFinite(xoff) or
+        !std.math.isFinite(yoff) or
+        @abs(xoff) > max_scroll_delta_per_event or
+        @abs(yoff) > max_scroll_delta_per_event)
+    {
+        return;
+    }
 
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
@@ -3504,25 +3638,11 @@ pub fn scrollCallback(
         // so that we move further away from zero, but we don't assert
         // this because in theory a user could scroll in the opposite
         // direction and undo a pending scroll.
-        const poff: f64 = self.mouse.pending_scroll_y + yoff_adjusted;
-
-        // If the new offset is less than a single unit of scroll, we save
-        // the new pending value and do not scroll yet.
-        if (@abs(poff) < cell_size) {
-            self.mouse.pending_scroll_y = poff;
-            break :y .{};
-        }
-
-        // We scroll by the number of rows in the offset and save the remainder
-        const amount = poff / cell_size;
-        assert(@abs(amount) >= 1);
-        self.mouse.pending_scroll_y = poff - (amount * cell_size);
-
-        // Round towards zero.
-        const delta: isize = @intFromFloat(@trunc(amount));
-        assert(@abs(delta) >= 1);
-
-        break :y .{ .delta = delta };
+        break :y accumulatePixelScroll(
+            &self.mouse.pending_scroll_y,
+            yoff_adjusted,
+            cell_size,
+        );
     };
 
     // For detailed comments see the y calculation above.
@@ -3532,19 +3652,12 @@ pub fn scrollCallback(
             break :x .{ .delta = x_delta_isize };
         }
 
-        const poff: f64 = self.mouse.pending_scroll_x + xoff;
         const cell_size: f64 = @floatFromInt(self.size.cell.width);
-        if (@abs(poff) < cell_size) {
-            self.mouse.pending_scroll_x = poff;
-            break :x .{};
-        }
-
-        const amount = poff / cell_size;
-        assert(@abs(amount) >= 1);
-        self.mouse.pending_scroll_x = poff - (amount * cell_size);
-        const delta: isize = @intFromFloat(@trunc(amount));
-        assert(@abs(delta) >= 1);
-        break :x .{ .delta = delta };
+        break :x accumulatePixelScroll(
+            &self.mouse.pending_scroll_x,
+            xoff,
+            cell_size,
+        );
     };
 
     // log.info("SCROLL: delta_y={} delta_x={}", .{ y.delta, x.delta });
@@ -3621,12 +3734,15 @@ pub fn scrollCallback(
             return;
         }
 
-        if (y.delta != 0) {
-            // Modify our viewport, this requires a lock since it affects
-            // rendering. We have to switch signs here because our delta
-            // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
-        }
+        // Precise trackpad events can be smaller than one cell. Their pixel
+        // remainder was retained above, but no terminal state changed, so
+        // avoid waking the renderer until a whole-row delta is available.
+        if (y.delta == 0) return;
+
+        // Modify our viewport, this requires a lock since it affects
+        // rendering. We have to switch signs here because our delta
+        // is negative down but our viewport is positive down.
+        self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
     }
 
     try self.queueRender();
@@ -4786,6 +4902,38 @@ fn showMouse(self: *Surface) void {
     ) catch |err| {
         log.warn("apprt failed to set mouse visibility err={}", .{err});
     };
+}
+
+/// Return one coherent snapshot of the active terminal's scrollable history.
+pub fn scrollbarSnapshot(self: *Surface) terminal.Scrollbar {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.renderer_state.terminal.scrollbar();
+}
+
+/// Atomically validate a saved history identity and scroll to its row. The
+/// renderer mutex covers both operations so pruning, reflow, or an alternate
+/// screen switch cannot redirect a stale bookmark to unrelated content.
+pub fn scrollToRowIfHistoryMatches(
+    self: *Surface,
+    row: usize,
+    content_generation: u64,
+    screen_identity: u64,
+) !bool {
+    const did_scroll = did_scroll: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        break :did_scroll self.renderer_state.terminal
+            .scrollViewportIfHistoryMatches(
+            row,
+            content_generation,
+            screen_identity,
+        );
+    };
+    if (!did_scroll) return false;
+
+    try self.queueRender();
+    return true;
 }
 
 /// Perform a binding action. A binding is a keybinding. This function

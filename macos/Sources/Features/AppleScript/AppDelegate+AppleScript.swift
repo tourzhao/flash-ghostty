@@ -177,6 +177,12 @@ extension NSApplication {
             command.scriptErrorString = "Ghostty app delegate is unavailable."
             return nil
         }
+        guard !appDelegate.isDeferringTerminalLaunches else {
+            command.scriptErrorNumber = errAEEventFailed
+            command.scriptErrorString =
+                "Choose whether to restore previous sessions before creating a terminal."
+            return nil
+        }
 
         let baseConfig: Ghostty.SurfaceConfiguration?
         if let scriptRecord = command.evaluatedArguments?["configuration"] as? NSDictionary {
@@ -191,10 +197,13 @@ extension NSApplication {
             baseConfig = nil
         }
 
-        let controller = TerminalController.newWindow(
-            appDelegate.ghostty,
-            withBaseConfig: baseConfig
-        )
+        guard let controller = appDelegate.requestNewTerminalWindow(
+            baseConfig: baseConfig
+        ) else {
+            command.scriptErrorNumber = errAEEventFailed
+            command.scriptErrorString = "Failed to create window."
+            return nil
+        }
         let createdWindowID = ScriptWindow.stableID(primaryController: controller)
 
         if let scriptWindow = scriptWindows.first(where: { $0.stableID == createdWindowID }) {
@@ -235,6 +244,12 @@ extension NSApplication {
             command.scriptErrorString = "Ghostty app delegate is unavailable."
             return nil
         }
+        guard !appDelegate.isDeferringTerminalLaunches else {
+            command.scriptErrorNumber = errAEEventFailed
+            command.scriptErrorString =
+                "Choose whether to restore previous sessions before creating a terminal."
+            return nil
+        }
 
         let baseConfig: Ghostty.SurfaceConfiguration?
         if let scriptRecord = command.evaluatedArguments?["configuration"] as? NSDictionary {
@@ -263,10 +278,9 @@ extension NSApplication {
             parentWindow = TerminalController.preferredParent?.window
         }
 
-        guard let createdController = TerminalController.newTab(
-            appDelegate.ghostty,
+        guard let createdController = appDelegate.requestNewTerminalTab(
             from: parentWindow,
-            withBaseConfig: baseConfig
+            baseConfig: baseConfig
         ) else {
             command.scriptErrorNumber = errAEEventFailed
             command.scriptErrorString = "Failed to create tab."

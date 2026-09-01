@@ -8,16 +8,24 @@ import Foundation
 enum CommandLinePersistencePolicy {
     static let ignoreStateKey = "ApplePersistenceIgnoreState"
 
+    @discardableResult
     static func installIfNeeded(
         arguments: [String],
+        isUnitTestHost: Bool = false,
         defaults: UserDefaults = .standard,
         argumentDomainName: String = UserDefaults.argumentDomain
-    ) {
-        guard arguments.contains("-e") else { return }
+    ) -> Bool {
+        guard arguments.contains("-e") || isUnitTestHost else { return false }
 
         var domain = defaults.volatileDomain(forName: argumentDomainName)
         domain[ignoreStateKey] = true
         defaults.setVolatileDomain(domain, forName: argumentDomainName)
+
+        // Report success only after the requested volatile domain contains the
+        // override. `main.swift` alone converts that pre-AppKit success into
+        // archive-preservation authority.
+        return defaults.volatileDomain(forName: argumentDomainName)[ignoreStateKey]
+            as? Bool == true
     }
 }
 

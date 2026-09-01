@@ -23,19 +23,26 @@ final class SessionWorkspace: ObservableObject {
 
     /// A single atomic value keeps observers from seeing an order, selection,
     /// and sidebar-visibility combination that violates workspace invariants.
-    struct Snapshot: Equatable, Codable, Sendable {
+    ///
+    /// This is deliberately an in-memory projection, not a saved-state schema.
+    /// AppKit restoration is versioned by `TerminalRestorableState`, which owns
+    /// the compatibility defaults for session and file-browser presentation.
+    struct Snapshot: Equatable, Sendable {
         var orderedSessionIDs: [SessionID]
         var selectedSessionID: SessionID?
         var isSidebarVisible: Bool
+        var isFileBrowserVisible: Bool
 
         init(
             orderedSessionIDs: [SessionID] = [],
             selectedSessionID: SessionID? = nil,
-            isSidebarVisible: Bool = true
+            isSidebarVisible: Bool = true,
+            isFileBrowserVisible: Bool = true
         ) {
             self.orderedSessionIDs = orderedSessionIDs
             self.selectedSessionID = selectedSessionID
             self.isSidebarVisible = isSidebarVisible
+            self.isFileBrowserVisible = isFileBrowserVisible
         }
     }
 
@@ -44,18 +51,21 @@ final class SessionWorkspace: ObservableObject {
     var orderedSessionIDs: [SessionID] { snapshot.orderedSessionIDs }
     var selectedSessionID: SessionID? { snapshot.selectedSessionID }
     var isSidebarVisible: Bool { snapshot.isSidebarVisible }
+    var isFileBrowserVisible: Bool { snapshot.isFileBrowserVisible }
     var sessionCount: Int { snapshot.orderedSessionIDs.count }
 
     init(
         sessionIDs: [SessionID] = [],
         selectedSessionID: SessionID? = nil,
-        isSidebarVisible: Bool = true
+        isSidebarVisible: Bool = true,
+        isFileBrowserVisible: Bool = true
     ) {
         self.snapshot = Self.normalized(
             Snapshot(
                 orderedSessionIDs: sessionIDs,
                 selectedSessionID: selectedSessionID,
-                isSidebarVisible: isSidebarVisible
+                isSidebarVisible: isSidebarVisible,
+                isFileBrowserVisible: isFileBrowserVisible
             )
         )
     }
@@ -64,7 +74,8 @@ final class SessionWorkspace: ObservableObject {
         self.init(
             sessionIDs: snapshot.orderedSessionIDs,
             selectedSessionID: snapshot.selectedSessionID,
-            isSidebarVisible: snapshot.isSidebarVisible
+            isSidebarVisible: snapshot.isSidebarVisible,
+            isFileBrowserVisible: snapshot.isFileBrowserVisible
         )
     }
 
@@ -194,6 +205,18 @@ final class SessionWorkspace: ObservableObject {
         setSidebarVisible(!snapshot.isSidebarVisible)
     }
 
+    func setFileBrowserVisible(_ isVisible: Bool) {
+        guard snapshot.isFileBrowserVisible != isVisible else { return }
+
+        var next = snapshot
+        next.isFileBrowserVisible = isVisible
+        publish(next)
+    }
+
+    func toggleFileBrowserVisibility() {
+        setFileBrowserVisible(!snapshot.isFileBrowserVisible)
+    }
+
     private func publish(_ next: Snapshot) {
         let next = Self.normalized(next)
         guard next != snapshot else { return }
@@ -223,7 +246,8 @@ final class SessionWorkspace: ObservableObject {
         return Snapshot(
             orderedSessionIDs: orderedSessionIDs,
             selectedSessionID: selectedSessionID,
-            isSidebarVisible: candidate.isSidebarVisible
+            isSidebarVisible: candidate.isSidebarVisible,
+            isFileBrowserVisible: candidate.isFileBrowserVisible
         )
     }
 }

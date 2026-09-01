@@ -11,47 +11,213 @@ on:
 permissions:
   contents: read
 
+defaults:
+  # The explicit bash shell enables the runner's -eo pipefail invocation;
+  # signing and architecture checks must observe every pipeline failure.
+  run:
+    shell: bash
+
 concurrency:
   group: flash-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   validate:
+    # Keep this job runnable on an invalid dispatch so the workflow fails with
+    # an actionable trust-boundary error instead of silently skipping every
+    # job. Downstream jobs still require this validation to succeed.
     if: github.repository == 'tourzhao/flash-ghostty'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.value }}
+      bundle_version: ${{ steps.version.outputs.bundle_version }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify fork product overlay
         run: flash/verify-product-overlay.sh
+
+      - name: Verify release configuration statics
+        run: |
+          project="macos/Ghostty.xcodeproj/project.pbxproj"
+          shared_config="macos/Configurations/FlashGhostty.Shared.xcconfig"
+          release_config="macos/Configurations/FlashGhostty.Release.xcconfig"
+          source_plist="macos/FlashGhostty-Info.plist"
+
+          grep -Fqx '#include "FlashGhostty.Shared.xcconfig"' "$release_config"
+          grep -Fqx 'FLASH_GHOSTTY_MAIN_NIB = FlashMainMenu' "$shared_config"
+          grep -Fq '<string>$(FLASH_GHOSTTY_APP_DISPLAY_NAME)</string>' "$source_plist"
+          grep -Fq '<key>GhosttyCommit</key>' "$source_plist"
+          grep -Fq '<string>FlashGhostty.sdef</string>' "$source_plist"
+          grep -Fq '<key>LSMultipleInstancesProhibited</key>' "$source_plist"
+
+          app_release_settings="$(
+            awk '
+              /A5B30542299BEAAB0047F10C \/\* Release \*\/ = \{/ { capture = 1 }
+              capture { print }
+              capture && /name = Release;/ { exit }
+            ' "$project"
+          )"
+          test -n "$app_release_settings"
+          grep -Fq 'CODE_SIGN_ENTITLEMENTS = Ghostty.entitlements;' <<< "$app_release_settings"
+          grep -Fq 'INFOPLIST_FILE = "FlashGhostty-Info.plist";' <<< "$app_release_settings"
+          grep -Fq 'INFOPLIST_KEY_NSMainNibFile = "$(FLASH_GHOSTTY_MAIN_NIB)";' <<< "$app_release_settings"
+          grep -Fq 'INFOPLIST_PREPROCESSOR_DEFINITIONS = "FLASH_GHOSTTY_PROHIBIT_MULTIPLE_INSTANCES=1";' \
+            <<< "$app_release_settings"
+          grep -Fq 'MACOSX_DEPLOYMENT_TARGET = 13.0;' <<< "$app_release_settings"
+          grep -Fq 'PRODUCT_BUNDLE_IDENTIFIER = "$(FLASH_GHOSTTY_APP_BUNDLE_IDENTIFIER)";' \
+            <<< "$app_release_settings"
+
+          plugin_release_settings="$(
+            awk '
+              /8193244F2F24E6C000A9ED8F \/\* Release \*\/ = \{/ { capture = 1 }
+              capture { print }
+              capture && /name = Release;/ { exit }
+            ' "$project"
+          )"
+          test -n "$plugin_release_settings"
+          grep -Fq 'INFOPLIST_KEY_CFBundleDisplayName = "FLASH-Ghostty Dock Tile Plugin";' \
+            <<< "$plugin_release_settings"
+          grep -Fq 'MACOSX_DEPLOYMENT_TARGET = 13.0;' <<< "$plugin_release_settings"
+          grep -Fq 'PRODUCT_BUNDLE_IDENTIFIER = "$(FLASH_GHOSTTY_APP_BUNDLE_IDENTIFIER).dock-tile";' \
+            <<< "$plugin_release_settings"
+
+      - name: Verify trusted release source
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          if [[ "$RELEASE_REF" != "refs/heads/main" ]]; then
+            echo "signed release candidates may only be built from main" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_REF_PROTECTED" != "true" ]]; then
+            echo "signed release candidates require protected main" >&2
+            exit 1
+          fi
 
       - name: Validate version
         id: version
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          if [[ ! "$REQUESTED_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "version must use vX.Y.Z format" >&2
+          version_component='(0|[1-9][0-9]{0,3})'
+          if [[ ! "$REQUESTED_VERSION" =~ ^v${version_component}\.${version_component}\.${version_component}$ ]]; then
+            echo "version must use canonical vX.Y.Z format with 1-4 digits per component" >&2
             exit 1
           fi
-          echo "value=${REQUESTED_VERSION#v}" >> "$GITHUB_OUTPUT"
+
+          # Bundle-version history is external to this repository today, so
+          # never infer CFBundleVersion from commit count or a workflow run.
+          # The protected release commit must declare both release identifiers
+          # after reconciling any already-published builds.
+          release_metadata=flash/release-metadata.env
+          expected_metadata_keys="$(
+            printf '%s\n' \
+              FLASH_GHOSTTY_RELEASE_METADATA_SCHEMA \
+              FLASH_GHOSTTY_RELEASE_VERSION \
+              FLASH_GHOSTTY_BUNDLE_VERSION \
+              | LC_ALL=C sort
+          )"
+          actual_metadata_keys="$(
+            awk '
+              /^[[:space:]]*($|#)/ { next }
+              BEGIN { FS = "=" }
+              NF != 2 || $1 !~ /^[A-Z][A-Z0-9_]*$/ { exit 2 }
+              { print $1 }
+            ' "$release_metadata" | LC_ALL=C sort
+          )"
+          if [[ "$actual_metadata_keys" != "$expected_metadata_keys" ]]; then
+            echo "flash/release-metadata.env keys do not match schema 1" >&2
+            exit 1
+          fi
+          release_metadata_value() {
+            local requested="$1"
+            awk -v requested="$requested" '
+              BEGIN { FS = "="; count = 0 }
+              $1 == requested {
+                if (NF != 2) exit 2
+                value = $2
+                count += 1
+              }
+              END {
+                if (count != 1) exit 3
+                print value
+              }
+            ' "$release_metadata"
+          }
+          FLASH_GHOSTTY_RELEASE_METADATA_SCHEMA="$(
+            release_metadata_value FLASH_GHOSTTY_RELEASE_METADATA_SCHEMA
+          )"
+          FLASH_GHOSTTY_RELEASE_VERSION="$(
+            release_metadata_value FLASH_GHOSTTY_RELEASE_VERSION
+          )"
+          FLASH_GHOSTTY_BUNDLE_VERSION="$(
+            release_metadata_value FLASH_GHOSTTY_BUNDLE_VERSION
+          )"
+          if [[ "$FLASH_GHOSTTY_RELEASE_METADATA_SCHEMA" != 1 ]]; then
+            echo "flash/release-metadata.env has an unsupported schema" >&2
+            exit 1
+          fi
+          if [[ -z "$FLASH_GHOSTTY_RELEASE_VERSION" \
+            || -z "$FLASH_GHOSTTY_BUNDLE_VERSION" ]]; then
+            echo "flash/release-metadata.env must declare the reconciled release and bundle versions" >&2
+            exit 1
+          fi
+          if [[ "v$FLASH_GHOSTTY_RELEASE_VERSION" != "$REQUESTED_VERSION" ]]; then
+            echo "workflow version does not match the protected release metadata" >&2
+            exit 1
+          fi
+          # Apple's release CFBundleVersion is three canonical integers: the
+          # first is 1-9999 and the remaining components are 0-99.
+          bundle_major='[1-9][0-9]{0,3}'
+          bundle_component='(0|[1-9][0-9]?)'
+          if [[ ! "$FLASH_GHOSTTY_BUNDLE_VERSION" =~ ^${bundle_major}\.${bundle_component}\.${bundle_component}$ ]]; then
+            echo "FLASH_GHOSTTY_BUNDLE_VERSION must use canonical A.B.C format (A=1-9999, B/C=0-99)" >&2
+            exit 1
+          fi
+
+          printf 'value=%s\n' "$FLASH_GHOSTTY_RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'bundle_version=%s\n' "$FLASH_GHOSTTY_BUNDLE_VERSION" >> "$GITHUB_OUTPUT"
 
   build-macos:
     needs: validate
+    if: >-
+      needs.validate.result == 'success' &&
+      github.repository == 'tourzhao/flash-ghostty' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 120
+    outputs:
+      unsigned_archive_sha256: ${{ steps.signing_input.outputs.archive_sha256 }}
+      unsigned_manifest_sha256: ${{ steps.signing_input.outputs.manifest_sha256 }}
+      bundle_version: ${{ steps.signing_input.outputs.bundle_version }}
+      commit: ${{ steps.signing_input.outputs.commit }}
     env:
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/local
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
-      XCODE_XCCONFIG_FILE: ${{ github.workspace }}/macos/Configurations/FlashGhostty.ReleaseLocal.xcconfig
+      XCODE_XCCONFIG_FILE: ${{ github.workspace }}/macos/Configurations/FlashGhostty.Release.xcconfig
+      FLASH_NUSHELL_VERSION: 0.115.1
+      FLASH_NUSHELL_SHA256: 2e6ed1eb043869ff05b5f2448a8c443e4d3a93557ba4303b21008a0523c96734
+      FLASH_SWIFTLINT_VERSION: 0.65.1
+      FLASH_SWIFTLINT_SHA256: c1e429b0599cf1b516f369a2d9ec04eaf0e436f3c12b637df8851fa52ff694d0
+      FLASH_XCODE_VERSION: 26.6
+      FLASH_XCODE_BUILD: 17F113
+      FLASH_MACOS_MINIMUM_VERSION: "13.0"
+      # Reuse one isolated UI-test host across the four critical suites. Local
+      # invocations default to a unique process ID, while CI avoids relinking
+      # the app solely because each build.nu process had a different ID.
+      FLASH_GHOSTTY_UI_TEST_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Load product manifest
         run: |
@@ -67,65 +233,1227 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
 
       - name: Select Xcode 26.6
-        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcode_version="$(xcodebuild -version)"
+          grep -Fx "Xcode $FLASH_XCODE_VERSION" <<< "$xcode_version"
+          grep -Fx "Build version $FLASH_XCODE_BUILD" <<< "$xcode_version"
 
       - name: Build GhosttyKit
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          expected_zig_version="$(
+            sed -n -E \
+              's/^[[:space:]]*\.?minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+              build.zig.zon
+          )"
+          test -n "$expected_zig_version"
+          test "$(zig version)" = "$expected_zig_version"
           zig build \
             -Doptimize=ReleaseFast \
             -Demit-macos-app=false \
+            -Dxcframework-target=universal \
             -Dversion-string="$RELEASE_VERSION"
 
-      - name: Install Nushell
-        run: brew install nushell
+      - name: Install pinned macOS build tools
+        run: |
+          tools_directory="$RUNNER_TEMP/flash-pinned-tools"
+          nu_archive="$RUNNER_TEMP/nu-$FLASH_NUSHELL_VERSION.tar.gz"
+          swiftlint_archive="$RUNNER_TEMP/swiftlint-$FLASH_SWIFTLINT_VERSION.zip"
+          mkdir -p "$tools_directory"
 
-      - name: Build unsigned release candidate
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --show-error \
+            --output "$nu_archive" \
+            "https://github.com/nushell/nushell/releases/download/$FLASH_NUSHELL_VERSION/nu-$FLASH_NUSHELL_VERSION-aarch64-apple-darwin.tar.gz"
+          printf '%s  %s\n' "$FLASH_NUSHELL_SHA256" "$nu_archive" \
+            | shasum -a 256 --check
+          tar \
+            -xzf "$nu_archive" \
+            -C "$tools_directory" \
+            --strip-components=1 \
+            "nu-$FLASH_NUSHELL_VERSION-aarch64-apple-darwin/nu"
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --show-error \
+            --output "$swiftlint_archive" \
+            "https://github.com/realm/SwiftLint/releases/download/$FLASH_SWIFTLINT_VERSION/portable_swiftlint.zip"
+          printf '%s  %s\n' "$FLASH_SWIFTLINT_SHA256" "$swiftlint_archive" \
+            | shasum -a 256 --check
+          unzip -q "$swiftlint_archive" swiftlint -d "$tools_directory"
+
+          echo "$tools_directory" >> "$GITHUB_PATH"
+          test "$("$tools_directory/nu" --version)" = "$FLASH_NUSHELL_VERSION"
+          test "$("$tools_directory/swiftlint" version)" = "$FLASH_SWIFTLINT_VERSION"
+
+      - name: Run release quality gates
+        run: |
+          # Keep the already-built universal GhosttyKit intact. On macOS, the
+          # default Zig test graph also builds a native-only XCFramework for
+          # Xcode tests; the explicit Xcode test below covers those tests.
+          zig build test \
+            -Demit-xcframework=false \
+            -Demit-macos-app=false
+          # The default test graph intentionally does not depend on the
+          # public libghostty-vt suite, so keep this as an explicit gate.
+          zig build test-lib-vt \
+            -Demit-xcframework=false \
+            -Demit-macos-app=false
+          swiftlint lint --strict --no-cache
+          macos/build.nu \
+            --configuration Debug \
+            --locked-packages \
+            --action test
+          git diff --exit-code -- \
+            macos/Ghostty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+      - name: Run critical FLASH UI tests
+        run: |
+          for suite in \
+            GhosttySessionSidebarUITests \
+            GhosttyFileBrowserUITests \
+            GhosttySurfaceNavigationUITests \
+            GhosttySessionRestorationUITests; do
+            macos/build.nu \
+              --configuration Debug \
+              --locked-packages \
+              --include-ui-tests \
+              --only-testing "GhosttyUITests/$suite" \
+              --action test
+          done
+
+      - name: Build release candidate
         run: |
           macos/build.nu \
-            --configuration ReleaseLocal \
+            --configuration Release \
             --xcconfig "$XCODE_XCCONFIG_FILE" \
+            --architectures "arm64 x86_64" \
+            --locked-packages \
             --action build
 
-      - name: Apply build metadata and verify updater isolation
+      - name: Apply and verify release metadata
         env:
+          BUNDLE_VERSION: ${{ needs.validate.outputs.bundle_version }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          app="macos/build/ReleaseLocal/$FLASH_GHOSTTY_APP_BUNDLE"
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
+          app="macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
           plist="$app/Contents/Info.plist"
-          build_number=$(git rev-list --count HEAD)
+          plugin="$app/Contents/PlugIns/DockTilePlugin.plugin"
+          plugin_plist="$plugin/Contents/Info.plist"
+          test -d "$app"
+          test -f "$plist"
+          test -d "$plugin"
+          test -f "$plugin_plist"
+
+          assert_plist_value() {
+            local plist_path="$1"
+            local key="$2"
+            local expected="$3"
+            local actual
+            if ! actual="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist_path")"; then
+              echo "$plist_path is missing required key $key" >&2
+              exit 1
+            fi
+            if [[ "$actual" != "$expected" ]]; then
+              echo "$plist_path has $key=$actual; expected $expected" >&2
+              exit 1
+            fi
+          }
+
+          assert_plist_absent() {
+            local plist_path="$1"
+            local key="$2"
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$plist_path" >/dev/null 2>&1; then
+              echo "$plist_path must not contain $key" >&2
+              exit 1
+            fi
+          }
+
           commit=$(git rev-parse --short HEAD)
 
           /usr/libexec/PlistBuddy -c "Set :GhosttyCommit $commit" "$plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUNDLE_VERSION" "$plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$plist"
           plutil -replace SUEnableAutomaticChecks -bool NO "$plist"
           /usr/libexec/PlistBuddy -c 'Delete :SUFeedURL' "$plist" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c 'Delete :SUPublicEDKey' "$plist" 2>/dev/null || true
 
-          test "$(defaults read "$PWD/$plist" CFBundleIdentifier)" = "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID"
-          test "$(defaults read "$PWD/$plist" CFBundleDisplayName)" = "$FLASH_GHOSTTY_DISPLAY_NAME"
-          if /usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$plist" >/dev/null 2>&1; then exit 1; fi
-          if /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" >/dev/null 2>&1; then exit 1; fi
-          codesign --force --deep --sign - "$app"
-          codesign --verify --deep --strict "$app"
+          # Keep the product-owned Dock plugin versioned with its host app.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUNDLE_VERSION" "$plugin_plist"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $RELEASE_VERSION" \
+            "$plugin_plist"
 
-      - name: Archive app
+          assert_plist_value "$plist" CFBundleIdentifier "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID"
+          assert_plist_value "$plist" CFBundleName "$FLASH_GHOSTTY_DISPLAY_NAME"
+          assert_plist_value "$plist" CFBundleDisplayName "$FLASH_GHOSTTY_DISPLAY_NAME"
+          assert_plist_value "$plist" CFBundleExecutable ghostty
+          assert_plist_value "$plist" NSMainNibFile FlashMainMenu
+          assert_plist_value "$plist" OSAScriptingDefinition FlashGhostty.sdef
+          assert_plist_value "$plist" LSMultipleInstancesProhibited true
+          assert_plist_value "$plist" LSMinimumSystemVersion "$FLASH_MACOS_MINIMUM_VERSION"
+          assert_plist_value "$plist" GhosttyCommit "$commit"
+          assert_plist_value "$plist" CFBundleVersion "$BUNDLE_VERSION"
+          assert_plist_value "$plist" CFBundleShortVersionString "$RELEASE_VERSION"
+          assert_plist_value "$plist" SUEnableAutomaticChecks false
+          assert_plist_absent "$plist" SUFeedURL
+          assert_plist_absent "$plist" SUPublicEDKey
+
+          assert_plist_value \
+            "$plugin_plist" \
+            CFBundleIdentifier \
+            "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID.dock-tile"
+          assert_plist_value "$plugin_plist" CFBundleName DockTilePlugin
+          assert_plist_value \
+            "$plugin_plist" \
+            CFBundleDisplayName \
+            "$FLASH_GHOSTTY_DISPLAY_NAME Dock Tile Plugin"
+          assert_plist_value "$plugin_plist" CFBundleExecutable DockTilePlugin
+          assert_plist_value \
+            "$plugin_plist" \
+            LSMinimumSystemVersion \
+            "$FLASH_MACOS_MINIMUM_VERSION"
+          assert_plist_value "$plugin_plist" CFBundleVersion "$BUNDLE_VERSION"
+          assert_plist_value \
+            "$plugin_plist" \
+            CFBundleShortVersionString \
+            "$RELEASE_VERSION"
+
+          candidate_manifest="$(
+            mktemp "$RUNNER_TEMP/flash-release-app-files.XXXXXX"
+          )"
+          trap 'rm -f "$candidate_manifest"' EXIT
+          if ! find "$app" -type f -print0 > "$candidate_manifest"; then
+            echo "Failed to enumerate every release-app file" >&2
+            exit 1
+          fi
+          mach_o_count=0
+          while IFS= read -r -d '' candidate; do
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
+              ((mach_o_count += 1))
+              if ! architectures="$(
+                  lipo -archs "$candidate" \
+                    | tr ' ' '\n' \
+                    | LC_ALL=C sort \
+                    | paste -sd ' ' -
+                )"; then
+                echo "Failed to inspect release-app architectures: $candidate" >&2
+                exit 1
+              fi
+              if [[ "$architectures" != "arm64 x86_64" ]]; then
+                echo "$candidate has architectures '$architectures'; expected exactly arm64 x86_64" >&2
+                exit 1
+              fi
+            fi
+          done < "$candidate_manifest"
+          if ((mach_o_count == 0)); then
+            echo "release app contains no Mach-O binaries" >&2
+            exit 1
+          fi
+
+      - name: Package unsigned signing input
+        id: signing_input
+        env:
+          BUNDLE_VERSION: ${{ needs.validate.outputs.bundle_version }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          app="macos/build/ReleaseLocal/$FLASH_GHOSTTY_APP_BUNDLE"
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
+          : "${RUNNER_OS:?GitHub RUNNER_OS is required}"
+          : "${RUNNER_ARCH:?GitHub RUNNER_ARCH is required}"
+          app="macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
+          transfer_root="$RUNNER_TEMP/flash-unsigned-signing-input"
+          transfer_archive="flash-ghostty-unsigned-signing-input.zip"
+          transfer_manifest="flash-ghostty-unsigned-signing-input.tsv"
+          release_directory="$transfer_root/macos/build/Release"
+          commit="$(git rev-parse --short HEAD)"
+          full_commit="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          commit_timestamp="$(git show -s --format=%ct HEAD)"
+
+          test "$full_commit" = "$GITHUB_SHA"
+          [[ "$full_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$source_tree" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$commit_timestamp" =~ ^[1-9][0-9]*$ ]]
+          [[ "$commit" =~ ^[0-9a-f]{7,40}$ ]]
+          [[ "$BUNDLE_VERSION" =~ ^[1-9][0-9]{0,3}\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)$ ]]
+          test -d "$app"
+          test -d "$app.dSYM"
+          test -d macos/build/Release/DockTilePlugin.plugin.dSYM
+          test -f macos/Ghostty.entitlements
+          test -f flash/product.env
+          test -f flash/release-metadata.env
+          test -f .github/workflows/flash-release.yml
+          test -f macos/Ghostty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          test ! -e "$transfer_root"
+          test ! -e "$transfer_archive"
+          test ! -e "$transfer_manifest"
+
+          mkdir -p "$release_directory"
+          ditto "$app" "$release_directory/$FLASH_GHOSTTY_APP_BUNDLE"
+          ditto "$app.dSYM" "$release_directory/$FLASH_GHOSTTY_APP_BUNDLE.dSYM"
+          ditto \
+            macos/build/Release/DockTilePlugin.plugin.dSYM \
+            "$release_directory/DockTilePlugin.plugin.dSYM"
+          mkdir -p "$transfer_root/macos"
+          ditto macos/Ghostty.entitlements "$transfer_root/macos/Ghostty.entitlements"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$transfer_root" \
+            "$transfer_archive"
+          unzip -tq "$transfer_archive"
+
+          archive_sha256="$(shasum -a 256 "$transfer_archive" | awk '{print $1}')"
+          [[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]]
+          xcode_version="$(xcodebuild -version | sed -n '1s/^Xcode //p')"
+          xcode_build="$(xcodebuild -version | sed -n '2s/^Build version //p')"
+          test "$xcode_version" = "$FLASH_XCODE_VERSION"
+          test "$xcode_build" = "$FLASH_XCODE_BUILD"
+          swift_version="$(swiftc --version | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+          test -n "$swift_version"
+          {
+            printf 'schema\t2\n'
+            printf 'repository\t%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref\t%s\n' "$GITHUB_REF"
+            printf 'sha\t%s\n' "$full_commit"
+            printf 'tree\t%s\n' "$source_tree"
+            printf 'version\t%s\n' "$RELEASE_VERSION"
+            printf 'bundle_version\t%s\n' "$BUNDLE_VERSION"
+            printf 'commit\t%s\n' "$commit"
+            printf 'commit_timestamp\t%s\n' "$commit_timestamp"
+            printf 'github_run_id\t%s\n' "$GITHUB_RUN_ID"
+            printf 'github_run_attempt\t%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'runner_os\t%s\n' "$RUNNER_OS"
+            printf 'runner_arch\t%s\n' "$RUNNER_ARCH"
+            printf 'macos_version\t%s\n' "$(sw_vers -productVersion)"
+            printf 'macos_build\t%s\n' "$(sw_vers -buildVersion)"
+            printf 'xcode_version\t%s\n' "$xcode_version"
+            printf 'xcode_build\t%s\n' "$xcode_build"
+            printf 'macos_sdk_version\t%s\n' "$(xcrun --sdk macosx --show-sdk-version)"
+            printf 'macos_sdk_build\t%s\n' "$(xcrun --sdk macosx --show-sdk-build-version)"
+            printf 'zig_version\t%s\n' "$(zig version)"
+            printf 'swift_version\t%s\n' "$swift_version"
+            printf 'homebrew_version\t%s\n' "$(brew --version | sed -n '1p')"
+            printf 'nushell_version\t%s\n' "$(nu --version)"
+            printf 'swiftlint_version\t%s\n' "$(swiftlint version)"
+            printf 'minimum_macos_version\t%s\n' "$FLASH_MACOS_MINIMUM_VERSION"
+            printf 'architectures\tarm64 x86_64\n'
+            printf 'zig_optimize\tReleaseFast\n'
+            printf 'xcode_configuration\tRelease\n'
+            printf 'build_command_schema\tghosttykit-releasefast-universal+xcode-release-universal-v1\n'
+            printf 'ghosttykit_command\tzig build -Doptimize=ReleaseFast -Demit-macos-app=false -Dxcframework-target=universal -Dversion-string=<release-version>\n'
+            printf 'app_build_command\tmacos/build.nu --configuration Release --xcconfig macos/Configurations/FlashGhostty.Release.xcconfig --architectures arm64+x86_64 --locked-packages --action build\n'
+            printf 'package_resolved_sha256\t%s\n' "$(
+              shasum -a 256 \
+                macos/Ghostty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+                | awk '{print $1}'
+            )"
+            printf 'zig_binary_sha256\t%s\n' "$(shasum -a 256 "$(command -v zig)" | awk '{print $1}')"
+            printf 'nushell_binary_sha256\t%s\n' "$(shasum -a 256 "$(command -v nu)" | awk '{print $1}')"
+            printf 'swiftlint_binary_sha256\t%s\n' "$(shasum -a 256 "$(command -v swiftlint)" | awk '{print $1}')"
+            printf 'build_zig_zon_sha256\t%s\n' "$(shasum -a 256 build.zig.zon | awk '{print $1}')"
+            printf 'build_nu_sha256\t%s\n' "$(shasum -a 256 macos/build.nu | awk '{print $1}')"
+            printf 'xcode_project_sha256\t%s\n' "$(shasum -a 256 macos/Ghostty.xcodeproj/project.pbxproj | awk '{print $1}')"
+            printf 'release_xcconfig_sha256\t%s\n' "$(shasum -a 256 "$XCODE_XCCONFIG_FILE" | awk '{print $1}')"
+            printf 'entitlements_sha256\t%s\n' "$(shasum -a 256 macos/Ghostty.entitlements | awk '{print $1}')"
+            printf 'product_manifest_sha256\t%s\n' "$(shasum -a 256 flash/product.env | awk '{print $1}')"
+            printf 'release_metadata_sha256\t%s\n' "$(shasum -a 256 flash/release-metadata.env | awk '{print $1}')"
+            printf 'workflow_sha256\t%s\n' "$(shasum -a 256 .github/workflows/flash-release.yml | awk '{print $1}')"
+            printf 'archive_sha256\t%s\n' "$archive_sha256"
+          } > "$transfer_manifest"
+          manifest_sha256="$(shasum -a 256 "$transfer_manifest" | awk '{print $1}')"
+          [[ "$manifest_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'archive_sha256=%s\n' "$archive_sha256" >> "$GITHUB_OUTPUT"
+          printf 'manifest_sha256=%s\n' "$manifest_sha256" >> "$GITHUB_OUTPUT"
+          printf 'bundle_version=%s\n' "$BUNDLE_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned signing input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-ghostty-${{ needs.validate.outputs.version }}-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |-
+            flash-ghostty-unsigned-signing-input.zip
+            flash-ghostty-unsigned-signing-input.tsv
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-notarize:
+    needs: [validate, build-macos]
+    if: >-
+      needs.validate.result == 'success' &&
+      needs['build-macos'].result == 'success' &&
+      github.repository == 'tourzhao/flash-ghostty' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected
+    runs-on: macos-26
+    timeout-minutes: 75
+    environment: flash-release
+    permissions: {}
+    env:
+      FLASH_GHOSTTY_DISPLAY_NAME: FLASH-Ghostty
+      FLASH_GHOSTTY_RELEASE_BUNDLE_ID: com.flashghostty.app
+      FLASH_GHOSTTY_APP_BUNDLE: FLASH-Ghostty.app
+      FLASH_GHOSTTY_ARTIFACT_BASENAME: flash-ghostty-macos-universal
+      FLASH_MACOS_MINIMUM_VERSION: "13.0"
+      FLASH_NUSHELL_VERSION: 0.115.1
+      FLASH_SWIFTLINT_VERSION: 0.65.1
+      FLASH_XCODE_VERSION: 26.6
+      FLASH_XCODE_BUILD: 17F113
+      FLASH_EXPECTED_TEAM_ID: ${{ vars.FLASH_MACOS_TEAM_ID }}
+      FLASH_EXPECTED_CERTIFICATE_SHA256: ${{ vars.FLASH_MACOS_CERTIFICATE_SHA256 }}
+      FLASH_SIGNING_INPUT_ROOT: ${{ github.workspace }}/flash-unsigned-signing-input
+    steps:
+      - name: Select and verify signing Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcode_version="$(xcodebuild -version)"
+          grep -Fx "Xcode $FLASH_XCODE_VERSION" <<< "$xcode_version"
+          grep -Fx "Build version $FLASH_XCODE_BUILD" <<< "$xcode_version"
+
+      - name: Download unsigned signing input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: flash-ghostty-${{ needs.validate.outputs.version }}-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          path: unsigned-signing-input
+
+      - name: Verify unsigned signing input
+        id: signing_input
+        env:
+          EXPECTED_ARCHIVE_SHA256: ${{ needs['build-macos'].outputs.unsigned_archive_sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs['build-macos'].outputs.unsigned_manifest_sha256 }}
+          EXPECTED_BUNDLE_VERSION: ${{ needs['build-macos'].outputs.bundle_version }}
+          EXPECTED_COMMIT: ${{ needs['build-macos'].outputs.commit }}
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          archive="unsigned-signing-input/flash-ghostty-unsigned-signing-input.zip"
+          manifest="unsigned-signing-input/flash-ghostty-unsigned-signing-input.tsv"
+          test -f "$archive"
+          test -f "$manifest"
+          [[ "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(shasum -a 256 "$manifest" | awk '{print $1}')" = \
+            "$EXPECTED_MANIFEST_SHA256"
+
+          expected_manifest_keys="$(
+            printf '%s\n' \
+              schema repository ref sha tree version bundle_version commit \
+              commit_timestamp github_run_id github_run_attempt runner_os \
+              runner_arch macos_version macos_build xcode_version xcode_build \
+              macos_sdk_version macos_sdk_build zig_version swift_version \
+              homebrew_version nushell_version swiftlint_version \
+              minimum_macos_version \
+              architectures zig_optimize xcode_configuration \
+              build_command_schema ghosttykit_command app_build_command \
+              package_resolved_sha256 zig_binary_sha256 \
+              nushell_binary_sha256 swiftlint_binary_sha256 \
+              build_zig_zon_sha256 build_nu_sha256 xcode_project_sha256 \
+              release_xcconfig_sha256 \
+              entitlements_sha256 product_manifest_sha256 \
+              release_metadata_sha256 workflow_sha256 archive_sha256 \
+              | LC_ALL=C sort
+          )"
+          actual_manifest_keys="$(
+            awk '
+              BEGIN { FS = "\t" }
+              NF != 2 || $1 == "" || $2 == "" { exit 2 }
+              { print $1 }
+            ' "$manifest" | LC_ALL=C sort
+          )"
+          if [[ "$actual_manifest_keys" != "$expected_manifest_keys" ]]; then
+            echo "unsigned signing manifest keys do not match schema 2" >&2
+            exit 1
+          fi
+
+          manifest_value() {
+            local requested="$1"
+            awk -v requested="$requested" '
+              BEGIN { FS = "\t"; count = 0 }
+              $1 == requested {
+                if (NF != 2) exit 2
+                value = $2
+                count += 1
+              }
+              END {
+                if (count != 1) exit 3
+                print value
+              }
+            ' "$manifest"
+          }
+
+          manifest_schema="$(manifest_value schema)"
+          manifest_repository="$(manifest_value repository)"
+          manifest_ref="$(manifest_value ref)"
+          manifest_sha="$(manifest_value sha)"
+          manifest_tree="$(manifest_value tree)"
+          manifest_version="$(manifest_value version)"
+          manifest_bundle_version="$(manifest_value bundle_version)"
+          manifest_commit="$(manifest_value commit)"
+          manifest_archive_sha256="$(manifest_value archive_sha256)"
+
+          test "$manifest_schema" = 2
+          test "$manifest_repository" = "$GITHUB_REPOSITORY"
+          test "$manifest_ref" = "$GITHUB_REF"
+          test "$manifest_sha" = "$GITHUB_SHA"
+          test "$manifest_version" = "$EXPECTED_VERSION"
+          test "$manifest_bundle_version" = "$EXPECTED_BUNDLE_VERSION"
+          test "$manifest_commit" = "$EXPECTED_COMMIT"
+          test "$manifest_archive_sha256" = "$EXPECTED_ARCHIVE_SHA256"
+          test "$(manifest_value github_run_id)" = "$GITHUB_RUN_ID"
+          test "$(manifest_value github_run_attempt)" = "$GITHUB_RUN_ATTEMPT"
+          test "$(manifest_value runner_os)" = macOS
+          [[ "$(manifest_value runner_arch)" =~ ^(ARM64|X64)$ ]]
+          test "$(manifest_value xcode_version)" = "$FLASH_XCODE_VERSION"
+          test "$(manifest_value xcode_build)" = "$FLASH_XCODE_BUILD"
+          test "$(manifest_value nushell_version)" = "$FLASH_NUSHELL_VERSION"
+          test "$(manifest_value swiftlint_version)" = "$FLASH_SWIFTLINT_VERSION"
+          test "$(manifest_value minimum_macos_version)" = "$FLASH_MACOS_MINIMUM_VERSION"
+          test "$(manifest_value architectures)" = "arm64 x86_64"
+          test "$(manifest_value zig_optimize)" = ReleaseFast
+          test "$(manifest_value xcode_configuration)" = Release
+          test "$(manifest_value build_command_schema)" = \
+            "ghosttykit-releasefast-universal+xcode-release-universal-v1"
+          test "$(manifest_value ghosttykit_command)" = \
+            "zig build -Doptimize=ReleaseFast -Demit-macos-app=false -Dxcframework-target=universal -Dversion-string=<release-version>"
+          test "$(manifest_value app_build_command)" = \
+            "macos/build.nu --configuration Release --xcconfig macos/Configurations/FlashGhostty.Release.xcconfig --architectures arm64+x86_64 --locked-packages --action build"
+          [[ "$manifest_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$manifest_tree" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$manifest_version" =~ ^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})$ ]]
+          [[ "$manifest_bundle_version" =~ ^[1-9][0-9]{0,3}\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)$ ]]
+          [[ "$manifest_commit" =~ ^[0-9a-f]{7,40}$ ]]
+          [[ "$manifest_archive_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(manifest_value commit_timestamp)" =~ ^[1-9][0-9]*$ ]]
+          for digest_key in \
+            package_resolved_sha256 \
+            zig_binary_sha256 \
+            nushell_binary_sha256 \
+            swiftlint_binary_sha256 \
+            build_zig_zon_sha256 \
+            build_nu_sha256 \
+            xcode_project_sha256 \
+            release_xcconfig_sha256 \
+            entitlements_sha256 \
+            product_manifest_sha256 \
+            release_metadata_sha256 \
+            workflow_sha256; do
+            [[ "$(manifest_value "$digest_key")" =~ ^[0-9a-f]{64}$ ]]
+          done
+          expected_short_commit="${manifest_sha:0:${#manifest_commit}}"
+          test "$manifest_commit" = "$expected_short_commit"
+          actual_archive_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          test "$actual_archive_sha256" = "$manifest_archive_sha256"
+
+          test ! -e "$FLASH_SIGNING_INPUT_ROOT"
+          ditto -x -k "$archive" "$GITHUB_WORKSPACE"
+          test -d "$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
+          test -d "$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE.dSYM"
+          test -d "$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/DockTilePlugin.plugin.dSYM"
+          test -f "$FLASH_SIGNING_INPUT_ROOT/macos/Ghostty.entitlements"
+
+          printf 'bundle_version=%s\n' "$manifest_bundle_version" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$manifest_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Sign with Developer ID
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.FLASH_MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.FLASH_MACOS_CERTIFICATE_PWD }}
+          MACOS_CERTIFICATE_NAME: ${{ secrets.FLASH_MACOS_CERTIFICATE_NAME }}
+          MACOS_CI_KEYCHAIN_PWD: ${{ secrets.FLASH_MACOS_CI_KEYCHAIN_PWD }}
+        run: |
+          set +x
+          : "${MACOS_CERTIFICATE:?FLASH_MACOS_CERTIFICATE is required}"
+          : "${MACOS_CERTIFICATE_PWD:?FLASH_MACOS_CERTIFICATE_PWD is required}"
+          : "${MACOS_CERTIFICATE_NAME:?FLASH_MACOS_CERTIFICATE_NAME is required}"
+          : "${MACOS_CI_KEYCHAIN_PWD:?FLASH_MACOS_CI_KEYCHAIN_PWD is required}"
+          : "${FLASH_EXPECTED_TEAM_ID:?flash-release variable FLASH_MACOS_TEAM_ID is required}"
+          : "${FLASH_EXPECTED_CERTIFICATE_SHA256:?flash-release variable FLASH_MACOS_CERTIFICATE_SHA256 is required}"
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
+          if [[ ! "$FLASH_EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+            echo "FLASH_MACOS_TEAM_ID must be a canonical 10-character Apple Team ID" >&2
+            exit 1
+          fi
+          if [[ ! "$FLASH_EXPECTED_CERTIFICATE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "FLASH_MACOS_CERTIFICATE_SHA256 must be a lowercase SHA-256 fingerprint" >&2
+            exit 1
+          fi
+          certificate_name="$MACOS_CERTIFICATE_NAME"
+          if [[ "$certificate_name" != "Developer ID Application:"* ]]; then
+            echo "FLASH_MACOS_CERTIFICATE_NAME must be a Developer ID Application identity" >&2
+            exit 1
+          fi
+          if [[ "$certificate_name" == *$'\n'* \
+            || "$certificate_name" == *$'\r'* \
+            || "$certificate_name" != *" ($FLASH_EXPECTED_TEAM_ID)" ]]; then
+            echo "FLASH_MACOS_CERTIFICATE_NAME must end with the configured Team ID" >&2
+            exit 1
+          fi
+
+          app="$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
+          entitlements="$FLASH_SIGNING_INPUT_ROOT/macos/Ghostty.entitlements"
+          certificate="$RUNNER_TEMP/flash-certificate.p12"
+          leaf_certificate="$RUNNER_TEMP/flash-signing-leaf.pem"
+          keychain="$RUNNER_TEMP/flash-signing.keychain-db"
+          signed_entitlements="$RUNNER_TEMP/flash-signed-entitlements.plist"
+          umask 077
+          extracted_certificates="$(
+            mktemp -d "$RUNNER_TEMP/flash-extracted-signing-certificates.XXXXXX"
+          )"
+          cleanup() {
+            local original_status="$?"
+            local cleanup_status=0
+            trap - EXIT
+            set +e
+            rm -f "$certificate" "$leaf_certificate" "$signed_entitlements" \
+              || cleanup_status=1
+            rm -rf "$extracted_certificates" || cleanup_status=1
+            if [[ -e "$keychain" ]]; then
+              security lock-keychain "$keychain" >/dev/null 2>&1 \
+                || cleanup_status=1
+              security delete-keychain "$keychain" >/dev/null 2>&1 \
+                || cleanup_status=1
+            fi
+            if ((cleanup_status != 0)); then
+              echo "Failed to remove all ephemeral signing material" >&2
+            fi
+            if ((original_status != 0)); then
+              exit "$original_status"
+            fi
+            exit "$cleanup_status"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$MACOS_CI_KEYCHAIN_PWD" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$MACOS_CI_KEYCHAIN_PWD" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$MACOS_CI_KEYCHAIN_PWD" \
+            "$keychain"
+          unset MACOS_CERTIFICATE
+          unset MACOS_CERTIFICATE_PWD
+          unset MACOS_CERTIFICATE_NAME
+          unset MACOS_CI_KEYCHAIN_PWD
+          identity_matches="$(
+            security find-identity -v -p codesigning "$keychain" \
+              | awk -v expected="$certificate_name" '
+                  {
+                    hash = $2
+                    ordinal = $1
+                    sub(/\)$/, "", ordinal)
+                    name = $0
+                    sub(/^[^\"]*\"/, "", name)
+                    sub(/\"$/, "", name)
+                    if (ordinal ~ /^[0-9]+$/ \
+                        && name == expected \
+                        && length(hash) == 40 \
+                        && hash !~ /[^[:xdigit:]]/) {
+                      print tolower(hash)
+                    }
+                  }
+                '
+          )"
+          identity_match_count="$(
+            printf '%s\n' "$identity_matches" \
+              | awk 'NF { count += 1 } END { print count + 0 }'
+          )"
+          if [[ "$identity_match_count" != 1 ]]; then
+            echo "Expected exactly one matching Developer ID signing identity" >&2
+            exit 1
+          fi
+          signing_identity_sha1="$(
+            printf '%s\n' "$identity_matches" | awk 'NF { print; exit }'
+          )"
+          security find-certificate \
+            -c "$certificate_name" \
+            -p \
+            "$keychain" \
+            > "$leaf_certificate"
+          test -s "$leaf_certificate"
+          actual_certificate_sha256="$(
+            openssl x509 -in "$leaf_certificate" -outform DER \
+              | shasum -a 256 \
+              | awk '{print $1}'
+          )"
+          actual_certificate_sha1="$(
+            openssl x509 -in "$leaf_certificate" -outform DER \
+              | shasum -a 1 \
+              | awk '{print $1}'
+          )"
+          if [[ "$actual_certificate_sha1" != "$signing_identity_sha1" ]]; then
+            echo "Developer ID identity does not match the pinned leaf certificate" >&2
+            exit 1
+          fi
+          if [[ "$actual_certificate_sha256" != "$FLASH_EXPECTED_CERTIFICATE_SHA256" ]]; then
+            echo "Developer ID leaf certificate does not match the configured SHA-256 pin" >&2
+            exit 1
+          fi
+          openssl x509 -in "$leaf_certificate" -checkend 0 -noout
+          certificate_subject="$(
+            openssl x509 \
+              -in "$leaf_certificate" \
+              -noout \
+              -subject \
+              -nameopt RFC2253
+          )"
+          certificate_team_id="$(
+            sed -nE \
+              's/^subject=.*OU=([A-Z0-9]{10})(,.*)?$/\1/p' \
+              <<< "$certificate_subject"
+          )"
+          if [[ "$certificate_team_id" != "$FLASH_EXPECTED_TEAM_ID" ]]; then
+            echo "Developer ID certificate Team ID does not match FLASH_MACOS_TEAM_ID" >&2
+            exit 1
+          fi
+
+          forbidden_entitlements=(
+            com.apple.security.get-task-allow
+            com.apple.security.cs.allow-jit
+            com.apple.security.cs.allow-unsigned-executable-memory
+            com.apple.security.cs.disable-executable-page-protection
+            com.apple.security.cs.disable-library-validation
+            com.apple.security.cs.allow-dyld-environment-variables
+          )
+          expected_app_entitlements=(
+            com.apple.security.automation.apple-events
+            com.apple.security.device.audio-input
+            com.apple.security.device.camera
+            com.apple.security.personal-information.addressbook
+            com.apple.security.personal-information.calendars
+            com.apple.security.personal-information.location
+            com.apple.security.personal-information.photos-library
+          )
+          verify_exact_app_entitlements() {
+            local plist_path="$1"
+            local label="$2"
+            local actual_keys
+            local expected_keys
+            local entitlement
+            plutil -lint "$plist_path" >/dev/null
+            expected_keys="$(
+              printf '%s\n' "${expected_app_entitlements[@]}" | LC_ALL=C sort
+            )"
+            actual_keys="$(
+              /usr/libexec/PlistBuddy -c Print "$plist_path" \
+                | sed -nE \
+                  's/^[[:space:]]*([^ =]+)[[:space:]]*=[[:space:]].*/\1/p' \
+                | LC_ALL=C sort
+            )"
+            if [[ "$actual_keys" != "$expected_keys" ]]; then
+              echo "$label does not match the exact release entitlement allowlist" >&2
+              exit 1
+            fi
+            for entitlement in "${expected_app_entitlements[@]}"; do
+              if [[ "$(
+                /usr/libexec/PlistBuddy \
+                  -c "Print :$entitlement" \
+                  "$plist_path"
+              )" != true ]]; then
+                echo "$label has non-true entitlement $entitlement" >&2
+                exit 1
+              fi
+            done
+          }
+          verify_exact_app_entitlements "$entitlements" "unsigned main-app entitlements"
+
+          sparkle="$app/Contents/Frameworks/Sparkle.framework/Versions/B"
+          sign() {
+            /usr/bin/codesign \
+              --verbose \
+              --force \
+              --timestamp \
+              --keychain "$keychain" \
+              --sign "$signing_identity_sha1" \
+              --options runtime \
+              "$@"
+          }
+          # Sparkle 2.6+ may ship Downloader-specific entitlements. Preserve
+          # them as required by Sparkle's manual distribution-signing guide.
+          sign --preserve-metadata=entitlements "$sparkle/XPCServices/Downloader.xpc"
+          sign "$sparkle/XPCServices/Installer.xpc"
+          sign "$sparkle/Autoupdate"
+          sign "$sparkle/Updater.app"
+          sign "$app/Contents/Frameworks/Sparkle.framework"
+          sign "$app/Contents/PlugIns/DockTilePlugin.plugin"
+          sign --entitlements "$entitlements" "$app"
+
+          /usr/bin/codesign --verify --deep --strict --all-architectures --verbose=2 "$app"
+
+          # Verify every executable slice, not only the outer app. This makes
+          # future embedded helpers fail closed if the explicit inside-out
+          # signing list above is not updated with them.
+          candidate_manifest="$extracted_certificates/app-files.nul"
+          if ! find "$app" -type f -print0 > "$candidate_manifest"; then
+            echo "Failed to enumerate every release-app file" >&2
+            exit 1
+          fi
+          signed_mach_o_count=0
+          while IFS= read -r -d '' candidate; do
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
+              ((signed_mach_o_count += 1))
+              for architecture in arm64 x86_64; do
+                certificate_prefix="$extracted_certificates/$signed_mach_o_count-$architecture-"
+                signature_info="$(
+                  /usr/bin/codesign \
+                    --display \
+                    --verbose=4 \
+                    --arch "$architecture" \
+                    --extract-certificates "$certificate_prefix" \
+                    "$candidate" \
+                    </dev/null 2>&1
+                )"
+                grep -Fx "Authority=$certificate_name" <<< "$signature_info"
+                grep -Fx "TeamIdentifier=$FLASH_EXPECTED_TEAM_ID" <<< "$signature_info"
+                grep -Eq 'flags=.*[(,]runtime([,)]|$)' <<< "$signature_info"
+                grep -F 'Timestamp=' <<< "$signature_info"
+                embedded_leaf="${certificate_prefix}0"
+                test -f "$embedded_leaf"
+                test -s "$embedded_leaf"
+                embedded_leaf_sha256="$(
+                  shasum -a 256 "$embedded_leaf" | awk '{print $1}'
+                )"
+                if [[ "$embedded_leaf_sha256" != "$FLASH_EXPECTED_CERTIFICATE_SHA256" ]]; then
+                  echo "$candidate ($architecture) was not signed by the pinned leaf certificate" >&2
+                  exit 1
+                fi
+
+                rm -f "$signed_entitlements"
+                /usr/bin/codesign \
+                  --display \
+                  --arch "$architecture" \
+                  --entitlements "$signed_entitlements" \
+                  --xml \
+                  "$candidate" \
+                  >/dev/null 2>&1
+                if [[ "$candidate" == "$app/Contents/MacOS/ghostty" \
+                  && ! -s "$signed_entitlements" ]]; then
+                  echo "$candidate ($architecture) has no signed entitlements" >&2
+                  exit 1
+                fi
+                if [[ "$candidate" == "$app/Contents/MacOS/ghostty" ]]; then
+                  verify_exact_app_entitlements \
+                    "$signed_entitlements" \
+                    "$candidate ($architecture) signed entitlements"
+                elif [[ -s "$signed_entitlements" ]]; then
+                  for forbidden_entitlement in "${forbidden_entitlements[@]}"; do
+                    if [[ "$(
+                      /usr/libexec/PlistBuddy \
+                        -c "Print :$forbidden_entitlement" \
+                        "$signed_entitlements" \
+                        2>/dev/null || true
+                    )" == "true" ]]; then
+                      echo "$candidate ($architecture) enables forbidden entitlement: $forbidden_entitlement" >&2
+                      exit 1
+                    fi
+                  done
+                fi
+              done
+            fi
+          done < "$candidate_manifest"
+          if ((signed_mach_o_count == 0)); then
+            echo "signed release app contains no Mach-O binaries" >&2
+            exit 1
+          fi
+
+      - name: Notarize and staple app
+        id: notarization
+        env:
+          APPLE_NOTARIZATION_ISSUER: ${{ secrets.FLASH_APPLE_NOTARIZATION_ISSUER }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.FLASH_APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.FLASH_APPLE_NOTARIZATION_KEY }}
+        run: |
+          set +x
+          : "${APPLE_NOTARIZATION_ISSUER:?FLASH_APPLE_NOTARIZATION_ISSUER is required}"
+          : "${APPLE_NOTARIZATION_KEY_ID:?FLASH_APPLE_NOTARIZATION_KEY_ID is required}"
+          : "${APPLE_NOTARIZATION_KEY:?FLASH_APPLE_NOTARIZATION_KEY is required}"
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
+
+          notarization_issuer="$APPLE_NOTARIZATION_ISSUER"
+          notarization_key_id="$APPLE_NOTARIZATION_KEY_ID"
+          app="$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
+          key="$RUNNER_TEMP/flash-notarization-key.p8"
+          archive="$RUNNER_TEMP/flash-notarization.zip"
+          diagnostics="$GITHUB_WORKSPACE/flash-notarization-diagnostics"
+          result="$diagnostics/submission-result.json"
+          log="$diagnostics/submission-log.json"
+          umask 077
+          mkdir -p "$diagnostics"
+          trap 'rm -f "$key" "$archive"' EXIT
+
+          printf '%s' "$APPLE_NOTARIZATION_KEY" > "$key"
+          unset APPLE_NOTARIZATION_ISSUER
+          unset APPLE_NOTARIZATION_KEY_ID
+          unset APPLE_NOTARIZATION_KEY
+          if ! grep -q '^-----BEGIN PRIVATE KEY-----$' "$key" \
+            || ! grep -q '^-----END PRIVATE KEY-----$' "$key"; then
+            echo "FLASH_APPLE_NOTARIZATION_KEY must contain the raw .p8 private key" >&2
+            exit 1
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+          submit_succeeded=true
+          if ! xcrun notarytool submit "$archive" \
+              --key "$key" \
+              --key-id "$notarization_key_id" \
+              --issuer "$notarization_issuer" \
+              --wait \
+              --timeout 45m \
+              --no-progress \
+              --output-format json \
+              | tee "$result"; then
+            submit_succeeded=false
+          fi
+
+          notarization_status="$(
+            plutil -extract status raw -o - "$result" 2>/dev/null || true
+          )"
+          submission_id="$(
+            plutil -extract id raw -o - "$result" 2>/dev/null || true
+          )"
+          if [[ "$submit_succeeded" != "true" \
+            || "$notarization_status" != "Accepted" ]]; then
+            echo "Apple notarization did not return Accepted (status: ${notarization_status:-unknown})" >&2
+            if [[ -n "$submission_id" ]]; then
+              if ! xcrun notarytool log \
+                  --key "$key" \
+                  --key-id "$notarization_key_id" \
+                  --issuer "$notarization_issuer" \
+                  "$submission_id" \
+                  "$log"; then
+                echo "Failed to retrieve notarization log for $submission_id" >&2
+              fi
+            fi
+            exit 1
+          fi
+          if [[ ! "$submission_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "Apple notarization returned a malformed submission ID" >&2
+            exit 1
+          fi
+          xcrun stapler staple -v "$app"
+          xcrun stapler validate -v "$app"
+          /usr/bin/codesign --verify --deep --strict --all-architectures --verbose=2 "$app"
+          /usr/sbin/spctl --assess --type execute --verbose=4 "$app"
+          printf 'submission_id=%s\n' "$submission_id" >> "$GITHUB_OUTPUT"
+          rm -f "$result" "$log"
+          rmdir "$diagnostics" 2>/dev/null || true
+
+      - name: Upload notarization diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-notarization-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: flash-notarization-diagnostics
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Archive and verify app and debug symbols
+        env:
+          EXPECTED_BUNDLE_VERSION: ${{ steps.signing_input.outputs.bundle_version }}
+          EXPECTED_COMMIT: ${{ steps.signing_input.outputs.commit }}
+          EXPECTED_UNSIGNED_ARCHIVE_SHA256: ${{ needs['build-macos'].outputs.unsigned_archive_sha256 }}
+          EXPECTED_UNSIGNED_MANIFEST_SHA256: ${{ needs['build-macos'].outputs.unsigned_manifest_sha256 }}
+          NOTARIZATION_SUBMISSION_ID: ${{ steps.notarization.outputs.submission_id }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
+          app="$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
+          symbols="$app.dSYM"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          plugin="$app/Contents/PlugIns/DockTilePlugin.plugin"
+          plugin_symbols="$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/DockTilePlugin.plugin.dSYM"
+          plugin_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plugin/Contents/Info.plist")"
+
+          assert_plist_value() {
+            local plist_path="$1"
+            local key="$2"
+            local expected="$3"
+            local actual
+            if ! actual="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist_path")"; then
+              echo "$plist_path is missing required key $key" >&2
+              exit 1
+            fi
+            if [[ "$actual" != "$expected" ]]; then
+              echo "$plist_path has $key=$actual; expected $expected" >&2
+              exit 1
+            fi
+          }
+
+          assert_plist_absent() {
+            local plist_path="$1"
+            local key="$2"
+            if /usr/libexec/PlistBuddy -c "Print :$key" "$plist_path" >/dev/null 2>&1; then
+              echo "$plist_path must not contain $key" >&2
+              exit 1
+            fi
+          }
+
+          verify_dsym() {
+            local binary="$1"
+            local dsym="$2"
+            local label="$3"
+            local binary_uuids
+            local symbol_uuids
+            test -f "$binary"
+            test -d "$dsym"
+
+            binary_uuids="$(dwarfdump --uuid "$binary" | awk '{print $2, $3}' | sort)"
+            symbol_uuids="$(dwarfdump --uuid "$dsym" | awk '{print $2, $3}' | sort)"
+            if [[ -z "$binary_uuids" || "$binary_uuids" != "$symbol_uuids" ]]; then
+              echo "$label dSYM UUIDs do not match its executable" >&2
+              exit 1
+            fi
+          }
+          verify_dsym "$app/Contents/MacOS/$executable" "$symbols" "release app"
+          verify_dsym "$plugin/Contents/MacOS/$plugin_executable" "$plugin_symbols" "dock tile plugin"
+
+          symbols_bundle="$RUNNER_TEMP/flash-ghostty-dsyms"
+          mkdir "$symbols_bundle"
+          ditto "$symbols" "$symbols_bundle/$(basename "$symbols")"
+          ditto "$plugin_symbols" "$symbols_bundle/$(basename "$plugin_symbols")"
+
           ditto -c -k --sequesterRsrc --keepParent \
             "$app" \
             "$FLASH_GHOSTTY_ARTIFACT_BASENAME.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$symbols_bundle" \
+            "$FLASH_GHOSTTY_ARTIFACT_BASENAME-dsym.zip"
+          unzip -tq "$FLASH_GHOSTTY_ARTIFACT_BASENAME.zip"
+          unzip -tq "$FLASH_GHOSTTY_ARTIFACT_BASENAME-dsym.zip"
+          build_inputs="$FLASH_GHOSTTY_ARTIFACT_BASENAME-build-inputs.tsv"
+          provenance="$FLASH_GHOSTTY_ARTIFACT_BASENAME-provenance.tsv"
+          source_build_inputs="unsigned-signing-input/flash-ghostty-unsigned-signing-input.tsv"
+          test -f "$source_build_inputs"
+          ditto "$source_build_inputs" "$build_inputs"
+          app_archive_sha256="$(
+            shasum -a 256 "$FLASH_GHOSTTY_ARTIFACT_BASENAME.zip" | awk '{print $1}'
+          )"
+          dsym_archive_sha256="$(
+            shasum -a 256 "$FLASH_GHOSTTY_ARTIFACT_BASENAME-dsym.zip" | awk '{print $1}'
+          )"
+          build_inputs_sha256="$(shasum -a 256 "$build_inputs" | awk '{print $1}')"
+          test "$build_inputs_sha256" = "$EXPECTED_UNSIGNED_MANIFEST_SHA256"
+          for digest in \
+            "$app_archive_sha256" \
+            "$dsym_archive_sha256" \
+            "$build_inputs_sha256" \
+            "$EXPECTED_UNSIGNED_ARCHIVE_SHA256" \
+            "$FLASH_EXPECTED_CERTIFICATE_SHA256"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          done
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$NOTARIZATION_SUBMISSION_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+          {
+            printf 'schema\t1\n'
+            printf 'repository\t%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref\t%s\n' "$GITHUB_REF"
+            printf 'sha\t%s\n' "$GITHUB_SHA"
+            printf 'version\t%s\n' "$RELEASE_VERSION"
+            printf 'bundle_version\t%s\n' "$EXPECTED_BUNDLE_VERSION"
+            printf 'commit\t%s\n' "$EXPECTED_COMMIT"
+            printf 'github_run_id\t%s\n' "$GITHUB_RUN_ID"
+            printf 'github_run_attempt\t%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'unsigned_archive_sha256\t%s\n' "$EXPECTED_UNSIGNED_ARCHIVE_SHA256"
+            printf 'build_inputs_sha256\t%s\n' "$build_inputs_sha256"
+            printf 'app_archive_sha256\t%s\n' "$app_archive_sha256"
+            printf 'dsym_archive_sha256\t%s\n' "$dsym_archive_sha256"
+            printf 'signing_xcode_version\t%s\n' "$FLASH_XCODE_VERSION"
+            printf 'signing_xcode_build\t%s\n' "$FLASH_XCODE_BUILD"
+            printf 'signing_runner_os\t%s\n' "$RUNNER_OS"
+            printf 'signing_runner_arch\t%s\n' "$RUNNER_ARCH"
+            printf 'signing_macos_version\t%s\n' "$(sw_vers -productVersion)"
+            printf 'signing_macos_build\t%s\n' "$(sw_vers -buildVersion)"
+            printf 'team_id\t%s\n' "$FLASH_EXPECTED_TEAM_ID"
+            printf 'certificate_sha256\t%s\n' "$FLASH_EXPECTED_CERTIFICATE_SHA256"
+            printf 'notarization_submission_id\t%s\n' "$NOTARIZATION_SUBMISSION_ID"
+          } > "$provenance"
+          shasum -a 256 \
+            "$FLASH_GHOSTTY_ARTIFACT_BASENAME.zip" \
+            "$FLASH_GHOSTTY_ARTIFACT_BASENAME-dsym.zip" \
+            "$build_inputs" \
+            "$provenance" \
+            | tee "$FLASH_GHOSTTY_ARTIFACT_BASENAME-SHA256SUMS.txt"
+          shasum -a 256 -c "$FLASH_GHOSTTY_ARTIFACT_BASENAME-SHA256SUMS.txt"
+
+          verification_directory="$RUNNER_TEMP/flash-artifact-verification"
+          mkdir "$verification_directory"
+          ditto -x -k \
+            "$FLASH_GHOSTTY_ARTIFACT_BASENAME.zip" \
+            "$verification_directory"
+          archived_app="$verification_directory/$FLASH_GHOSTTY_APP_BUNDLE"
+          archived_plist="$archived_app/Contents/Info.plist"
+          archived_plugin="$archived_app/Contents/PlugIns/DockTilePlugin.plugin"
+          archived_plugin_plist="$archived_plugin/Contents/Info.plist"
+          bundle_version="$EXPECTED_BUNDLE_VERSION"
+          commit="$EXPECTED_COMMIT"
+          test -d "$archived_app"
+          test -f "$archived_plist"
+          test -d "$archived_plugin"
+          test -f "$archived_plugin_plist"
+
+          assert_plist_value \
+            "$archived_plist" \
+            CFBundleIdentifier \
+            "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID"
+          assert_plist_value "$archived_plist" CFBundleName "$FLASH_GHOSTTY_DISPLAY_NAME"
+          assert_plist_value \
+            "$archived_plist" \
+            CFBundleDisplayName \
+            "$FLASH_GHOSTTY_DISPLAY_NAME"
+          assert_plist_value "$archived_plist" CFBundleExecutable ghostty
+          assert_plist_value "$archived_plist" NSMainNibFile FlashMainMenu
+          assert_plist_value "$archived_plist" OSAScriptingDefinition FlashGhostty.sdef
+          assert_plist_value "$archived_plist" LSMultipleInstancesProhibited true
+          assert_plist_value \
+            "$archived_plist" \
+            LSMinimumSystemVersion \
+            "$FLASH_MACOS_MINIMUM_VERSION"
+          assert_plist_value "$archived_plist" GhosttyCommit "$commit"
+          assert_plist_value "$archived_plist" CFBundleVersion "$bundle_version"
+          assert_plist_value \
+            "$archived_plist" \
+            CFBundleShortVersionString \
+            "$RELEASE_VERSION"
+          assert_plist_value "$archived_plist" SUEnableAutomaticChecks false
+          assert_plist_absent "$archived_plist" SUFeedURL
+          assert_plist_absent "$archived_plist" SUPublicEDKey
+
+          assert_plist_value \
+            "$archived_plugin_plist" \
+            CFBundleIdentifier \
+            "$FLASH_GHOSTTY_RELEASE_BUNDLE_ID.dock-tile"
+          assert_plist_value "$archived_plugin_plist" CFBundleName DockTilePlugin
+          assert_plist_value \
+            "$archived_plugin_plist" \
+            CFBundleDisplayName \
+            "$FLASH_GHOSTTY_DISPLAY_NAME Dock Tile Plugin"
+          assert_plist_value "$archived_plugin_plist" CFBundleExecutable DockTilePlugin
+          assert_plist_value \
+            "$archived_plugin_plist" \
+            LSMinimumSystemVersion \
+            "$FLASH_MACOS_MINIMUM_VERSION"
+          assert_plist_value "$archived_plugin_plist" CFBundleVersion "$bundle_version"
+          assert_plist_value \
+            "$archived_plugin_plist" \
+            CFBundleShortVersionString \
+            "$RELEASE_VERSION"
+
+          /usr/bin/codesign \
+            --verify --deep --strict --all-architectures --verbose=2 \
+            "$archived_app"
+          xcrun stapler validate -v "$archived_app"
+          /usr/sbin/spctl --assess --type execute --verbose=4 "$archived_app"
+
+          archived_candidate_manifest="$(
+            mktemp "$RUNNER_TEMP/flash-archived-app-files.XXXXXX"
+          )"
+          trap 'rm -f "$archived_candidate_manifest"' EXIT
+          if ! find "$archived_app" -type f -print0 \
+              > "$archived_candidate_manifest"; then
+            echo "Failed to enumerate every archived release-app file" >&2
+            exit 1
+          fi
+          archived_mach_o_count=0
+          while IFS= read -r -d '' candidate; do
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect archived release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
+              ((archived_mach_o_count += 1))
+              if ! architectures="$(
+                  lipo -archs "$candidate" \
+                    | tr ' ' '\n' \
+                    | LC_ALL=C sort \
+                    | paste -sd ' ' -
+                )"; then
+                echo "Failed to inspect archived architectures: $candidate" >&2
+                exit 1
+              fi
+              if [[ "$architectures" != "arm64 x86_64" ]]; then
+                echo "archived $candidate has architectures '$architectures'; expected exactly arm64 x86_64" >&2
+                exit 1
+              fi
+            fi
+          done < "$archived_candidate_manifest"
+          if ((archived_mach_o_count == 0)); then
+            echo "archived release app contains no Mach-O binaries" >&2
+            exit 1
+          fi
 
       - name: Upload release candidate
+        id: release_artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: flash-ghostty-${{ needs.validate.outputs.version }}-macos
-          path: flash-ghostty-macos-universal.zip
+          name: flash-ghostty-${{ needs.validate.outputs.version }}-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |-
+            flash-ghostty-macos-universal.zip
+            flash-ghostty-macos-universal-dsym.zip
+            flash-ghostty-macos-universal-build-inputs.tsv
+            flash-ghostty-macos-universal-provenance.tsv
+            flash-ghostty-macos-universal-SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
 
-# Deliberately no GitHub Release, appcast, R2, Sentry, notarization, or
-# Sparkle signing step. Add those only after FLASH-Ghostty owns the required
-# identities and secrets.
+      - name: Record release artifact digest
+        env:
+          ARTIFACT_DIGEST: ${{ steps.release_artifact.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.release_artifact.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.release_artifact.outputs.artifact-url }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          test -n "$ARTIFACT_URL"
+          record="$FLASH_GHOSTTY_ARTIFACT_BASENAME-github-artifact.tsv"
+          {
+            printf 'schema\t1\n'
+            printf 'repository\t%s\n' "$GITHUB_REPOSITORY"
+            printf 'ref\t%s\n' "$GITHUB_REF"
+            printf 'sha\t%s\n' "$GITHUB_SHA"
+            printf 'version\t%s\n' "$RELEASE_VERSION"
+            printf 'github_run_id\t%s\n' "$GITHUB_RUN_ID"
+            printf 'github_run_attempt\t%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'artifact_name\tflash-ghostty-%s-macos-%s-%s\n' \
+              "$RELEASE_VERSION" \
+              "$GITHUB_RUN_ID" \
+              "$GITHUB_RUN_ATTEMPT"
+            printf 'artifact_id\t%s\n' "$ARTIFACT_ID"
+            printf 'artifact_url\t%s\n' "$ARTIFACT_URL"
+            printf 'artifact_digest\t%s\n' "$ARTIFACT_DIGEST"
+          } > "$record"
+          {
+            printf '### FLASH-Ghostty release artifact\n\n'
+            printf -- '- Full source SHA: `%s`\n' "$GITHUB_SHA"
+            printf -- '- GitHub artifact SHA-256: `%s`\n' "$ARTIFACT_DIGEST"
+            printf -- '- Artifact URL: %s\n' "$ARTIFACT_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable artifact digest record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flash-ghostty-${{ needs.validate.outputs.version }}-artifact-record-${{ github.run_id }}-${{ github.run_attempt }}
+          path: flash-ghostty-macos-universal-github-artifact.tsv
+          if-no-files-found: error
+          retention-days: 14
+
+# Deliberately no GitHub Release, appcast, R2, Sentry, or Sparkle update
+# signing step. The uploaded artifact is nevertheless Developer ID signed and
+# notarized; the workflow fails closed until the FLASH_* secrets exist.

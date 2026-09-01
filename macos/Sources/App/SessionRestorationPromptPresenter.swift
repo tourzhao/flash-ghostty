@@ -9,11 +9,13 @@ protocol SessionRestorationPromptPresenting: AnyObject {
 
 /// Presents the startup choice as a sheet when a host window exists. During
 /// state restoration AppKit has not created that host yet, so the standalone
-/// alert is app-modal until the user makes the launch-wide decision.
+/// decision uses a retained panel until the user makes the launch-wide choice.
 @MainActor
 final class AppKitSessionRestorationPromptPresenter: NSObject,
                                                         SessionRestorationPromptPresenting {
     private var activeAlert: NSAlert?
+    private var activePanel: NSPanel?
+    private var activePanelController: NSWindowController?
     private var completion: ((SessionRestorationDecision) -> Void)?
 
     func present(
@@ -60,23 +62,30 @@ final class AppKitSessionRestorationPromptPresenter: NSObject,
             return
         }
 
-        // AppKit waits for the restoration completion handler before it
-        // finishes activating the application. A modeless alert can therefore
-        // remain on the previous Space indefinitely. Running this one decision
-        // app-modally completes that handshake without decoding or starting
-        // any restored terminal session first.
-        alert.window.collectionBehavior.insert(.moveToActiveSpace)
-        alert.window.collectionBehavior.insert(.fullScreenAuxiliary)
-        alert.window.hidesOnDeactivate = false
-        alert.window.level = .modalPanel
-        alert.window.center()
-        alert.window.makeKeyAndOrderFront(nil)
-        alert.window.orderFrontRegardless()
+        // AppKit disables the application while asynchronous restoration
+        // completion handlers are outstanding. Merely ordering a modeless
+        // window in that interval leaves no visible or accessible decision UI.
+        // A retained custom panel plus a nested modal session keeps the choice
+        // interactive while continuing to service the normal event loop.
+        activeAlert = nil
+        let panel = makeStandalonePanel()
+        let panelController = NSWindowController(window: panel)
+        activePanel = panel
+        activePanelController = panelController
+        panel.center()
+        panelController.showWindow(nil)
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        let decision: SessionRestorationDecision =
-            response == .alertFirstButtonReturn ? .restore : .startFresh
-        finish(with: decision)
+        NSApp.runModal(for: panel)
+    }
+
+    @objc private func restoreFromStandaloneAlert(_ sender: Any?) {
+        finish(with: .restore)
+    }
+
+    @objc private func startFreshFromStandaloneAlert(_ sender: Any?) {
+        finish(with: .startFresh)
     }
 
     private func sheetParent(for alert: NSAlert) -> NSWindow? {
@@ -90,8 +99,108 @@ final class AppKitSessionRestorationPromptPresenter: NSObject,
         guard let completion else { return }
 
         self.completion = nil
+        if NSApp.modalWindow === activePanel {
+            NSApp.stopModal()
+        }
         activeAlert?.window.orderOut(nil)
         activeAlert = nil
+        activePanel?.close()
+        activePanel = nil
+        activePanelController = nil
         completion(decision)
+    }
+
+    private func makeStandalonePanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 190),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = FlashGhosttyProductProfile.displayName
+        panel.identifier = .init("session-restoration-prompt")
+        panel.isRestorable = false
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.level = .modalPanel
+        panel.collectionBehavior.insert(.moveToActiveSpace)
+        panel.collectionBehavior.insert(.fullScreenAuxiliary)
+        panel.standardWindowButton(.closeButton)?.isHidden = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+
+        let icon = NSImageView(image: NSApp.applicationIconImage)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 64),
+            icon.heightAnchor.constraint(equalToConstant: 64),
+        ])
+
+        let title = NSTextField(labelWithString: "Restore Previous Sessions?")
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+
+        let detail = NSTextField(wrappingLabelWithString: """
+        \(FlashGhosttyProductProfile.displayName) can restore windows, tabs, session names, working directories, and layouts from the last time you quit.
+        Running commands, terminal output, and Codex or Claude Code processes cannot be resumed.
+        """)
+        detail.textColor = .secondaryLabelColor
+
+        let labels = NSStackView(views: [title, detail])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 8
+
+        let message = NSStackView(views: [icon, labels])
+        message.orientation = .horizontal
+        message.alignment = .top
+        message.spacing = 16
+
+        let freshButton = NSButton(
+            title: "Start Fresh",
+            target: self,
+            action: #selector(startFreshFromStandaloneAlert(_:))
+        )
+        freshButton.identifier = .init("session-restoration-prompt.start-fresh")
+        freshButton.keyEquivalent = "\u{1b}"
+
+        let restoreButton = NSButton(
+            title: "Restore Sessions",
+            target: self,
+            action: #selector(restoreFromStandaloneAlert(_:))
+        )
+        restoreButton.identifier = .init("session-restoration-prompt.restore")
+        restoreButton.keyEquivalent = "\r"
+
+        let buttons = NSStackView(views: [freshButton, restoreButton])
+        buttons.orientation = .horizontal
+        buttons.alignment = .centerY
+        buttons.spacing = 8
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let buttonRow = NSStackView(views: [spacer, buttons])
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+
+        let content = NSStackView(views: [message, buttonRow])
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 18
+        panel.contentView = NSView()
+        panel.contentView?.addSubview(content)
+        if let contentView = panel.contentView {
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+                content.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+                content.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 22),
+                content.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20),
+                message.widthAnchor.constraint(equalTo: content.widthAnchor),
+                buttonRow.widthAnchor.constraint(equalTo: content.widthAnchor),
+            ])
+        }
+        return panel
     }
 }

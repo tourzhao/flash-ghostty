@@ -305,8 +305,8 @@ class TerminalWindow: NSWindow {
     /// Refreshes the titlebar toggle from the controller's shared tab-group
     /// state. Every native tab owns a separate window and titlebar accessory,
     /// so each window must update when the shared visibility changes.
-    func sessionSidebarVisibilityDidChange() {
-        flashSidebarChrome.visibilityDidChange()
+    func sessionSidebarVisibilityDidChange(isVisible: Bool) {
+        flashSidebarChrome.visibilityDidChange(isVisible: isVisible)
     }
 
     /// Updates the accessibility exposure using a tab group captured by the

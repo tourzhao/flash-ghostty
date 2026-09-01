@@ -2,7 +2,9 @@
 .*.swp
 .swp
 *.log
+*.profraw
 .DS_Store
+/macos/com.apple.DeveloperTools/
 .vscode/
 .direnv/
 .envrc.local

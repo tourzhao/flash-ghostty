@@ -739,7 +739,7 @@ extension Ghostty {
                 checkForUpdates(app)
 
             case GHOSTTY_ACTION_OPEN_URL:
-                return openURL(action.action.open_url)
+                return openURL(action.action.open_url, target: target)
 
             case GHOSTTY_ACTION_UNDO:
                 return undo(app, target: target)
@@ -801,7 +801,8 @@ extension Ghostty {
         }
 
         private static func openURL(
-            _ v: ghostty_action_open_url_s
+            _ v: ghostty_action_open_url_s,
+            target: ghostty_target_s? = nil
         ) -> Bool {
             let action = Ghostty.Action.OpenURL(c: v)
 
@@ -809,7 +810,42 @@ extension Ghostty {
             // out of the unrestricted generic opener so unsafe local files and
             // deceptive targets cannot reach Launch Services directly.
             if action.kind == .osc8 {
-                return openUntrustedURL(action.url)
+                return openUntrustedURL(action.url, target: target)
+            }
+
+            // FLASH: Matcher-detected local links from terminal output get
+            // native file actions instead of opening immediately. The matcher
+            // reports these as `.unknown`; explicit text and HTML actions keep
+            // their existing behavior.
+            if action.kind == .unknown,
+               let target,
+               let surfaceView = surfaceView(for: target) {
+                let workingDirectory = surfaceView.pwd.flatMap {
+                    $0.isEmpty ? nil : $0
+                } ?? surfaceView.lastKnownWorkingDirectory
+
+                if FlashTerminalFileTargetResolver.isPotentialLocalPath(action.url) {
+                    let retryAsURL = FlashTerminalFileTargetResolver
+                        .shouldRetryAsURLAfterLocalMiss(action.url)
+                    let onFailure: (@Sendable () -> Void)?
+                    if retryAsURL {
+                        let value = action.url
+                        onFailure = {
+                            guard let url = URL(string: value) else { return }
+                            _ = NSWorkspace.shared.open(url)
+                        }
+                    } else {
+                        onFailure = nil
+                    }
+
+                    FlashTerminalFileActionMenu.resolveAndPresent(
+                        action.url,
+                        workingDirectory: workingDirectory,
+                        sourceSurfaceID: surfaceView.id,
+                        onFailure: onFailure
+                    )
+                    return true
+                }
             }
 
             // If the URL doesn't have a valid scheme we assume its a file path. The URL
@@ -852,7 +888,37 @@ extension Ghostty {
             return true
         }
 
-        private static func openUntrustedURL(_ value: String) -> Bool {
+        private static func openUntrustedURL(
+            _ value: String,
+            target actionTarget: ghostty_target_s?
+        ) -> Bool {
+            // OSC 8 file links emitted by modern CLI tools should behave like
+            // auto-detected paths. The resolver also returns unsafe executable
+            // targets as reveal-only, so Finder remains available without
+            // dispatching them to Launch Services.
+            if let actionTarget,
+               let surfaceView = surfaceView(for: actionTarget) {
+                let workingDirectory = surfaceView.pwd.flatMap {
+                    $0.isEmpty ? nil : $0
+                } ?? surfaceView.lastKnownWorkingDirectory
+
+                if FlashTerminalFileTargetResolver.isPotentialLocalPath(value) {
+                    FlashTerminalFileActionMenu.resolveAndPresent(
+                        value,
+                        workingDirectory: workingDirectory,
+                        sourceSurfaceID: surfaceView.id,
+                        onFailure: {
+                            _ = openUntrustedURLDecision(value)
+                        }
+                    )
+                    return true
+                }
+            }
+
+            return openUntrustedURLDecision(value)
+        }
+
+        private static func openUntrustedURLDecision(_ value: String) -> Bool {
             let target = UntrustedURL(value)
             switch target.decision {
             case .allow(let url):
@@ -874,6 +940,17 @@ extension Ghostty {
             // Always report OSC 8 actions as handled. Returning false would
             // cause the core to retry with the unrestricted fallback opener.
             return true
+        }
+
+        private static func surfaceView(
+            for target: ghostty_target_s
+        ) -> SurfaceView? {
+            guard
+                target.tag == GHOSTTY_TARGET_SURFACE,
+                let surface = target.target.surface
+            else { return nil }
+
+            return surfaceView(from: surface)
         }
 
         private static func undo(_ app: ghostty_app_t, target: ghostty_target_s) -> Bool {
@@ -1773,8 +1850,12 @@ extension Ghostty {
             _ app: ghostty_app_t,
             target: ghostty_target_s
         ) {
-            guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
-            appDelegate.toggleQuickTerminal(self)
+            DispatchQueue.main.async { @MainActor in
+                guard let appDelegate = NSApp.delegate as? AppDelegate else {
+                    return
+                }
+                appDelegate.requestQuickTerminalToggle()
+            }
         }
 
         private static func setTitle(
@@ -2219,6 +2300,9 @@ extension Ghostty {
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
 
+                // The action already carries the coherent geometry sampled by
+                // the renderer. Do not reacquire the renderer mutex here; a
+                // full identity is needed only by FLASH Pin validation paths.
                 let scrollbar = Ghostty.Action.Scrollbar(c: v)
                 NotificationCenter.default.post(
                     name: .ghosttyDidUpdateScrollbar,

@@ -49,5 +49,17 @@ struct FlashGhosttyProductProfileTests {
         #expect(FlashGhosttyProductProfile.defaultsSuiteIdentifier(
             forBundleIdentifier: "com.flashghostty.app.debug.dock-tile"
         ) == "com.flashghostty.app.debug")
+        #expect(FlashGhosttyProductProfile.defaultsSuiteIdentifier(
+            forBundleIdentifier: "com.flashghostty.app.debug.ui-tests"
+        ) == "com.flashghostty.app.debug.ui-tests")
+        #expect(FlashGhosttyProductProfile.defaultsSuiteIdentifier(
+            forBundleIdentifier: "com.flashghostty.app.debug.ui-tests.dock-tile"
+        ) == "com.flashghostty.app.debug.ui-tests")
+        #expect(FlashGhosttyProductProfile.defaultsSuiteIdentifier(
+            forBundleIdentifier: "com.flashghostty.app.debug.ui-tests.run-1234"
+        ) == "com.flashghostty.app.debug.ui-tests.run-1234")
+        #expect(FlashGhosttyProductProfile.defaultsSuiteIdentifier(
+            forBundleIdentifier: "com.flashghostty.app.debug.ui-tests.run-1234.dock-tile"
+        ) == "com.flashghostty.app.debug.ui-tests.run-1234")
     }
 }

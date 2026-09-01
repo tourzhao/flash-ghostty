@@ -75,16 +75,19 @@ class BaseTerminalController: NSWindowController,
     /// window title after applying title overrides and bell decoration.
     @Published private(set) var sessionTitle: String = "👻"
 
-    /// Session metadata has an independent lifecycle and provider layer. These
-    /// forwarding properties keep existing terminal/sidebar call sites small.
-    private let sessionMetadata = TerminalSessionMetadataMonitor()
-    private var sessionMetadataObservation: AnyCancellable?
+    /// Session metadata has an independent lifecycle and provider layer. Views
+    /// observe this narrow model directly so frequent provider/title updates do
+    /// not invalidate the terminal controller's entire SwiftUI root.
+    let sessionMetadata = TerminalSessionMetadataMonitor()
     var sessionDynamicTitle: String { sessionMetadata.dynamicTitle }
     var sessionForegroundProcessName: String? { sessionMetadata.foregroundProcessName }
     var sessionTool: TerminalSessionTool { sessionMetadata.tool }
     var sessionActivityStatus: TerminalSessionActivityStatus { sessionMetadata.activityStatus }
     var sessionLastInstruction: String? { sessionMetadata.lastInstruction }
     var sessionWorkingDirectory: URL? { sessionMetadata.workingDirectory }
+    var sessionWorkingDirectoryPublisher: AnyPublisher<URL?, Never> {
+        sessionMetadata.$workingDirectory.eraseToAnyPublisher()
+    }
 
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
@@ -123,7 +126,7 @@ class BaseTerminalController: NSWindowController,
 
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
-    @Published var titleOverride: String? = nil {
+    @Published var titleOverride: String? {
         didSet { applyTitleToWindow() }
     }
 
@@ -139,7 +142,8 @@ class BaseTerminalController: NSWindowController,
     /// which we set via the delegate method.
     override var undoManager: ExpiringUndoManager? {
         // This should be set via the delegate method windowWillReturnUndoManager
-        if let result = window?.undoManager as? ExpiringUndoManager {
+        if isWindowLoaded,
+           let result = window?.undoManager as? ExpiringUndoManager {
             return result
         }
 
@@ -168,11 +172,6 @@ class BaseTerminalController: NSWindowController,
         self.derivedConfig = DerivedConfig(ghostty.config)
 
         super.init(window: nil)
-
-        // Relay nested metadata changes through the controller because existing
-        // SwiftUI terminal roots observe the controller itself.
-        sessionMetadataObservation = sessionMetadata.objectWillChange
-            .sink { [weak self] _ in self?.objectWillChange.send() }
 
         // Initialize our initial surface.
         guard let ghostty_app = ghostty.app else { preconditionFailure("app must be loaded") }
@@ -888,12 +887,15 @@ class BaseTerminalController: NSWindowController,
         }
 
         replaceSurfaceTree(removedTree, moveFocusFrom: oldFocusedSurface)
+        let terminalController = self as? TerminalController
         _ = TerminalController.newWindow(
             ghostty,
             tree: newTree,
             position: notification.userInfo?[Notification.Name.ghosttySurfaceDragEndedNoTargetPointKey] as? NSPoint,
             confirmUndo: false,
-            inheritBackgroundOpacity: isBackgroundOpaque)
+            inheritBackgroundOpacity: isBackgroundOpaque,
+            inheritSessionSidebarVisibility: terminalController?.sessionSidebarIsVisible,
+            inheritFileBrowserVisibility: terminalController?.fileBrowserIsVisible)
     }
 
     // MARK: Local Events
@@ -953,11 +955,22 @@ class BaseTerminalController: NSWindowController,
         sessionMetadata.refresh()
     }
 
+    func updateSessionMetadataRefreshContext(
+        sidebarIsVisible: Bool,
+        sessionIsSelected: Bool
+    ) {
+        sessionMetadata.updateRefreshContext(
+            sidebarIsVisible: sidebarIsVisible,
+            sessionIsSelected: sessionIsSelected
+        )
+    }
+
     func startSessionMetadataRefreshMonitoring() {
         TerminalSessionMetadataRefreshScheduler.shared.register(sessionMetadata)
     }
 
     func stopSessionMetadataRefreshMonitoring() {
+        sessionMetadata.stopMonitoring()
         TerminalSessionMetadataRefreshScheduler.shared.unregister(sessionMetadata)
     }
 
@@ -976,6 +989,11 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func applyTitleToWindow() {
+        // Reading `window` on an NSWindowController lazily loads it. Title
+        // restoration happens before the rest of the workspace state is
+        // applied, so don't let a title assignment create the SwiftUI root
+        // with stale sidebar/file-browser settings.
+        guard isWindowLoaded else { return }
         guard let window else { return }
 
         let regularTitle: String
@@ -1253,6 +1271,9 @@ class BaseTerminalController: NSWindowController,
         // Capture titles assigned while the window was loading, such as the
         // configured static title, before surface updates begin arriving.
         sessionTitle = window.title
+        if titleOverride != nil {
+            applyTitleToWindow()
+        }
 
         // We always initialize our fullscreen style to native if we can because
         // initialization sets up some state (i.e. observers). If its set already
@@ -1377,6 +1398,11 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func syncSurfaceTreeOcclusionState() {
+        // `window` is lazy on NSWindowController. The surface tree is assigned
+        // during initialization, before restoration has applied controller-owned
+        // presentation state, so occlusion bookkeeping must not load the nib.
+        guard isWindowLoaded else { return }
+
         let visible = self.window?.occlusionState.contains(.visible) ?? false
         for view in surfaceTree {
             if let surface = view.surface, view.isWindowVisible != visible {

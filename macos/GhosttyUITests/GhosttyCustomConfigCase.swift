@@ -45,21 +45,53 @@ class GhosttyCustomConfigCase: XCTestCase {
     private let configFile: URL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         .appendingPathExtension("ghostty")
 
+    /// Zsh-based UI tests must not inherit the developer's startup files.
+    /// Besides making the tests machine-dependent, a startup file that touches
+    /// a protected folder can leave the login shell blocked behind a TCC prompt.
+    private let shellConfigurationDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
 
     override func tearDown() async throws {
         try? FileManager.default.removeItem(at: configFile)
+        try? FileManager.default.removeItem(at: shellConfigurationDirectory)
     }
 
     func updateConfig(_ newConfig: String) throws {
+        try FileManager.default.createDirectory(
+            at: shellConfigurationDirectory,
+            withIntermediateDirectories: true
+        )
+
         try newConfig.write(to: configFile, atomically: true, encoding: .utf8)
     }
 
-    func ghosttyApplication(defaultsSuite: String = GhosttyCustomConfigCase.defaultsSuiteName) throws -> XCUIApplication {
-        let app = XCUIApplication()
-        app.launchArguments.append(contentsOf: ["-ApplePersistenceIgnoreState", "YES"])
+    func ghosttyApplication(
+        defaultsSuite: String = GhosttyCustomConfigCase.defaultsSuiteName,
+        ignoreSavedApplicationState: Bool = true,
+        bundleIdentifier: String? = nil
+    ) throws -> XCUIApplication {
+        let app: XCUIApplication
+        if let bundleIdentifier {
+            app = XCUIApplication(bundleIdentifier: bundleIdentifier)
+        } else {
+            app = XCUIApplication()
+        }
+        if ignoreSavedApplicationState {
+            app.launchArguments.append(contentsOf: ["-ApplePersistenceIgnoreState", "YES"])
+        }
+        // The persistence arguments belong to AppKit, not Ghostty's config
+        // parser. This DEBUG-only test seam prevents them from opening a
+        // Configuration Errors window in the launched application.
+        app.launchEnvironment["GHOSTTY_TEST_DISABLE_CLI_ARGS"] = "true"
+        // Ghostty's zsh integration captures this as the user's ZDOTDIR before it
+        // temporarily points zsh at the bundled integration entry point. Do
+        // not set SHELL here: desktop launches deliberately resolve their
+        // default shell from passwd rather than the process environment.
+        app.launchEnvironment["ZDOTDIR"] = shellConfigurationDirectory.path
         app.launchEnvironment["GHOSTTY_CONFIG_PATH"] = configFile.path
         app.launchEnvironment["GHOSTTY_USER_DEFAULTS_SUITE"] = defaultsSuite
         return app

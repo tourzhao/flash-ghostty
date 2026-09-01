@@ -61,8 +61,9 @@ struct NewTerminalIntent: AppIntent {
         guard let appDelegate = NSApp.delegate as? AppDelegate else {
             throw GhosttyIntentError.appUnavailable
         }
-        let ghostty = appDelegate.ghostty
-
+        guard !appDelegate.isDeferringTerminalLaunches else {
+            throw GhosttyIntentError.startupRestorationPending
+        }
         var config = Ghostty.SurfaceConfiguration()
 
         // We don't run command as "command" and instead use "initialInput" so
@@ -107,19 +108,20 @@ struct NewTerminalIntent: AppIntent {
         }
         switch location {
         case .window:
-            let newController = TerminalController.newWindow(
-                ghostty,
-                withBaseConfig: config,
-                withParent: parent?.window)
+            guard let newController = appDelegate.requestNewTerminalWindow(
+                baseConfig: config,
+                parent: parent?.window
+            ) else {
+                throw GhosttyIntentError.startupRestorationPending
+            }
             if let view = newController.surfaceTree.root?.leftmostLeaf() {
                 return .result(value: await TerminalEntity(view: view))
             }
 
         case .tab:
-            let newController = TerminalController.newTab(
-                ghostty,
+            let newController = appDelegate.requestNewTerminalTab(
                 from: parent?.window,
-                withBaseConfig: config)
+                baseConfig: config)
             if let view = newController?.surfaceTree.root?.leftmostLeaf() {
                 return .result(value: await TerminalEntity(view: view))
             }

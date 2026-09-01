@@ -7,3 +7,10 @@
 window-save-state = always
 macos-titlebar-style = sidebar
 macos-custom-icon = ~/.config/flash-ghostty/FLASH-Ghostty.icns
+
+# FLASH navigation pins operate on terminal-owned scrollback. Claude's
+# fullscreen renderer keeps a private virtual history that terminals cannot
+# navigate, so use its supported main-screen renderer in new FLASH sessions.
+# A user can remove this default with:
+# env = CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=
+env = CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1

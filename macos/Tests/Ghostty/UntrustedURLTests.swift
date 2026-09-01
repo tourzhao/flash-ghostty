@@ -4,6 +4,18 @@ import Testing
 
 @Suite
 struct UntrustedURLTests {
+    @Test func rejectsRelativeFileURLs() {
+        #expect(
+            UntrustedURL("file:relative.txt").decision ==
+                .deny(.malformedURL)
+        )
+        #expect(
+            UntrustedURL("file:../relative.txt").decision ==
+                .deny(.malformedURL)
+        )
+        #expect(UntrustedURL("file:relative.txt").displayString == "file:relative.txt")
+    }
+
     @Test(arguments: ["http://example.com", "https://example.com/path", "mailto:user@example.com"])
     func allowsSafeSchemes(_ value: String) {
         guard case .allow(let url) = UntrustedURL(value).decision else {
@@ -96,6 +108,28 @@ struct UntrustedURLTests {
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: payload)
 
         #expect(UntrustedURL(link.absoluteString).decision == .deny(.unsafeFile))
+    }
+
+    @Test
+    func rejectsFinderAliasesEvenWithHarmlessExtensions() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = directory.appending(path: "payload.command")
+        try "#!/bin/sh\n".write(to: payload, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: payload.path
+        )
+
+        let alias = directory.appending(path: "notes.txt")
+        let bookmark = try payload.bookmarkData(
+            options: .suitableForBookmarkFile,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        try URL.writeBookmarkData(bookmark, to: alias)
+
+        #expect(UntrustedURL(alias.absoluteString).decision == .deny(.unsafeFile))
     }
 
     @Test(arguments: ["\u{0085}", "\u{2028}", "\u{2029}"])

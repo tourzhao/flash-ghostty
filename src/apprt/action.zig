@@ -465,14 +465,67 @@ pub const Action = union(Key) {
     };
 
     comptime {
-        // For ABI compatibility, we expect that this is our union size.
-        // At the time of writing, we don't promise ABI compatibility
-        // so we can change this but I want to be aware of it.
+        // Keep the embedded runtime ABI stable. The translated-header test
+        // below independently verifies these values against ghostty.h.
+        assert(@sizeOf(Key) == 4);
+        assert(@alignOf(Key) == 4);
         assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
             4 => 24,
             8 => 24,
             else => unreachable,
         });
+        assert(@alignOf(CValue) == 4 or @alignOf(CValue) == 8);
+        assert(@offsetOf(C, "key") == 0);
+        assert(@offsetOf(C, "value") == switch (@alignOf(CValue)) {
+            4 => 4,
+            8 => 8,
+            else => unreachable,
+        });
+        assert(@alignOf(C) == @alignOf(CValue));
+        assert(@sizeOf(C) == @offsetOf(C, "value") + @sizeOf(CValue));
+
+        // All supported desktop release targets are LP64. Pin the concrete
+        // layout there so synchronized edits to Zig and the header still
+        // require an explicit ABI decision rather than silently moving it.
+        if (@sizeOf(usize) == 8) {
+            assert(@alignOf(CValue) == 8);
+            assert(@offsetOf(C, "value") == 8);
+            assert(@alignOf(C) == 8);
+            assert(@sizeOf(C) == 32);
+        }
+    }
+
+    test "ghostty.h Action C layout" {
+        const c = @import("ghostty.h");
+        const testing = std.testing;
+
+        try testing.expectEqual(@sizeOf(CValue), @sizeOf(c.ghostty_action_u));
+        try testing.expectEqual(@alignOf(CValue), @alignOf(c.ghostty_action_u));
+        try testing.expectEqual(@sizeOf(C), @sizeOf(c.ghostty_action_s));
+        try testing.expectEqual(@alignOf(C), @alignOf(c.ghostty_action_s));
+        try testing.expectEqual(
+            @offsetOf(C, "key"),
+            @offsetOf(c.ghostty_action_s, "tag"),
+        );
+        try testing.expectEqual(
+            @offsetOf(C, "value"),
+            @offsetOf(c.ghostty_action_s, "action"),
+        );
+
+        const ZigScrollbar = terminal.Scrollbar.C;
+        const CScrollbar = c.ghostty_action_scrollbar_s;
+        try testing.expectEqual(@sizeOf(ZigScrollbar), @sizeOf(CScrollbar));
+        try testing.expectEqual(@alignOf(ZigScrollbar), @alignOf(CScrollbar));
+        inline for (.{
+            "total",
+            "offset",
+            "len",
+        }) |field| {
+            try testing.expectEqual(
+                @offsetOf(ZigScrollbar, field),
+                @offsetOf(CScrollbar, field),
+            );
+        }
     }
 
     /// Returns the value type for the given key.

@@ -54,9 +54,9 @@ pub fn run(alloc: Allocator) !u8 {
         \\`ghostty -e top` will run the `top` command inside the terminal.
         \\
         \\On macOS, launching the terminal emulator from the CLI is not
-        \\supported and only actions are supported. Use `open -na FLASH-Ghostty.app`
-        \\instead, or `open -na FLASH-Ghostty.app --args --foo=bar --baz=quz` to pass
-        \\arguments.
+        \\supported and only actions are supported. Use
+        \\`open -a FLASH-Ghostty.app` instead. FLASH-Ghostty uses one application
+        \\instance so restored sessions have one owner.
         \\
         \\Available actions:
         \\

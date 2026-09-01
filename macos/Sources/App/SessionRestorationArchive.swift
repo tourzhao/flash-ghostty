@@ -31,7 +31,7 @@ protocol SessionRestorationArchiveStoring: AnyObject {
     func store(_ marker: SessionRestorationArchiveMarker)
 }
 
-final class UserDefaultsSessionRestorationArchiveStore:
+final class UserDefaultsRestorationArchiveStore:
     SessionRestorationArchiveStoring {
     static let markerKey = "FLASHGhosttyRestorableSessionsAvailable"
 
@@ -40,7 +40,7 @@ final class UserDefaultsSessionRestorationArchiveStore:
 
     init(
         defaults: UserDefaults = .ghostty,
-        markerKey: String = UserDefaultsSessionRestorationArchiveStore.markerKey
+        markerKey: String = UserDefaultsRestorationArchiveStore.markerKey
     ) {
         self.defaults = defaults
         self.markerKey = markerKey
@@ -70,9 +70,10 @@ struct TerminalRestorableSnapshot<State: TerminalRestorable> {
 
     init?(coder: NSCoder) {
         let current = coder.decodeInteger(forKey: State.versionKey)
-        guard current >= State.minimumVersion else {
+        guard current >= State.minimumVersion,
+              current <= State.version else {
             AppDelegate.logger.error(
-                "error restoring terminal: version not supported: expected=\(State.minimumVersion, privacy: .public), got=\(current, privacy: .public)"
+                "error restoring terminal: version not supported: expected=\(State.minimumVersion, privacy: .public)...\(State.version, privacy: .public), got=\(current, privacy: .public)"
             )
             return nil
         }

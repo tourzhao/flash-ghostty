@@ -111,6 +111,11 @@ extension Ghostty {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 
+                if surfaceView.healthy && surfaceView.error == nil {
+                    FlashSurfaceNavigationOverlay(surfaceView: surfaceView)
+                        .id(surfaceView.id)
+                }
+
                 // If we have secure input enabled and we're the focused surface and window
                 // then we want to show the secure input overlay.
                 if ghostty.config.secureInputIndication &&

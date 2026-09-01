@@ -106,6 +106,20 @@ const bare_relative_path_branch =
     path_chars ++ "+" ++
     no_trailing_colon;
 
+// macOS-only branch 4: Bare filenames such as README.md, .gitignore, and
+// main.swift:42:7. Non-hidden names require an alphabetic extension to avoid
+// matching version numbers and IP addresses. The macOS opener performs an
+// existence check against the terminal PWD before presenting any action.
+const source_location_suffix =
+    \\(?::[1-9][0-9]*(?::[1-9][0-9]*)?)?
+;
+
+const bare_filename_branch =
+    \\(?<![\w\/$@,.])(?:[\w][\w\-.]*\.[A-Za-z][\w-]*|\.[A-Za-z_][\w-]*(?:\.[A-Za-z][\w-]*)*)
+++ source_location_suffix ++
+    \\(?![\w:.\/])
+;
+
 pub const regex =
     scheme_url_branch ++
     "|" ++
@@ -113,12 +127,17 @@ pub const regex =
     "|" ++
     bare_relative_path_branch;
 
+/// FLASH's terminal-PWD-aware macOS opener safely handles bare filenames.
+/// Keep this out of the shared default so GTK never resolves them relative to
+/// the GUI process working directory.
+pub const macos_regex = regex ++ "|" ++ bare_filename_branch;
+
 test "url regex" {
     const testing = std.testing;
 
     try oni.testing.ensureInit();
     var re = try oni.Regex.init(
-        regex,
+        macos_regex,
         .{},
         oni.Encoding.utf8,
         oni.Syntax.default,
@@ -391,6 +410,31 @@ test "url regex" {
             .input = "some-pkg/src/file.txt more text",
             .expect = "some-pkg/src/file.txt",
         },
+        // Bare filenames with an alphabetic extension.
+        .{
+            .input = "README.md",
+            .expect = "README.md",
+        },
+        .{
+            .input = "compiler: main.swift:42:7",
+            .expect = "main.swift:42:7",
+        },
+        .{
+            .input = "open archive.tar.gz please",
+            .expect = "archive.tar.gz",
+        },
+        .{
+            .input = "edit .env.local",
+            .expect = ".env.local",
+        },
+        .{
+            .input = "permission file .gitignore",
+            .expect = ".gitignore",
+        },
+        .{
+            .input = "compiler: .foo.swift:2",
+            .expect = ".foo.swift:2",
+        },
         // comma should match substrings
         .{
             .input = "src/foo.c,baz.txt",
@@ -506,6 +550,10 @@ test "url regex" {
         // double-slash comments are not paths
         "// foo bar",
         "//foo",
+        // Bare filename matching should not turn versions or email domains
+        // into local-file links.
+        "version 1.2.3",
+        "person@example.com",
     };
     for (no_match_cases) |input| {
         var result = re.search(input, .{});
@@ -514,4 +562,21 @@ test "url regex" {
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+}
+
+test "shared url regex excludes macOS-only bare filenames" {
+    try oni.testing.ensureInit();
+    var re = try oni.Regex.init(
+        regex,
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer re.deinit();
+
+    try std.testing.expectError(
+        error.Mismatch,
+        re.search("README.md", .{}),
+    );
 }

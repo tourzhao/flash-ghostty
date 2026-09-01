@@ -78,9 +78,9 @@ extension Ghostty {
                 ghostty_config_load_default_files(cfg)
             }
 
-            // We only load CLI args when not running in Xcode because in Xcode we
-            // pass some special parameters to control the debugger.
-            if !isRunningInXcode() {
+            // Xcode and the UI harness pass process arguments that belong to
+            // AppKit/XCTest rather than Ghostty's configuration parser.
+            if Self.shouldLoadCLIArguments() {
                 ghostty_config_load_cli_args(cfg)
             }
 
@@ -109,6 +109,22 @@ extension Ghostty {
             }
 
             return cfg
+        }
+
+        static func shouldLoadCLIArguments(
+            environment: [String: String] = ProcessInfo.processInfo.environment
+        ) -> Bool {
+            guard environment["__XCODE_BUILT_PRODUCTS_DIR_PATHS"] == nil else {
+                return false
+            }
+
+#if DEBUG
+            if (environment["GHOSTTY_TEST_DISABLE_CLI_ARGS"] as NSString?)?.boolValue == true {
+                return false
+            }
+#endif
+
+            return true
         }
 
         // MARK: - Keybindings

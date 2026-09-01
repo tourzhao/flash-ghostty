@@ -529,6 +529,17 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// Coherent terminal history state returned by ghostty_surface_scrollbar.
+// This is intentionally separate from ghostty_action_scrollbar_s so adding
+// history identity does not grow the by-value application action union.
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+  uint64_t content_generation;
+  uint64_t screen_identity;
+} ghostty_surface_scrollbar_s;
+
 // Config types
 
 // config.Path
@@ -1183,6 +1194,12 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API ghostty_surface_scrollbar_s ghostty_surface_scrollbar(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_scroll_to_row_if_history_matches(
+    ghostty_surface_t,
+    uint64_t,
+    uint64_t,
+    uint64_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,

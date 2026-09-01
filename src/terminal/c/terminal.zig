@@ -10,7 +10,6 @@ const osc = @import("../osc.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
-const PageList = @import("../PageList.zig");
 const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
@@ -1546,7 +1545,23 @@ pub const KittyGraphics = kitty_gfx_c.KittyGraphics;
 pub const TerminalScreen = ScreenSet.Key;
 
 /// C: GhosttyTerminalScrollbar
-pub const TerminalScrollbar = PageList.Scrollbar.C;
+///
+/// This remains a dedicated type rather than aliasing the core scrollbar C
+/// value:
+/// the application action carries additional identity metadata, while the
+/// public libghostty-vt scrollbar ABI intentionally remains geometry-only.
+pub const TerminalScrollbar = extern struct {
+    total: u64,
+    offset: u64,
+    len: u64,
+};
+
+comptime {
+    assert(@sizeOf(TerminalScrollbar) == 24);
+    assert(@offsetOf(TerminalScrollbar, "total") == 0);
+    assert(@offsetOf(TerminalScrollbar, "offset") == 8);
+    assert(@offsetOf(TerminalScrollbar, "len") == 16);
+}
 
 /// C: GhosttyTerminalData
 pub const TerminalData = enum(c_int) {
@@ -1700,7 +1715,14 @@ fn getTyped(
         .active_screen => out.* = t.screens.active_key,
         .cursor_visible => out.* = t.modes.get(.cursor_visible),
         .kitty_keyboard_flags => out.* = @as(u8, t.screens.active.kitty_keyboard.current().int()),
-        .scrollbar => out.* = t.screens.active.pages.scrollbar().cval(),
+        .scrollbar => {
+            const scrollbar = t.screens.active.pages.scrollbar();
+            out.* = .{
+                .total = @intCast(scrollbar.total),
+                .offset = @intCast(scrollbar.offset),
+                .len = @intCast(scrollbar.len),
+            };
+        },
         .cursor_style => out.* = .fromStyle(t.screens.active.cursor.style),
         .mouse_tracking => out.* = t.modes.get(.mouse_event_x10) or
             t.modes.get(.mouse_event_normal) or

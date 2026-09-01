@@ -2,10 +2,28 @@ import AppKit
 import Cocoa
 import GhosttyKit
 
+/// Proof that this process redirected AppKit's outer restoration archive before
+/// `NSApplicationMain` began. The fileprivate initializer keeps this authority
+/// at the pre-main call site while other files may only carry the value.
+struct AppKitOuterArchiveIsolation: Equatable, Sendable {
+    fileprivate init() {}
+}
+
 // A `-e` process is a one-shot command window, not a replacement interactive
-// workspace. Install this before AppKit initializes so it neither consumes nor
-// rewrites the previous launch's Saved Application State archive.
-CommandLinePersistencePolicy.installIfNeeded(arguments: CommandLine.arguments)
+// workspace. A hosted unit-test process must likewise leave the developer's
+// workspace untouched. Install this before AppKit initializes and retain the
+// resulting proof for the launch-wide restoration coordinator.
+let appKitOuterArchiveIsolation: AppKitOuterArchiveIsolation? = {
+    guard CommandLinePersistencePolicy.installIfNeeded(
+        arguments: CommandLine.arguments,
+        isUnitTestHost: SessionRestorationProcessRole.isUnitTestHost()
+    ) else { return nil }
+
+    return AppKitOuterArchiveIsolation()
+}()
+// Force the global initializer at this exact top-level point rather than rely
+// on the first read from AppDelegate after NSApplicationMain has begun.
+_ = appKitOuterArchiveIsolation
 
 // Initialize Ghostty global state. We do this once right away because the
 // CLI APIs require it and it lets us ensure it is done immediately for the
