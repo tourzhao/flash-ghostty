@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+defaults:
+  # The explicit bash shell enables the runner's -eo pipefail invocation;
+  # signing and architecture checks must observe every pipeline failure.
+  run:
+    shell: bash
+
 concurrency:
   group: flash-release-${{ github.ref }}
   cancel-in-progress: false
@@ -337,6 +343,7 @@ jobs:
           BUNDLE_VERSION: ${{ needs.validate.outputs.bundle_version }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
           app="macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
           plist="$app/Contents/Info.plist"
           plugin="$app/Contents/PlugIns/DockTilePlugin.plugin"
@@ -420,22 +427,37 @@ jobs:
             CFBundleShortVersionString \
             "$RELEASE_VERSION"
 
+          candidate_manifest="$(
+            mktemp "$RUNNER_TEMP/flash-release-app-files.XXXXXX"
+          )"
+          trap 'rm -f "$candidate_manifest"' EXIT
+          if ! find "$app" -type f -print0 > "$candidate_manifest"; then
+            echo "Failed to enumerate every release-app file" >&2
+            exit 1
+          fi
           mach_o_count=0
           while IFS= read -r -d '' candidate; do
-            if file -b "$candidate" | grep -q 'Mach-O'; then
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
               ((mach_o_count += 1))
-              architectures="$(
-                lipo -archs "$candidate" \
-                  | tr ' ' '\n' \
-                  | LC_ALL=C sort \
-                  | paste -sd ' ' -
-              )"
+              if ! architectures="$(
+                  lipo -archs "$candidate" \
+                    | tr ' ' '\n' \
+                    | LC_ALL=C sort \
+                    | paste -sd ' ' -
+                )"; then
+                echo "Failed to inspect release-app architectures: $candidate" >&2
+                exit 1
+              fi
               if [[ "$architectures" != "arm64 x86_64" ]]; then
                 echo "$candidate has architectures '$architectures'; expected exactly arm64 x86_64" >&2
                 exit 1
               fi
             fi
-          done < <(find "$app" -type f -print0)
+          done < "$candidate_manifest"
           if ((mach_o_count == 0)); then
             echo "release app contains no Mach-O binaries" >&2
             exit 1
@@ -769,6 +791,12 @@ jobs:
             echo "FLASH_MACOS_CERTIFICATE_NAME must be a Developer ID Application identity" >&2
             exit 1
           fi
+          if [[ "$certificate_name" == *$'\n'* \
+            || "$certificate_name" == *$'\r'* \
+            || "$certificate_name" != *" ($FLASH_EXPECTED_TEAM_ID)" ]]; then
+            echo "FLASH_MACOS_CERTIFICATE_NAME must end with the configured Team ID" >&2
+            exit 1
+          fi
 
           app="$FLASH_SIGNING_INPUT_ROOT/macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
           entitlements="$FLASH_SIGNING_INPUT_ROOT/macos/Ghostty.entitlements"
@@ -777,9 +805,30 @@ jobs:
           keychain="$RUNNER_TEMP/flash-signing.keychain-db"
           signed_entitlements="$RUNNER_TEMP/flash-signed-entitlements.plist"
           umask 077
+          extracted_certificates="$(
+            mktemp -d "$RUNNER_TEMP/flash-extracted-signing-certificates.XXXXXX"
+          )"
           cleanup() {
-            rm -f "$certificate" "$leaf_certificate" "$signed_entitlements"
-            security delete-keychain "$keychain" 2>/dev/null || true
+            local original_status="$?"
+            local cleanup_status=0
+            trap - EXIT
+            set +e
+            rm -f "$certificate" "$leaf_certificate" "$signed_entitlements" \
+              || cleanup_status=1
+            rm -rf "$extracted_certificates" || cleanup_status=1
+            if [[ -e "$keychain" ]]; then
+              security lock-keychain "$keychain" >/dev/null 2>&1 \
+                || cleanup_status=1
+              security delete-keychain "$keychain" >/dev/null 2>&1 \
+                || cleanup_status=1
+            fi
+            if ((cleanup_status != 0)); then
+              echo "Failed to remove all ephemeral signing material" >&2
+            fi
+            if ((original_status != 0)); then
+              exit "$original_status"
+            fi
+            exit "$cleanup_status"
           }
           trap cleanup EXIT
 
@@ -800,8 +849,36 @@ jobs:
           unset MACOS_CERTIFICATE_PWD
           unset MACOS_CERTIFICATE_NAME
           unset MACOS_CI_KEYCHAIN_PWD
-          security find-identity -v -p codesigning "$keychain" \
-            | grep -F -- "\"$certificate_name\""
+          identity_matches="$(
+            security find-identity -v -p codesigning "$keychain" \
+              | awk -v expected="$certificate_name" '
+                  {
+                    hash = $2
+                    ordinal = $1
+                    sub(/\)$/, "", ordinal)
+                    name = $0
+                    sub(/^[^\"]*\"/, "", name)
+                    sub(/\"$/, "", name)
+                    if (ordinal ~ /^[0-9]+$/ \
+                        && name == expected \
+                        && length(hash) == 40 \
+                        && hash !~ /[^[:xdigit:]]/) {
+                      print tolower(hash)
+                    }
+                  }
+                '
+          )"
+          identity_match_count="$(
+            printf '%s\n' "$identity_matches" \
+              | awk 'NF { count += 1 } END { print count + 0 }'
+          )"
+          if [[ "$identity_match_count" != 1 ]]; then
+            echo "Expected exactly one matching Developer ID signing identity" >&2
+            exit 1
+          fi
+          signing_identity_sha1="$(
+            printf '%s\n' "$identity_matches" | awk 'NF { print; exit }'
+          )"
           security find-certificate \
             -c "$certificate_name" \
             -p \
@@ -813,7 +890,19 @@ jobs:
               | shasum -a 256 \
               | awk '{print $1}'
           )"
-          test "$actual_certificate_sha256" = "$FLASH_EXPECTED_CERTIFICATE_SHA256"
+          actual_certificate_sha1="$(
+            openssl x509 -in "$leaf_certificate" -outform DER \
+              | shasum -a 1 \
+              | awk '{print $1}'
+          )"
+          if [[ "$actual_certificate_sha1" != "$signing_identity_sha1" ]]; then
+            echo "Developer ID identity does not match the pinned leaf certificate" >&2
+            exit 1
+          fi
+          if [[ "$actual_certificate_sha256" != "$FLASH_EXPECTED_CERTIFICATE_SHA256" ]]; then
+            echo "Developer ID leaf certificate does not match the configured SHA-256 pin" >&2
+            exit 1
+          fi
           openssl x509 -in "$leaf_certificate" -checkend 0 -noout
           certificate_subject="$(
             openssl x509 \
@@ -889,7 +978,7 @@ jobs:
               --force \
               --timestamp \
               --keychain "$keychain" \
-              --sign "$certificate_name" \
+              --sign "$signing_identity_sha1" \
               --options runtime \
               "$@"
           }
@@ -908,23 +997,44 @@ jobs:
           # Verify every executable slice, not only the outer app. This makes
           # future embedded helpers fail closed if the explicit inside-out
           # signing list above is not updated with them.
+          candidate_manifest="$extracted_certificates/app-files.nul"
+          if ! find "$app" -type f -print0 > "$candidate_manifest"; then
+            echo "Failed to enumerate every release-app file" >&2
+            exit 1
+          fi
           signed_mach_o_count=0
           while IFS= read -r -d '' candidate; do
-            if file -b "$candidate" | grep -q 'Mach-O'; then
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
               ((signed_mach_o_count += 1))
               for architecture in arm64 x86_64; do
+                certificate_prefix="$extracted_certificates/$signed_mach_o_count-$architecture-"
                 signature_info="$(
                   /usr/bin/codesign \
                     --display \
                     --verbose=4 \
                     --arch "$architecture" \
+                    --extract-certificates "$certificate_prefix" \
                     "$candidate" \
                     </dev/null 2>&1
                 )"
-                grep -F "Authority=$certificate_name" <<< "$signature_info"
-                grep -F "TeamIdentifier=$FLASH_EXPECTED_TEAM_ID" <<< "$signature_info"
+                grep -Fx "Authority=$certificate_name" <<< "$signature_info"
+                grep -Fx "TeamIdentifier=$FLASH_EXPECTED_TEAM_ID" <<< "$signature_info"
                 grep -Eq 'flags=.*[(,]runtime([,)]|$)' <<< "$signature_info"
                 grep -F 'Timestamp=' <<< "$signature_info"
+                embedded_leaf="${certificate_prefix}0"
+                test -f "$embedded_leaf"
+                test -s "$embedded_leaf"
+                embedded_leaf_sha256="$(
+                  shasum -a 256 "$embedded_leaf" | awk '{print $1}'
+                )"
+                if [[ "$embedded_leaf_sha256" != "$FLASH_EXPECTED_CERTIFICATE_SHA256" ]]; then
+                  echo "$candidate ($architecture) was not signed by the pinned leaf certificate" >&2
+                  exit 1
+                fi
 
                 rm -f "$signed_entitlements"
                 /usr/bin/codesign \
@@ -958,7 +1068,7 @@ jobs:
                 fi
               done
             fi
-          done < <(find "$app" -type f -print0)
+          done < "$candidate_manifest"
           if ((signed_mach_o_count == 0)); then
             echo "signed release app contains no Mach-O binaries" >&2
             exit 1
@@ -1251,22 +1361,38 @@ jobs:
           xcrun stapler validate -v "$archived_app"
           /usr/sbin/spctl --assess --type execute --verbose=4 "$archived_app"
 
+          archived_candidate_manifest="$(
+            mktemp "$RUNNER_TEMP/flash-archived-app-files.XXXXXX"
+          )"
+          trap 'rm -f "$archived_candidate_manifest"' EXIT
+          if ! find "$archived_app" -type f -print0 \
+              > "$archived_candidate_manifest"; then
+            echo "Failed to enumerate every archived release-app file" >&2
+            exit 1
+          fi
           archived_mach_o_count=0
           while IFS= read -r -d '' candidate; do
-            if file -b "$candidate" | grep -q 'Mach-O'; then
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect archived release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
               ((archived_mach_o_count += 1))
-              architectures="$(
-                lipo -archs "$candidate" \
-                  | tr ' ' '\n' \
-                  | LC_ALL=C sort \
-                  | paste -sd ' ' -
-              )"
+              if ! architectures="$(
+                  lipo -archs "$candidate" \
+                    | tr ' ' '\n' \
+                    | LC_ALL=C sort \
+                    | paste -sd ' ' -
+                )"; then
+                echo "Failed to inspect archived architectures: $candidate" >&2
+                exit 1
+              fi
               if [[ "$architectures" != "arm64 x86_64" ]]; then
                 echo "archived $candidate has architectures '$architectures'; expected exactly arm64 x86_64" >&2
                 exit 1
               fi
             fi
-          done < <(find "$archived_app" -type f -print0)
+          done < "$archived_candidate_manifest"
           if ((archived_mach_o_count == 0)); then
             echo "archived release app contains no Mach-O binaries" >&2
             exit 1

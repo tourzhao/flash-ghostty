@@ -11,6 +11,9 @@ defaults_overlay="$repository_root/macos/Sources/Flash/Configuration/FlashGhostt
 fork_plist="$repository_root/macos/FlashGhostty-Info.plist"
 fork_sdef="$repository_root/macos/FlashGhostty.sdef"
 fork_main_menu="$repository_root/macos/Sources/App/FlashMainMenu.xib"
+branch_workflow="$repository_root/.github/workflows/flash-branch-validate.yml"
+release_workflow="$repository_root/.github/workflows/flash-release.yml"
+upstream_publish_workflow="$repository_root/.github/workflows/publish-tag.yml"
 
 require_literal() {
     file=$1
@@ -37,6 +40,14 @@ require_literal "$fork_plist" '<string>FlashGhostty.sdef</string>'
 require_literal "$fork_sdef" '<dictionary title="FLASH-Ghostty Scripting Dictionary">'
 require_literal "$fork_main_menu" 'menuItem title="FLASH-Ghostty"'
 require_literal "$fork_main_menu" 'action selector="toggleSessionSidebar:"'
+require_literal "$upstream_publish_workflow" "if: github.repository == 'ghostty-org/ghostty'"
+require_literal "$branch_workflow" '    shell: bash'
+require_literal "$release_workflow" '    shell: bash'
+require_literal "$release_workflow" '--sign "$signing_identity_sha1"'
+require_literal "$release_workflow" '--extract-certificates "$certificate_prefix"'
+require_literal "$release_workflow" 'if [[ "$actual_certificate_sha1" != "$signing_identity_sha1" ]]; then'
+require_literal "$release_workflow" 'if [[ "$actual_certificate_sha256" != "$FLASH_EXPECTED_CERTIFICATE_SHA256" ]]; then'
+require_literal "$release_workflow" 'if [[ "$embedded_leaf_sha256" != "$FLASH_EXPECTED_CERTIFICATE_SHA256" ]]; then'
 
 if [ "$FLASH_GHOSTTY_UPDATE_ENABLED" != false ]; then
     echo "update publishing must remain disabled until product-owned signing is configured" >&2

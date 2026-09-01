@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+defaults:
+  # The explicit bash shell enables the runner's -eo pipefail invocation;
+  # architecture checks must observe every pipeline failure.
+  run:
+    shell: bash
+
 # Feature branches deliberately stop before signing and notarization. Those
 # trust-boundary steps remain restricted to protected main in flash-release.yml.
 
@@ -224,6 +230,7 @@ jobs:
 
       - name: Verify release identity and universal architectures
         run: |
+          : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
           app="macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
           plist="$app/Contents/Info.plist"
           plugin="$app/Contents/PlugIns/DockTilePlugin.plugin"
@@ -287,22 +294,37 @@ jobs:
             LSMinimumSystemVersion \
             "$FLASH_MACOS_MINIMUM_VERSION"
 
+          candidate_manifest="$(
+            mktemp "$RUNNER_TEMP/flash-branch-app-files.XXXXXX"
+          )"
+          trap 'rm -f "$candidate_manifest"' EXIT
+          if ! find "$app" -type f -print0 > "$candidate_manifest"; then
+            echo "Failed to enumerate every release-app file" >&2
+            exit 1
+          fi
           mach_o_count=0
           while IFS= read -r -d '' candidate; do
-            if file -b "$candidate" | grep -q 'Mach-O'; then
+            if ! candidate_type="$(file -b "$candidate")"; then
+              echo "Failed to inspect release-app file: $candidate" >&2
+              exit 1
+            fi
+            if grep -q 'Mach-O' <<< "$candidate_type"; then
               ((mach_o_count += 1))
-              architectures="$(
-                lipo -archs "$candidate" \
-                  | tr ' ' '\n' \
-                  | LC_ALL=C sort \
-                  | paste -sd ' ' -
-              )"
+              if ! architectures="$(
+                  lipo -archs "$candidate" \
+                    | tr ' ' '\n' \
+                    | LC_ALL=C sort \
+                    | paste -sd ' ' -
+                )"; then
+                echo "Failed to inspect release-app architectures: $candidate" >&2
+                exit 1
+              fi
               if [[ "$architectures" != "arm64 x86_64" ]]; then
                 echo "$candidate has architectures '$architectures'; expected exactly arm64 x86_64" >&2
                 exit 1
               fi
             fi
-          done < <(find "$app" -type f -print0)
+          done < "$candidate_manifest"
           if ((mach_o_count == 0)); then
             echo "release app contains no Mach-O binaries" >&2
             exit 1
