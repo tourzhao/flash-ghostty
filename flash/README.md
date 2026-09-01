@@ -111,9 +111,14 @@ The workflow fails closed unless the source is protected `main`, the metadata
 matches the dispatch input, and the Environment values are present. It imports
 exactly one matching signing identity, selects it by certificate hash, checks
 the configured SHA-256 pin, and re-extracts the embedded leaf certificate from
-every signed Mach-O slice before notarization. After downloading the artifact,
-retain the checksum and provenance files with the release candidate and verify
-the app again before distribution:
+every signed Mach-O slice before notarization. If signing or notarization fails,
+GitHub's **Re-run failed jobs** action reuses and revalidates the exact unsigned
+input from the successful build through a content-checked cache; the separately
+uploaded one-day artifact remains a short-lived audit copy. If that cache has
+been evicted, use **Re-run all jobs** to rebuild it. The cache contains no
+signing credentials. After downloading the final artifact, retain the checksum
+and provenance files with the release candidate and verify the app again before
+distribution:
 
 ```bash
 shasum -a 256 -c flash-ghostty-macos-universal-SHA256SUMS.txt

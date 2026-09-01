@@ -110,10 +110,9 @@ jobs:
             exit 1
           fi
 
-          # Bundle-version history is external to this repository today, so
-          # never infer CFBundleVersion from commit count or a workflow run.
-          # The protected release commit must declare both release identifiers
-          # after reconciling any already-published builds.
+          # Never infer CFBundleVersion from commit count or a workflow run.
+          # The protected release commit declares both identifiers after
+          # reconciling repository and known external distribution history.
           release_metadata=flash/release-metadata.env
           expected_metadata_keys="$(
             printf '%s\n' \
@@ -195,6 +194,8 @@ jobs:
     outputs:
       unsigned_archive_sha256: ${{ steps.signing_input.outputs.archive_sha256 }}
       unsigned_manifest_sha256: ${{ steps.signing_input.outputs.manifest_sha256 }}
+      unsigned_run_attempt: ${{ steps.signing_input.outputs.run_attempt }}
+      unsigned_cache_key: ${{ steps.signing_input.outputs.cache_key }}
       bundle_version: ${{ steps.signing_input.outputs.bundle_version }}
       commit: ${{ steps.signing_input.outputs.commit }}
     env:
@@ -472,10 +473,12 @@ jobs:
           : "${RUNNER_TEMP:?GitHub RUNNER_TEMP is required}"
           : "${RUNNER_OS:?GitHub RUNNER_OS is required}"
           : "${RUNNER_ARCH:?GitHub RUNNER_ARCH is required}"
+          : "${GITHUB_WORKSPACE:?GitHub workspace is required}"
           app="macos/build/Release/$FLASH_GHOSTTY_APP_BUNDLE"
           transfer_root="$RUNNER_TEMP/flash-unsigned-signing-input"
-          transfer_archive="flash-ghostty-unsigned-signing-input.zip"
-          transfer_manifest="flash-ghostty-unsigned-signing-input.tsv"
+          handoff_directory="$GITHUB_WORKSPACE/unsigned-signing-input"
+          transfer_archive="$handoff_directory/flash-ghostty-unsigned-signing-input.zip"
+          transfer_manifest="$handoff_directory/flash-ghostty-unsigned-signing-input.tsv"
           release_directory="$transfer_root/macos/build/Release"
           commit="$(git rev-parse --short HEAD)"
           full_commit="$(git rev-parse HEAD)"
@@ -497,9 +500,9 @@ jobs:
           test -f .github/workflows/flash-release.yml
           test -f macos/Ghostty.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
           test ! -e "$transfer_root"
-          test ! -e "$transfer_archive"
-          test ! -e "$transfer_manifest"
+          test ! -e "$handoff_directory"
 
+          mkdir -p "$handoff_directory"
           mkdir -p "$release_directory"
           ditto "$app" "$release_directory/$FLASH_GHOSTTY_APP_BUNDLE"
           ditto "$app.dSYM" "$release_directory/$FLASH_GHOSTTY_APP_BUNDLE.dSYM"
@@ -572,19 +575,50 @@ jobs:
             printf 'archive_sha256\t%s\n' "$archive_sha256"
           } > "$transfer_manifest"
           manifest_sha256="$(shasum -a 256 "$transfer_manifest" | awk '{print $1}')"
+          cache_key="flash-unsigned-macos-${GITHUB_RUN_ID}-${full_commit}-${GITHUB_RUN_ATTEMPT}"
           [[ "$manifest_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$cache_key" =~ ^flash-unsigned-macos-[1-9][0-9]*-[0-9a-f]{40}-[1-9][0-9]*$ ]]
           printf 'archive_sha256=%s\n' "$archive_sha256" >> "$GITHUB_OUTPUT"
           printf 'manifest_sha256=%s\n' "$manifest_sha256" >> "$GITHUB_OUTPUT"
+          printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          printf 'cache_key=%s\n' "$cache_key" >> "$GITHUB_OUTPUT"
           printf 'bundle_version=%s\n' "$BUNDLE_VERSION" >> "$GITHUB_OUTPUT"
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Save unsigned signing input for retry-safe handoff
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: unsigned-signing-input
+          key: ${{ steps.signing_input.outputs.cache_key }}
+
+      # cache/save deliberately degrades service errors to warnings. Make the
+      # build fail unless the exact immutable entry is actually readable, so a
+      # failed-job rerun repeats this build instead of stranding the signer.
+      - name: Look up saved unsigned signing input
+        id: unsigned_cache_lookup
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: unsigned-signing-input
+          key: ${{ steps.signing_input.outputs.cache_key }}
+          lookup-only: true
+          fail-on-cache-miss: true
+
+      - name: Verify saved unsigned signing input
+        env:
+          EXPECTED_UNSIGNED_CACHE_KEY: ${{ steps.signing_input.outputs.cache_key }}
+          SAVED_UNSIGNED_CACHE_HIT: ${{ steps.unsigned_cache_lookup.outputs.cache-hit }}
+          SAVED_UNSIGNED_CACHE_KEY: ${{ steps.unsigned_cache_lookup.outputs.cache-matched-key }}
+        run: |
+          test "$SAVED_UNSIGNED_CACHE_HIT" = true
+          test "$SAVED_UNSIGNED_CACHE_KEY" = "$EXPECTED_UNSIGNED_CACHE_KEY"
 
       - name: Upload unsigned signing input
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: flash-ghostty-${{ needs.validate.outputs.version }}-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          name: flash-ghostty-${{ needs.validate.outputs.version }}-unsigned-${{ github.run_id }}-${{ steps.signing_input.outputs.run_attempt }}
           path: |-
-            flash-ghostty-unsigned-signing-input.zip
-            flash-ghostty-unsigned-signing-input.tsv
+            unsigned-signing-input/flash-ghostty-unsigned-signing-input.zip
+            unsigned-signing-input/flash-ghostty-unsigned-signing-input.tsv
           if-no-files-found: error
           retention-days: 1
 
@@ -621,17 +655,22 @@ jobs:
           grep -Fx "Xcode $FLASH_XCODE_VERSION" <<< "$xcode_version"
           grep -Fx "Build version $FLASH_XCODE_BUILD" <<< "$xcode_version"
 
-      - name: Download unsigned signing input
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Restore unsigned signing input
+        id: unsigned_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: flash-ghostty-${{ needs.validate.outputs.version }}-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
           path: unsigned-signing-input
+          key: ${{ needs['build-macos'].outputs.unsigned_cache_key }}
+          fail-on-cache-miss: true
 
       - name: Verify unsigned signing input
         id: signing_input
         env:
           EXPECTED_ARCHIVE_SHA256: ${{ needs['build-macos'].outputs.unsigned_archive_sha256 }}
           EXPECTED_MANIFEST_SHA256: ${{ needs['build-macos'].outputs.unsigned_manifest_sha256 }}
+          EXPECTED_UNSIGNED_RUN_ATTEMPT: ${{ needs['build-macos'].outputs.unsigned_run_attempt }}
+          EXPECTED_UNSIGNED_CACHE_KEY: ${{ needs['build-macos'].outputs.unsigned_cache_key }}
+          RESTORED_UNSIGNED_CACHE_KEY: ${{ steps.unsigned_cache.outputs.cache-matched-key }}
           EXPECTED_BUNDLE_VERSION: ${{ needs['build-macos'].outputs.bundle_version }}
           EXPECTED_COMMIT: ${{ needs['build-macos'].outputs.commit }}
           EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
@@ -641,6 +680,11 @@ jobs:
           test -f "$archive"
           test -f "$manifest"
           [[ "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_UNSIGNED_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_UNSIGNED_CACHE_KEY" =~ ^flash-unsigned-macos-[1-9][0-9]*-[0-9a-f]{40}-[1-9][0-9]*$ ]]
+          test "$EXPECTED_UNSIGNED_CACHE_KEY" = \
+            "flash-unsigned-macos-${GITHUB_RUN_ID}-${GITHUB_SHA}-${EXPECTED_UNSIGNED_RUN_ATTEMPT}"
+          test "$RESTORED_UNSIGNED_CACHE_KEY" = "$EXPECTED_UNSIGNED_CACHE_KEY"
           test "$(shasum -a 256 "$manifest" | awk '{print $1}')" = \
             "$EXPECTED_MANIFEST_SHA256"
 
@@ -709,7 +753,7 @@ jobs:
           test "$manifest_commit" = "$EXPECTED_COMMIT"
           test "$manifest_archive_sha256" = "$EXPECTED_ARCHIVE_SHA256"
           test "$(manifest_value github_run_id)" = "$GITHUB_RUN_ID"
-          test "$(manifest_value github_run_attempt)" = "$GITHUB_RUN_ATTEMPT"
+          test "$(manifest_value github_run_attempt)" = "$EXPECTED_UNSIGNED_RUN_ATTEMPT"
           test "$(manifest_value runner_os)" = macOS
           [[ "$(manifest_value runner_arch)" =~ ^(ARM64|X64)$ ]]
           test "$(manifest_value xcode_version)" = "$FLASH_XCODE_VERSION"
