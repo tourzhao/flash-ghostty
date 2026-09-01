@@ -229,7 +229,7 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
             "Session A must contain two live terminal surfaces before saving"
         )
         XCTAssertTrue(
-            waitForTerminalPaneCount(2, in: app),
+            waitForTerminalSurfaceCount(2, in: app),
             "Session A must expose exactly two terminal leaves before saving"
         )
         try moveShell(
@@ -323,7 +323,7 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
             "Session A must restore both sides of its split tree"
         )
         XCTAssertTrue(
-            waitForTerminalPaneCount(2, in: app),
+            waitForTerminalSurfaceCount(2, in: app),
             "Session A must restore exactly two terminal leaves"
         )
         try assertRestoredSession(
@@ -372,7 +372,7 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
             in: app
         )
         XCTAssertTrue(
-            waitForTerminalPaneCount(1, in: app),
+            waitForTerminalSurfaceCount(1, in: app),
             "Session B must restore as exactly one terminal leaf"
         )
     }
@@ -650,19 +650,18 @@ final class GhosttySessionRestorationUITests: GhosttyCustomConfigCase {
     }
 
     @MainActor
-    private func waitForTerminalPaneCount(
+    private func waitForTerminalSurfaceCount(
         _ expectedCount: Int,
         in app: XCUIApplication,
         timeout: TimeInterval = 10
     ) -> Bool {
-        let terminalPanes = app.groups.matching(
-            NSPredicate(format: "label == %@", "Terminal pane")
-        )
+        // SurfaceView exposes one .textArea accessibility node per terminal leaf.
+        let terminalSurfaces = app.textViews
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in
-                terminalPanes.count == expectedCount
+                terminalSurfaces.count == expectedCount
             },
-            object: app
+            object: terminalSurfaces
         )
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
