@@ -81,18 +81,19 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         XCTAssertTrue(table.waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["initial.swift"].waitForExistence(timeout: 5))
 
-        // The filename is an accessibility button for the row's primary Open
-        // action. Select through the native outline row so this exercises the
-        // Table selection contract instead of activating that nested button.
+        // Wait for the native outline row, but do not click it: its AX frame
+        // includes horizontally clipped columns, and cell clicks are not a
+        // deterministic way to select that oversized row across CI hosts.
         let nativeRow = table.outlineRows.firstMatch
         XCTAssertTrue(nativeRow.waitForExistence(timeout: 5))
-        // XCUIElement.click() first tries to scroll the entire 472-point row
-        // into the 300-point sidebar, so the row can never become "hittable".
-        // A coordinate click sends the same real mouse event at the visible
-        // row center without requiring the full horizontal extent onscreen.
-        nativeRow.coordinate(
-            withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
+
+        // Click a visible empty part of the Table to exercise the real list
+        // focus bridge, then let native keyboard navigation select its first
+        // row. This avoids activating the filename's primary Open action.
+        table.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.25, dy: 0.75)
         ).click()
+        app.typeKey(.downArrow, modifierFlags: [])
 
         let copyButton = app.buttons["terminal-file-sidebar.copy"]
         let selectionPublished = XCTNSPredicateExpectation(
