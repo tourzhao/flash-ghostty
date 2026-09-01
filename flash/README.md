@@ -79,6 +79,11 @@ Before the first run:
    - `FLASH_APPLE_NOTARIZATION_KEY_ID`: App Store Connect API key ID.
    - `FLASH_APPLE_NOTARIZATION_KEY`: raw `.p8` private-key contents.
 
+Keep all nine names above exclusive to the `flash-release` Environment. Do not
+duplicate them as repository-level variables or secrets: the workflow context
+does not expose a value's scope, so preflight cannot distinguish such a
+fallback from the intended Environment configuration.
+
 The certificate pin can be calculated locally without exposing the private
 key. Replace the placeholder with the exact Keychain identity name:
 
@@ -106,6 +111,16 @@ recorded in `flash/release-metadata.env`:
 ```sh
 gh workflow run flash-release.yml --ref main -f version=vX.Y.Z
 ```
+
+Before reserving the macOS build runner, a no-deployment preflight job checks
+that all required `flash-release` variables and secrets are present. That job
+does not check out repository content, invoke an action, or receive token
+permissions. It projects only configured/not-configured booleans into the shell
+environment and never prints secret values; the signing job still performs the
+authoritative certificate, identity, and key validation. If preflight fails,
+configure the missing values and use **Re-run all jobs**. Environment wait
+timers and required reviewers apply separately to both preflight and the signing
+job.
 
 The workflow fails closed unless the source is protected `main`, the metadata
 matches the dispatch input, and the Environment values are present. It imports

@@ -26,6 +26,16 @@ require_literal() {
     fi
 }
 
+require_block_literal() {
+    block=$1
+    literal=$2
+    description=$3
+    if ! printf '%s\n' "$block" | grep -Fq -- "$literal"; then
+        echo "identity drift: '$literal' is missing from $description" >&2
+        exit 1
+    fi
+}
+
 require_literal "$shared_xcconfig" "FLASH_GHOSTTY_APP_DISPLAY_NAME = $FLASH_GHOSTTY_DISPLAY_NAME"
 require_literal "$shared_xcconfig" "FLASH_GHOSTTY_APP_BUNDLE_IDENTIFIER = $FLASH_GHOSTTY_RELEASE_BUNDLE_ID"
 require_literal "$shared_xcconfig" "FLASH_GHOSTTY_FILESYSTEM_NAMESPACE = $FLASH_GHOSTTY_FILESYSTEM_NAMESPACE"
@@ -47,6 +57,123 @@ require_literal "$upstream_release_tag_workflow" "if: github.repository == 'ghos
 require_literal "$upstream_release_tip_workflow" "github.repository == 'ghostty-org/ghostty' &&"
 require_literal "$branch_workflow" '    shell: bash'
 require_literal "$release_workflow" '    shell: bash'
+release_preflight_job=$(
+    awk '
+        /^  release-preflight:/ { capture = 1 }
+        capture && /^  build-macos:/ { exit }
+        capture { print }
+    ' "$release_workflow"
+)
+if [ -z "$release_preflight_job" ]; then
+    echo "identity drift: release-preflight job is missing from $release_workflow" >&2
+    exit 1
+fi
+require_block_literal "$release_preflight_job" 'runs-on: ubuntu-latest' 'release-preflight job'
+require_block_literal "$release_preflight_job" 'timeout-minutes: 5' 'release-preflight job'
+require_block_literal "$release_preflight_job" 'name: flash-release' 'release-preflight job'
+require_block_literal "$release_preflight_job" 'deployment: false' 'release-preflight job'
+require_block_literal "$release_preflight_job" 'permissions: {}' 'release-preflight job'
+require_block_literal "$release_preflight_job" 'needs: validate' 'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "needs.validate.result == 'success'" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "github.repository == 'tourzhao/flash-ghostty'" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "github.ref == 'refs/heads/main'" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" 'github.ref_protected' 'release-preflight job'
+require_block_literal "$release_preflight_job" 'set +x' 'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_MACOS_TEAM_ID_CONFIGURED: \${{ vars.FLASH_MACOS_TEAM_ID != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_MACOS_CERTIFICATE_SHA256_CONFIGURED: \${{ vars.FLASH_MACOS_CERTIFICATE_SHA256 != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_MACOS_CERTIFICATE_CONFIGURED: \${{ secrets.FLASH_MACOS_CERTIFICATE != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_MACOS_CERTIFICATE_PWD_CONFIGURED: \${{ secrets.FLASH_MACOS_CERTIFICATE_PWD != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_MACOS_CERTIFICATE_NAME_CONFIGURED: \${{ secrets.FLASH_MACOS_CERTIFICATE_NAME != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_MACOS_CI_KEYCHAIN_PWD_CONFIGURED: \${{ secrets.FLASH_MACOS_CI_KEYCHAIN_PWD != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_APPLE_NOTARIZATION_ISSUER_CONFIGURED: \${{ secrets.FLASH_APPLE_NOTARIZATION_ISSUER != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_APPLE_NOTARIZATION_KEY_ID_CONFIGURED: \${{ secrets.FLASH_APPLE_NOTARIZATION_KEY_ID != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    "FLASH_APPLE_NOTARIZATION_KEY_CONFIGURED: \${{ secrets.FLASH_APPLE_NOTARIZATION_KEY != '' }}" \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_MACOS_TEAM_ID_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_MACOS_CERTIFICATE_SHA256_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_MACOS_CERTIFICATE_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_MACOS_CERTIFICATE_PWD_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_MACOS_CERTIFICATE_NAME_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_MACOS_CI_KEYCHAIN_PWD_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_APPLE_NOTARIZATION_ISSUER_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_APPLE_NOTARIZATION_KEY_ID_CONFIGURED"' \
+    'release-preflight job'
+require_block_literal "$release_preflight_job" \
+    'require_configured "$FLASH_APPLE_NOTARIZATION_KEY_CONFIGURED"' \
+    'release-preflight job'
+if printf '%s\n' "$release_preflight_job" | grep -Fq 'uses:'; then
+    echo "identity drift: release-preflight must not execute actions or check out repository content" >&2
+    exit 1
+fi
+if printf '%s\n' "$release_preflight_job" \
+    | grep -Eq ': *\$\{\{ *(secrets|vars)\.[A-Z0-9_]+ *\}\}'; then
+    echo "identity drift: release-preflight must project booleans, not secret or variable values" >&2
+    exit 1
+fi
+if printf '%s\n' "$release_preflight_job" \
+    | grep -Eq 'github\.token|secrets\.GITHUB_TOKEN|GITHUB_TOKEN'; then
+    echo "identity drift: release-preflight must not explicitly consume or project GITHUB_TOKEN" >&2
+    exit 1
+fi
+if [ "$(printf '%s\n' "$release_preflight_job" | grep -c '^[[:space:]]*run:')" -ne 1 ]; then
+    echo "identity drift: release-preflight must contain exactly one inline shell step" >&2
+    exit 1
+fi
+release_build_job=$(
+    awk '
+        /^  build-macos:/ { capture = 1 }
+        capture && /^  sign-notarize:/ { exit }
+        capture { print }
+    ' "$release_workflow"
+)
+if [ -z "$release_build_job" ]; then
+    echo "identity drift: build-macos job is missing from $release_workflow" >&2
+    exit 1
+fi
+require_block_literal "$release_build_job" \
+    'needs: [validate, release-preflight]' \
+    'build-macos job'
+require_block_literal "$release_build_job" \
+    "needs['release-preflight'].result == 'success'" \
+    'build-macos job'
 require_literal "$release_workflow" '--sign "$signing_identity_sha1"'
 require_literal "$release_workflow" '--extract-certificates "$certificate_prefix"'
 require_literal "$release_workflow" 'if [[ "$actual_certificate_sha1" != "$signing_identity_sha1" ]]; then'
