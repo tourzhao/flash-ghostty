@@ -182,10 +182,66 @@ jobs:
           printf 'value=%s\n' "$FLASH_GHOSTTY_RELEASE_VERSION" >> "$GITHUB_OUTPUT"
           printf 'bundle_version=%s\n' "$FLASH_GHOSTTY_BUNDLE_VERSION" >> "$GITHUB_OUTPUT"
 
-  build-macos:
+  release-preflight:
     needs: validate
     if: >-
       needs.validate.result == 'success' &&
+      github.repository == 'tourzhao/flash-ghostty' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: flash-release
+      deployment: false
+    permissions: {}
+    steps:
+      # Do not check out the working tree or invoke repository scripts/actions
+      # in this job. Project only presence booleans into the shell environment;
+      # never interpolate release secret values into it.
+      - name: Verify release environment configuration
+        env:
+          FLASH_MACOS_TEAM_ID_CONFIGURED: ${{ vars.FLASH_MACOS_TEAM_ID != '' }}
+          FLASH_MACOS_CERTIFICATE_SHA256_CONFIGURED: ${{ vars.FLASH_MACOS_CERTIFICATE_SHA256 != '' }}
+          FLASH_MACOS_CERTIFICATE_CONFIGURED: ${{ secrets.FLASH_MACOS_CERTIFICATE != '' }}
+          FLASH_MACOS_CERTIFICATE_PWD_CONFIGURED: ${{ secrets.FLASH_MACOS_CERTIFICATE_PWD != '' }}
+          FLASH_MACOS_CERTIFICATE_NAME_CONFIGURED: ${{ secrets.FLASH_MACOS_CERTIFICATE_NAME != '' }}
+          FLASH_MACOS_CI_KEYCHAIN_PWD_CONFIGURED: ${{ secrets.FLASH_MACOS_CI_KEYCHAIN_PWD != '' }}
+          FLASH_APPLE_NOTARIZATION_ISSUER_CONFIGURED: ${{ secrets.FLASH_APPLE_NOTARIZATION_ISSUER != '' }}
+          FLASH_APPLE_NOTARIZATION_KEY_ID_CONFIGURED: ${{ secrets.FLASH_APPLE_NOTARIZATION_KEY_ID != '' }}
+          FLASH_APPLE_NOTARIZATION_KEY_CONFIGURED: ${{ secrets.FLASH_APPLE_NOTARIZATION_KEY != '' }}
+        run: |
+          set +x
+          require_configured() {
+            if [[ "$1" != true ]]; then
+              echo "flash-release $2 is required" >&2
+              exit 1
+            fi
+          }
+          require_configured "$FLASH_MACOS_TEAM_ID_CONFIGURED" \
+            "variable FLASH_MACOS_TEAM_ID"
+          require_configured "$FLASH_MACOS_CERTIFICATE_SHA256_CONFIGURED" \
+            "variable FLASH_MACOS_CERTIFICATE_SHA256"
+          require_configured "$FLASH_MACOS_CERTIFICATE_CONFIGURED" \
+            "secret FLASH_MACOS_CERTIFICATE"
+          require_configured "$FLASH_MACOS_CERTIFICATE_PWD_CONFIGURED" \
+            "secret FLASH_MACOS_CERTIFICATE_PWD"
+          require_configured "$FLASH_MACOS_CERTIFICATE_NAME_CONFIGURED" \
+            "secret FLASH_MACOS_CERTIFICATE_NAME"
+          require_configured "$FLASH_MACOS_CI_KEYCHAIN_PWD_CONFIGURED" \
+            "secret FLASH_MACOS_CI_KEYCHAIN_PWD"
+          require_configured "$FLASH_APPLE_NOTARIZATION_ISSUER_CONFIGURED" \
+            "secret FLASH_APPLE_NOTARIZATION_ISSUER"
+          require_configured "$FLASH_APPLE_NOTARIZATION_KEY_ID_CONFIGURED" \
+            "secret FLASH_APPLE_NOTARIZATION_KEY_ID"
+          require_configured "$FLASH_APPLE_NOTARIZATION_KEY_CONFIGURED" \
+            "secret FLASH_APPLE_NOTARIZATION_KEY"
+
+  build-macos:
+    needs: [validate, release-preflight]
+    if: >-
+      needs.validate.result == 'success' &&
+      needs['release-preflight'].result == 'success' &&
       github.repository == 'tourzhao/flash-ghostty' &&
       github.ref == 'refs/heads/main' &&
       github.ref_protected
