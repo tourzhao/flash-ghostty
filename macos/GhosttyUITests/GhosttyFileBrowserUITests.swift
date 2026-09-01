@@ -86,7 +86,13 @@ final class GhosttyFileBrowserUITests: GhosttyCustomConfigCase {
         // Table selection contract instead of activating that nested button.
         let nativeRow = table.outlineRows.firstMatch
         XCTAssertTrue(nativeRow.waitForExistence(timeout: 5))
-        nativeRow.click()
+        // XCUIElement.click() first tries to scroll the entire 472-point row
+        // into the 300-point sidebar, so the row can never become "hittable".
+        // A coordinate click sends the same real mouse event at the visible
+        // row center without requiring the full horizontal extent onscreen.
+        nativeRow.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
+        ).click()
 
         let copyButton = app.buttons["terminal-file-sidebar.copy"]
         let selectionPublished = XCTNSPredicateExpectation(
