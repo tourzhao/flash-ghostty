@@ -129,10 +129,19 @@ def main [
         [$"GITHUB_ACTIONS=($env.GITHUB_ACTIONS)"]
     }
 
+    # Respect a per-command Xcode selection even when xcode-select points at
+    # the standalone Command Line Tools. Keep the remaining environment clean.
+    let developer_dir_setting = if ($env.DEVELOPER_DIR? | default "" | is-empty) {
+        []
+    } else {
+        [$"DEVELOPER_DIR=($env.DEVELOPER_DIR)"]
+    }
+
     (^env -i
         $"HOME=($env.HOME)"
         "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
         ...$github_actions_setting
+        ...$developer_dir_setting
         xcodebuild
         -project $project
         -scheme $scheme

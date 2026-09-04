@@ -23,6 +23,7 @@ const cell_c = @import("cell.zig");
 const row_c = @import("row.zig");
 const grid_ref_c = @import("grid_ref.zig");
 const grid_ref_tracked_c = @import("grid_ref_tracked.zig");
+const search_c = @import("search.zig");
 const selection_c = @import("selection.zig");
 const style_c = @import("style.zig");
 const color = @import("../color.zig");
@@ -103,15 +104,17 @@ const TerminalWrapper = struct {
     /// created by `new` or transferred from snapshot decoding until `free`.
     /// Freestanding owners contain no native allocation and expose failing I/O.
     io: Io,
-    /// We also need to store a temp dir path for some operations (e.g., kitty
-    /// graphics). This provides stable storage for the API calls.
-    tmp_dir_path: [max_path_bytes]u8,
+    /// Allocator-owned copy of the temporary directory path for some
+    /// operations (e.g. kitty graphics). This is only allocated once the
+    /// embedder sets the option.
+    tmp_dir_path: ?[]u8 = null,
     /// The terminfo name reported for XTGETTCAP "TN". The stream handler holds
     /// a slice into this.
     terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
     stream: Stream,
     effects: Effects = .{},
     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
+    searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
 
     /// Fetches a `TerminalWrapper` reference from a `Handler`.
     fn fromHandler(handler: *Handler) *TerminalWrapper {
@@ -725,7 +728,6 @@ fn wrap(
     wrapper.* = .{
         .terminal = t,
         .io = io,
-        .tmp_dir_path = undefined,
         .terminfo_name_buf = undefined,
         .stream = Stream.init(.{
             .allocator = alloc,
@@ -1360,8 +1362,9 @@ fn setTyped(
         },
         .color_palette => {
             wrapper.terminal.colors.palette.changeDefault(
+                wrapper.terminal.gpa(),
                 if (value) |v| color.paletteZval(v) else color.default,
-            );
+            ) catch return .out_of_memory;
             wrapper.terminal.flags.dirty.palette = true;
         },
         .kitty_image_storage_limit => {
@@ -1390,22 +1393,31 @@ fn setTyped(
         },
         .kitty_image_medium_temp_file => {
             if (comptime !build_options.kitty_graphics) return .success;
+            const alloc = wrapper.terminal.gpa();
             if (value) |v| {
-                if (v.len > wrapper.tmp_dir_path.len) return .out_of_memory;
-                @memcpy(wrapper.tmp_dir_path[0..v.len], v.ptr[0..v.len]);
+                if (v.len > max_path_bytes) return .out_of_memory;
+                const path = alloc.dupe(u8, v.ptr[0..v.len]) catch
+                    return .out_of_memory;
                 var it = wrapper.terminal.screens.all.iterator();
                 while (it.next()) |entry| {
                     const screen = entry.value.*;
                     screen.kitty_images.image_limits.temporary_file = .{
-                        .enabled = .{ .directory = wrapper.tmp_dir_path[0..v.len] },
+                        .enabled = .{ .directory = path },
                     };
                 }
+
+                // Every screen points at the new copy now so the previous
+                // one can be released.
+                if (wrapper.tmp_dir_path) |old| alloc.free(old);
+                wrapper.tmp_dir_path = path;
             } else {
                 var it = wrapper.terminal.screens.all.iterator();
                 while (it.next()) |entry| {
                     const screen = entry.value.*;
                     screen.kitty_images.image_limits.temporary_file = .disabled;
                 }
+                if (wrapper.tmp_dir_path) |old| alloc.free(old);
+                wrapper.tmp_dir_path = null;
             }
         },
         .apc_max_bytes => {
@@ -1747,7 +1759,7 @@ fn getTyped(
         .color_background_default => out.* = (t.colors.background.default orelse return .no_value).cval(),
         .color_cursor_default => out.* = (t.colors.cursor.default orelse return .no_value).cval(),
         .color_palette => out.* = color.paletteCval(&t.colors.palette.current),
-        .color_palette_default => out.* = color.paletteCval(&t.colors.palette.original),
+        .color_palette_default => out.* = color.paletteCval(t.colors.palette.original),
         .kitty_image_storage_limit => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = @intCast(t.screens.active.kitty_images.total_limit);
@@ -1877,8 +1889,11 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
 
     for (wrapper.tracked_grid_refs.keys()) |ref| ref.terminal = null;
     wrapper.tracked_grid_refs.deinit(alloc);
+    for (wrapper.searches.keys()) |search| search.terminal = null;
+    wrapper.searches.deinit(alloc);
     wrapper.stream.deinit();
     t.deinit(alloc);
+    if (wrapper.tmp_dir_path) |path| alloc.free(path);
     wrapper.io.deinit(alloc);
     alloc.destroy(t);
     alloc.destroy(wrapper);

@@ -356,6 +356,7 @@ pub fn init(
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.tabstops.deinit(alloc);
     self.screens.deinit(alloc);
+    self.colors.palette.deinit(alloc);
     self.pwd.deinit(alloc);
     self.title.deinit(alloc);
     self.glyph_glossary.deinit(alloc);
@@ -10030,6 +10031,38 @@ test "Terminal: eraseChars wide char wrap boundary conditions" {
     }
 }
 
+test "Terminal: eraseChars clearing wrapped wide char marks spacer head row dirty" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 3, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // The wide char doesn't fit so it wraps, leaving a spacer head at
+    // the end of the first row.
+    try t.printString("ABCD字");
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_head, list_cell.cell.wide);
+        try testing.expect(list_cell.row.wrap);
+    }
+
+    t.setCursorPos(2, 1);
+    t.clearDirty();
+    t.eraseChars(1);
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
+
+    // Erasing the wide char also clears the spacer head on the previous
+    // row, so that row must be dirty too.
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
+    try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 2 } }));
+
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.narrow, list_cell.cell.wide);
+    }
+}
+
 test "Terminal: reverseIndex" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
@@ -13464,8 +13497,15 @@ test "Terminal: deleteChars wide char wrap boundary conditions" {
     }
 
     t.setCursorPos(2, 2);
+    t.clearDirty();
     t.deleteChars(3);
     t.screens.active.cursor.page_pin.node.page().assertIntegrity();
+
+    // Deleting the wide char also clears the spacer head on the previous
+    // row, so that row must be dirty too.
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
+    try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 2 } }));
 
     {
         const str = try t.plainString(alloc);

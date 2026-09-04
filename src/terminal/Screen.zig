@@ -1949,6 +1949,11 @@ pub fn splitCellBoundary(
                         p_rac.row,
                         p_cells[p_row.node.cols() - 1 ..][0..1],
                     );
+
+                    // `clearCells` does not mark rows dirty, and our
+                    // callers only mark the cursor row, so mark the
+                    // previous row here.
+                    p_row.markDirty();
                 }
             }
         }

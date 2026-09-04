@@ -1191,11 +1191,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
-            // If we're not visible, then we want to stop the display link
-            // because it is a waste of resources and we can move to pure
-            // change-driven updates.
-            if (self.visible and self.focused) {
-                display_link.start() catch {};
+            const should_run =
+                // Non-visible windows never vsync
+                self.visible and
+                // Only vsync if we have cell changes or animation
+                (self.cells_rebuilt or self.animationWake() != null);
+
+            if (should_run) {
+                if (!display_link.isRunning()) {
+                    display_link.start() catch {};
+                }
             } else {
                 display_link.stop() catch {};
             }
@@ -1593,6 +1598,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Update custom shader uniforms that depend on terminal state.
                 self.updateCustomShaderUniformsFromState();
             }
+
+            // Start the display link now that the rebuilt frame is ready.
+            self.syncDisplayLink(null, null);
         }
 
         /// Draw the frame to the screen.
@@ -1670,6 +1678,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
+
+                // Resync the display link because we can probably pause
+                // the display link at this point.
+                self.syncDisplayLink(null, null);
                 return;
             }
             self.cells_rebuilt = false;
