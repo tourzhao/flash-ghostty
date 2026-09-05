@@ -15,6 +15,8 @@ final class SessionAttentionTracker {
     private final class Registration {
         let source: any SessionAttentionSource
         var subscription: AnyCancellable?
+        var wasViewed = false
+        var lastViewedUptime: TimeInterval?
 
         init(source: any SessionAttentionSource) {
             self.source = source
@@ -63,14 +65,20 @@ final class SessionAttentionTracker {
                 .sink { [weak self, weak registration] snapshot in
                     guard let self, let registration,
                           registrations[id] === registration else { return }
+                    let uptime = now()
+                    let viewed = recordVisibility(for: id, registration: registration, at: uptime)
+                    let viewedAfterObservation = snapshot.observedAt.map { observedAt in
+                        registration.lastViewedUptime.map { $0 >= observedAt } ?? false
+                    } ?? false
                     state.update(
                         surfaceID: id,
                         tool: snapshot.tool,
                         status: snapshot.status,
-                        isViewed: isViewed(id),
-                        now: now()
+                        isViewed: viewed || viewedAfterObservation,
+                        now: snapshot.observedAt ?? uptime
                     )
-                    publishAndSchedule()
+                    state.advance(to: uptime)
+                    refreshVisibility(at: uptime)
                 }
             source.startAttentionMonitoring()
         }
@@ -78,17 +86,36 @@ final class SessionAttentionTracker {
     }
 
     func refreshVisibility() {
-        for id in registrations.keys where isViewed(id) {
+        refreshVisibility(at: now())
+    }
+
+    private func refreshVisibility(at uptime: TimeInterval) {
+        for (id, registration) in registrations where recordVisibility(
+            for: id, registration: registration, at: uptime
+        ) {
             state.markViewed(surfaceID: id)
         }
         publishAndSchedule()
     }
 
+    private func recordVisibility(for id: UUID, registration: Registration, at uptime: TimeInterval) -> Bool {
+        let viewed = isViewed(id)
+        // Keep the end of a viewing interval as well as visits while focused.
+        // A completion can arrive before provider discovery, then be replayed
+        // after the user has already read it and switched away.
+        if viewed || registration.wasViewed {
+            registration.lastViewedUptime = uptime
+        }
+        registration.wasViewed = viewed
+        return viewed
+    }
+
     /// Public inside the module so tests can drive the same deadline path with
     /// a deterministic clock instead of sleeping or manipulating a run loop.
     func advance() {
-        state.advance(to: now())
-        refreshVisibility()
+        let uptime = now()
+        state.advance(to: uptime)
+        refreshVisibility(at: uptime)
     }
 
     func stop() {

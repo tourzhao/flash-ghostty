@@ -1,3 +1,5 @@
+import Foundation
+
 enum TerminalSessionTool: Equatable, Hashable, Sendable {
     case codex
     case claudeCode
@@ -21,4 +23,16 @@ enum TerminalSessionActivityStatus: Equatable, Sendable {
 struct TerminalSessionActivitySnapshot: Equatable, Sendable {
     let tool: TerminalSessionTool
     let status: TerminalSessionActivityStatus
+    /// Original monotonic observation time when provider discovery delays delivery.
+    let observedAt: TimeInterval?
+
+    init(
+        tool: TerminalSessionTool,
+        status: TerminalSessionActivityStatus,
+        observedAt: TimeInterval? = nil
+    ) {
+        self.tool = tool
+        self.status = status
+        self.observedAt = observedAt
+    }
 }

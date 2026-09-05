@@ -20,8 +20,8 @@ struct SessionAttentionTrackerTests {
             // A synchronous callback during teardown must not restore state.
             send(.paused)
         }
-        func send(_ status: TerminalSessionActivityStatus) {
-            subject.send(.init(tool: .codex, status: status))
+        func send(_ status: TerminalSessionActivityStatus, observedAt: TimeInterval? = nil) {
+            subject.send(.init(tool: .codex, status: status, observedAt: observedAt))
         }
     }
 
@@ -141,6 +141,174 @@ struct SessionAttentionTrackerTests {
         second.send(.completed)
         #expect(counts == [1, 0])
         tracker.stop()
+    }
+
+    private enum DelayedCompletionViewing: CaseIterable {
+        case completedWhileViewed
+        case viewedAfterCompletion
+        case alwaysInBackground
+        case viewedBeforeCompletion
+
+        var acknowledgesCompletion: Bool {
+            self == .completedWhileViewed || self == .viewedAfterCompletion
+        }
+    }
+
+    @Test(arguments: DelayedCompletionViewing.allCases)
+    private func delayedCompletionUsesOriginalViewingHistory(viewing: DelayedCompletionViewing) {
+        let id = UUID()
+        let source = Source()
+        var now: TimeInterval = 0
+        var viewed = viewing == .completedWhileViewed || viewing == .viewedBeforeCompletion
+        var counts: [Int] = []
+        let tracker = SessionAttentionTracker(
+            makeSource: { _ in source }, isViewed: { _ in viewed },
+            countDidChange: { counts.append($0) }, now: { now }, automaticallySchedule: false
+        )
+        defer { tracker.stop() }
+        tracker.reconcile(owners: [id: UUID()])
+
+        if viewing == .viewedBeforeCompletion {
+            now = 1
+            viewed = false
+            tracker.refreshVisibility()
+        }
+        // The round completes at time 2, while provider discovery is pending.
+        if viewing == .viewedAfterCompletion {
+            now = 3
+            viewed = true
+            tracker.refreshVisibility()
+        }
+        now = 4
+        viewed = false
+        tracker.refreshVisibility()
+
+        // Delivery happens after the one-second completion deadline.
+        now = 10
+        source.send(.active, observedAt: 1.5)
+        source.send(.completed, observedAt: 2)
+        source.send(.completed, observedAt: 2)
+
+        #expect(tracker.count == (viewing.acknowledgesCompletion ? 0 : 1))
+        #expect(counts == (viewing.acknowledgesCompletion ? [] : [1]))
+    }
+
+    @Test func delayedCompletionKeepsItsOriginalDeadline() {
+        let id = UUID()
+        let source = Source()
+        var now: TimeInterval = 0
+        var counts: [Int] = []
+        let tracker = SessionAttentionTracker(
+            makeSource: { _ in source }, isViewed: { _ in false },
+            countDidChange: { counts.append($0) }, now: { now }, automaticallySchedule: false
+        )
+        defer { tracker.stop() }
+        tracker.reconcile(owners: [id: UUID()])
+        now = 2.4
+        source.send(.active, observedAt: 1)
+        source.send(.completed, observedAt: 2)
+        #expect(tracker.count == 0)
+        now = 2.9
+        tracker.advance()
+        #expect(tracker.count == 0)
+        now = 3
+        tracker.advance()
+        #expect(counts == [1])
+    }
+
+    @Test func sourceDeliveryRecordsTheEndOfViewingBeforeDelayedCompletion() {
+        let id = UUID()
+        let source = Source()
+        var now: TimeInterval = 0
+        var viewed = true
+        var counts: [Int] = []
+        let tracker = SessionAttentionTracker(
+            makeSource: { _ in source }, isViewed: { _ in viewed },
+            countDidChange: { counts.append($0) }, now: { now }, automaticallySchedule: false
+        )
+        defer { tracker.stop() }
+        tracker.reconcile(owners: [id: UUID()])
+        now = 3
+        viewed = false
+        // Delivery can precede the coordinator's next visibility refresh.
+        source.send(.active, observedAt: 1)
+        source.send(.completed, observedAt: 2)
+        #expect(counts.isEmpty)
+    }
+
+    @Test func untimestampedCompletionDoesNotReuseEarlierViewing() {
+        let id = UUID()
+        let source = Source()
+        var now: TimeInterval = 0
+        var viewed = true
+        let tracker = SessionAttentionTracker(
+            makeSource: { _ in source }, isViewed: { _ in viewed },
+            countDidChange: { _ in }, now: { now }, automaticallySchedule: false
+        )
+        defer { tracker.stop() }
+        tracker.reconcile(owners: [id: UUID()])
+        now = 3
+        viewed = false
+        tracker.refreshVisibility()
+        source.send(.active)
+        source.send(.completed)
+        #expect(tracker.count == 0)
+        now = 4
+        tracker.advance()
+        #expect(tracker.count == 1)
+    }
+
+    @Test(arguments: [false, true])
+    func viewingHistorySurvivesMovesButNotRemoval(removesSource: Bool) {
+        let id = UUID()
+        var source = Source()
+        var now: TimeInterval = 0
+        var viewed = true
+        var counts: [Int] = []
+        let tracker = SessionAttentionTracker(
+            makeSource: { _ in source }, isViewed: { _ in viewed },
+            countDidChange: { counts.append($0) }, now: { now }, automaticallySchedule: false
+        )
+        defer { tracker.stop() }
+        tracker.reconcile(owners: [id: UUID()])
+        now = 3
+        viewed = false
+        tracker.refreshVisibility()
+        now = 4
+        if removesSource {
+            tracker.reconcile(owners: [:])
+            source = Source()
+        }
+        tracker.reconcile(owners: [id: UUID()])
+        now = 10
+        source.send(.active, observedAt: 1)
+        source.send(.completed, observedAt: 2)
+        #expect(tracker.count == (removesSource ? 1 : 0))
+        #expect(counts == (removesSource ? [1] : []))
+    }
+
+    @Test func metadataDeadlinePromotionAcknowledgesOtherViewedPanesBeforePublishing() {
+        let firstID = UUID()
+        let secondID = UUID()
+        let first = Source()
+        let second = Source()
+        var now: TimeInterval = 0
+        var viewed: UUID?
+        var counts: [Int] = []
+        let tracker = SessionAttentionTracker(
+            makeSource: { $0 == firstID ? first : second },
+            isViewed: { $0 == viewed }, countDidChange: { counts.append($0) },
+            now: { now }, automaticallySchedule: false
+        )
+        defer { tracker.stop() }
+        tracker.reconcile(owners: [firstID: UUID(), secondID: UUID()])
+        first.send(.active)
+        first.send(.completed)
+        now = 2
+        viewed = firstID
+        second.send(.active)
+        #expect(counts.isEmpty)
+        #expect(tracker.count == 0)
     }
 
     @Test func automaticDeadlinePublishesUnreadCompletion() async throws {
