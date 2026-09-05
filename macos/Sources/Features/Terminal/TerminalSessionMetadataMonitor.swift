@@ -84,6 +84,10 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     @Published private(set) var foregroundProcessName: String?
     @Published private(set) var tool: TerminalSessionTool = .terminal
     @Published private(set) var activityStatus: TerminalSessionActivityStatus = .ready
+    @Published private(set) var activitySnapshot = TerminalSessionActivitySnapshot(
+        tool: .terminal,
+        status: .ready
+    )
     @Published private(set) var lastInstruction: String?
     @Published private(set) var workingDirectory: URL?
 
@@ -179,6 +183,7 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         progressReport = nil
         activityStatus = .ready
         tool = .terminal
+        publishActivitySnapshot()
         lastInstruction = nil
         foregroundProcessName = nil
         invalidateVisibleContentsReads()
@@ -242,11 +247,13 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
 
     func updateRefreshContext(
         sidebarIsVisible: Bool,
-        sessionIsSelected: Bool
+        sessionIsSelected: Bool,
+        attentionIsEnabled: Bool = false
     ) {
         let nextMode = SessionMetadataPollingMode.resolve(
             sidebarIsVisible: sidebarIsVisible,
-            sessionIsSelected: sessionIsSelected
+            sessionIsSelected: sessionIsSelected,
+            attentionIsEnabled: attentionIsEnabled
         )
         guard nextMode != refreshThrottle.mode else { return }
 
@@ -254,7 +261,8 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         let shouldRefreshImmediately = refreshThrottle.update(mode: nextMode)
         TerminalSessionMetadataRefreshScheduler.shared.refreshContextDidChange()
         if nextMode == .suspended {
-            // A hidden sidebar has no consumer for renderer-backed metadata.
+            // Without a visible sidebar or attention consumer, no renderer-
+            // backed metadata is needed.
             // Cancel queued reads before they enter the renderer lock and reject
             // a read that is already running. Reopening starts from a fresh
             // snapshot because invalidation also clears its refresh timestamp.
@@ -400,6 +408,7 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         progressReport = nil
         tool = .terminal
         activityStatus = .ready
+        publishActivitySnapshot()
         lastInstruction = nil
         workingDirectory = nil
         invalidateVisibleContentsReads()
@@ -798,6 +807,10 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         defersVisibleContentsRefresh: Bool = false,
         providedClaudeAnalysis: TerminalSessionVisibleContentsAnalysis? = nil
     ) {
+        // Every path, including a deferred screen read after a provider change,
+        // publishes only the final coherent pair. Async reads reenter here.
+        defer { publishActivitySnapshot() }
+
         let detectedTool = TerminalSessionTool.detect(
             fromDynamicTitle: dynamicTitle,
             foregroundProcessName: foregroundProcessName
@@ -896,6 +909,16 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         if (previousStatus != .active && nextStatus == .active) ||
             (previousStatus == .active && nextStatus != .active) {
             scheduleLastInstructionCapture()
+        }
+    }
+
+    private func publishActivitySnapshot() {
+        let snapshot = TerminalSessionActivitySnapshot(
+            tool: tool,
+            status: activityStatus
+        )
+        if activitySnapshot != snapshot {
+            activitySnapshot = snapshot
         }
     }
 }

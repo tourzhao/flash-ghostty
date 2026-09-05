@@ -8,9 +8,12 @@ enum SessionMetadataPollingMode: Equatable, Sendable {
 
     static func resolve(
         sidebarIsVisible: Bool,
-        sessionIsSelected: Bool
+        sessionIsSelected: Bool,
+        attentionIsEnabled: Bool = false
     ) -> Self {
-        guard sidebarIsVisible else { return .suspended }
+        guard sidebarIsVisible else {
+            return attentionIsEnabled ? .background : .suspended
+        }
         return sessionIsSelected ? .selected : .background
     }
 
@@ -164,7 +167,7 @@ struct SessionInstructionStore {
 /// One app-wide clock refreshes weakly held session monitors. This avoids a
 /// separate run-loop timer for every native tab. The selected row refreshes
 /// every second, background rows apply their own throttling, and the clock is
-/// stopped entirely while every registered sidebar is hidden.
+/// stopped entirely when no sidebar or attention consumer needs refreshes.
 @MainActor
 final class TerminalSessionMetadataRefreshScheduler {
     static let shared = TerminalSessionMetadataRefreshScheduler()
@@ -205,8 +208,8 @@ final class TerminalSessionMetadataRefreshScheduler {
     }
 
     /// Visibility can change while the monitor remains registered. Stop the
-    /// app-wide clock when every sidebar is hidden, and restart it as soon as
-    /// any monitor becomes visible again.
+    /// app-wide clock when no consumer needs it, and restart it as soon as
+    /// any monitor needs periodic refreshes again.
     func refreshContextDidChange() {
         updateTimerState()
     }

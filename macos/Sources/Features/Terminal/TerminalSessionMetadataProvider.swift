@@ -15,3 +15,10 @@ enum TerminalSessionActivityStatus: Equatable, Sendable {
     case completed
     case failed
 }
+
+/// A coherent provider/activity value for consumers that must not observe one
+/// provider's status paired with another provider during a binding transition.
+struct TerminalSessionActivitySnapshot: Equatable, Sendable {
+    let tool: TerminalSessionTool
+    let status: TerminalSessionActivityStatus
+}
