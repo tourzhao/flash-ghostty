@@ -81,8 +81,12 @@ extension Ghostty {
         }
 
         // The progress report (if any)
+        private(set) var progressReportProcessID: Int32?
         override var progressReport: Action.ProgressReport? {
             didSet {
+                progressReportProcessID = progressReport.flatMap { _ in
+                    surfaceModel?.foregroundPID.flatMap { Int32(exactly: $0) }
+                }
                 // Cancel any existing timer
                 progressReportTimer?.invalidate()
                 progressReportTimer = nil

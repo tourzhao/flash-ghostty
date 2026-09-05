@@ -108,6 +108,9 @@ or misclassified when its interface changes or old prompt text remains visible.
 Output silence, progress reaching 100%, and progress-display timeouts do not by
 themselves mean a turn is complete. Counts stay in memory and reset on relaunch;
 no notification permission, agent credentials, or outbound service is required.
+Changed-PID discovery preserves fast first rounds while lookup is pending, but
+same-PID `exec` launches or agents that exit before identification can still be
+missed. See [behavior, limitations, and validation](flash/session-attention.md).
 
 ### A Finder-style file browser tied to each session
 

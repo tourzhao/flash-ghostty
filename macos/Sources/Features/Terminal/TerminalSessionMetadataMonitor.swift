@@ -49,12 +49,23 @@ private final class TerminalSessionVisibleContentsReadTicket: @unchecked Sendabl
 @MainActor
 protocol TerminalSessionMetadataBindingSource: AnyObject {
     var sessionMetadataSurface: Ghostty.SurfaceView? { get }
+    var sessionMetadataSurfaceID: UUID? { get }
+    var sessionMetadataForegroundPID: Int32? { get }
+    var sessionMetadataProgressProcessID: Int32? { get }
     var sessionMetadataTitlePublisher: AnyPublisher<String, Never> { get }
     var sessionMetadataBellPublisher: AnyPublisher<Bool, Never> { get }
     var sessionMetadataProgressPublisher:
         AnyPublisher<Ghostty.Action.ProgressReport?, Never> { get }
     var sessionMetadataWorkingDirectoryPublisher:
         AnyPublisher<String?, Never> { get }
+}
+
+extension TerminalSessionMetadataBindingSource {
+    var sessionMetadataSurfaceID: UUID? { sessionMetadataSurface?.id }
+    var sessionMetadataForegroundPID: Int32? {
+        sessionMetadataSurface?.surfaceModel?.foregroundPID.flatMap { Int32(exactly: $0) }
+    }
+    var sessionMetadataProgressProcessID: Int32? { sessionMetadataSurface?.progressReportProcessID }
 }
 
 extension Ghostty.SurfaceView: TerminalSessionMetadataBindingSource {
@@ -80,6 +91,10 @@ extension Ghostty.SurfaceView: TerminalSessionMetadataBindingSource {
 /// title changes; provider detection and process discovery stay in this model.
 @MainActor
 final class TerminalSessionMetadataMonitor: ObservableObject {
+    typealias ProcessLookup = @MainActor (
+        Int32, @escaping @MainActor @Sendable (String?) -> Void
+    ) -> Void
+
     @Published private(set) var dynamicTitle = ""
     @Published private(set) var foregroundProcessName: String?
     @Published private(set) var tool: TerminalSessionTool = .terminal
@@ -112,11 +127,17 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     /// rejects a callback already queued when the source is rebound or cleared.
     private var bindingGeneration: UInt = 0
     private var progressReport: Ghostty.Action.ProgressReport?
+    private var titleRevision: UInt = 0
+    private var progressTitleRevision: UInt?
     private var lastInstructions = SessionInstructionStore()
     private var instructionCaptureGeneration: UInt = 0
     private var processLookupGeneration: UInt = 0
     private var processLookupIsInFlight = false
     private var processLookupThrottle = SessionProcessLookupThrottle()
+    private var acceptedProcessID: Int32?
+    private var pendingProcessActivity: SessionPendingProcessActivity?
+    private let lookupProcess: ProcessLookup
+    private let now: () -> TimeInterval
     private var claudeVisibleContentsAnalysis: TerminalSessionVisibleContentsAnalysis?
     private var lastClaudeVisibleContentsRefreshUptime: TimeInterval?
     private var visibleContentsReadGeneration: UInt = 0
@@ -127,6 +148,30 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     private var visibleContentsTrailingRefresh: DispatchWorkItem?
     private var deferredInstructionCapture = DeferredInstructionCaptureState()
     private var refreshThrottle = SessionMetadataRefreshThrottle()
+
+    init(
+        processLookup: ProcessLookup? = nil,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) {
+        self.lookupProcess = processLookup ?? Self.startProcessLookup
+        self.now = now
+    }
+
+    private static func startProcessLookup(
+        _ processID: Int32,
+        completion: @escaping @MainActor @Sendable (String?) -> Void
+    ) {
+        processLookupQueue.async {
+            let name = TerminalSessionProcessResolver.foregroundProcessName(startingAt: processID)
+            DispatchQueue.main.async { completion(name) }
+        }
+    }
+
+    private var awaitsProcessIdentity: Bool {
+        guard bindingSource?.sessionMetadataSurfaceID != nil else { return false }
+        guard let processID = bindingSource?.sessionMetadataForegroundPID else { return true }
+        return processID != acceptedProcessID
+    }
 
     var boundSurface: Ghostty.SurfaceView? { surface }
     var requiresPeriodicRefresh: Bool {
@@ -180,6 +225,8 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
         processLookupThrottle.reset()
+        acceptedProcessID = nil
+        pendingProcessActivity = nil
         progressReport = nil
         activityStatus = .ready
         tool = .terminal
@@ -199,25 +246,33 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
                       bindingGeneration == generation else { return }
                 if dynamicTitle != title {
                     dynamicTitle = title
-                    refreshActivityStatus()
+                    titleRevision &+= 1
+                    activityEvent()
                 }
                 titleDidChange(title, bell)
             }
             .store(in: &surfaceCancellables)
 
+        var isInitialProgressSample = true
         nextSource.sessionMetadataProgressPublisher
             .sink { [weak self] incomingReport in
                 guard let self,
                       bindingGeneration == generation else { return }
 
+                let isInitial = isInitialProgressSample
+                isInitialProgressSample = false
+                // A surface retains progress for display after a process exits.
+                // Replay its bootstrap sample only when the PID recorded at
+                // emission still matches; otherwise wait for fresh evidence.
+                if isInitial && awaitsProcessIdentity &&
+                    bindingSource?.sessionMetadataProgressProcessID != bindingSource?.sessionMetadataForegroundPID {
+                    return
+                }
+
                 // Surface progress reports expire for display cleanup. A nil
                 // value is not a protocol-level completion event.
-                progressReport = TerminalSessionActivityClassifier.retainedProgressReport(
-                    current: progressReport,
-                    incoming: incomingReport
-                )
-                guard incomingReport != nil else { return }
-                refreshActivityStatus()
+                guard let incomingReport else { return }
+                activityEvent(progress: incomingReport)
             }
             .store(in: &surfaceCancellables)
 
@@ -288,6 +343,8 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
         processLookupThrottle.reset()
+        acceptedProcessID = nil
+        pendingProcessActivity = nil
         surfaceCancellables.removeAll()
         bindingSource = nil
         surface = nil
@@ -328,68 +385,126 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             defersVisibleContentsRefresh: defersVisibleContentsRefresh
         )
 
-        guard !processLookupIsInFlight,
-              let surface,
-              let pid = surface.surfaceModel?.foregroundPID,
-              let processID = Int32(exactly: pid) else { return }
+        requestProcessLookup()
+    }
 
-        let lookupUptime = ProcessInfo.processInfo.systemUptime
+    /// Events perform only the cheap PID check synchronously. Attribution
+    /// remains off-main and coalesced, while semantic evidence is retained for
+    /// fast rounds that can end before the lookup returns.
+    private func activityEvent(progress: Ghostty.Action.ProgressReport? = nil) {
+        if awaitsProcessIdentity {
+            // An unavailable PID is not evidence of a provider transition. Keep
+            // already-attributed observations, but do not attach this event to
+            // the last PID merely because it was the most recently visible one.
+            guard let processID = bindingSource?.sessionMetadataForegroundPID else { return }
+            preparePendingActivity(processID: processID)
+            if progress != nil { progressTitleRevision = titleRevision }
+            pendingProcessActivity?.observe(
+                title: dynamicTitle, progressReport: progress, observedAt: now()
+            )
+            requestProcessLookup()
+            return
+        }
+
+        pendingProcessActivity = nil
+        if progress != nil { progressTitleRevision = titleRevision }
+        progressReport = TerminalSessionActivityClassifier.retainedProgressReport(
+            current: progressReport, incoming: progress
+        )
+        refreshActivityStatus()
+    }
+
+    private func preparePendingActivity(processID: Int32) {
+        guard pendingProcessActivity?.processID != processID else { return }
+        pendingProcessActivity = SessionPendingProcessActivity(
+            processID: processID, previousTool: tool, previousStatus: activityStatus
+        )
+        progressReport = nil
+        progressTitleRevision = nil
+        instructionCaptureGeneration &+= 1
+        invalidateVisibleContentsReads()
+        deferredInstructionCapture.reset()
+    }
+
+    private func requestProcessLookup() {
+        guard !processLookupIsInFlight,
+              let surfaceID = bindingSource?.sessionMetadataSurfaceID,
+              let processID = bindingSource?.sessionMetadataForegroundPID else { return }
+
+        let lookupUptime = now()
         guard processLookupThrottle.shouldLookup(
             processID: processID,
             now: lookupUptime
         ) else { return }
 
+        if awaitsProcessIdentity {
+            preparePendingActivity(processID: processID)
+        }
+
         processLookupIsInFlight = true
         let request = SessionProcessLookupRequest(
             generation: processLookupGeneration,
-            surfaceID: surface.id,
+            surfaceID: surfaceID,
             processID: processID
         )
 
-        Self.processLookupQueue.async { [weak self] in
-            let processName = TerminalSessionProcessResolver.foregroundProcessName(
-                startingAt: request.processID
-            )
+        lookupProcess(request.processID) { [weak self] processName in
+            guard let self else { return }
+            let currentProcessID = bindingSource?.sessionMetadataForegroundPID
 
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                let currentProcessID = self.surface?.surfaceModel?.foregroundPID
-                    .flatMap { Int32(exactly: $0) }
+            switch request.disposition(
+                currentGeneration: processLookupGeneration,
+                currentSurfaceID: bindingSource?.sessionMetadataSurfaceID,
+                currentProcessID: currentProcessID
+            ) {
+            case .discard:
+                return
+            case .retryCurrentProcess:
+                processLookupIsInFlight = false
+                // The surface stayed bound while its foreground process
+                // changed. Reject the old ancestry result and immediately
+                // resolve the current PID instead of waiting for another tick.
+                refresh()
+                return
+            case .accept:
+                processLookupIsInFlight = false
+            }
 
-                switch request.disposition(
-                    currentGeneration: processLookupGeneration,
-                    currentSurfaceID: self.surface?.id,
-                    currentProcessID: currentProcessID
-                ) {
-                case .discard:
-                    return
-                case .retryCurrentProcess:
-                    processLookupIsInFlight = false
-                    // The surface stayed bound while its foreground process
-                    // changed. Reject the old ancestry result and immediately
-                    // start resolving the current PID instead of waiting for
-                    // the next scheduler tick.
-                    refresh()
-                    return
-                case .accept:
-                    processLookupIsInFlight = false
-                }
-
-                // A transient proc_pidinfo failure must not erase otherwise
-                // stable provider identity. A real exit yields the parent shell
-                // on a later successful poll.
-                if let processName {
-                    processLookupThrottle.accept(
-                        processID: request.processID,
-                        now: ProcessInfo.processInfo.systemUptime
-                    )
-                    if foregroundProcessName != processName {
-                        foregroundProcessName = processName
-                        refreshActivityStatus(allowClaudeSnapshotReuse: false)
-                    }
-                }
+            // Transient proc_* failures keep the buffered evidence for retry.
+            // A successful ordinary-shell result clears provider attention.
+            if let processName {
+                processLookupThrottle.accept(processID: request.processID, now: now())
+                acceptProcessIdentity(processName, processID: request.processID)
             }
         }
+    }
+
+    private func acceptProcessIdentity(_ name: String, processID: Int32) {
+        let pending = pendingProcessActivity?.processID == processID ? pendingProcessActivity : nil
+        pendingProcessActivity = nil
+        acceptedProcessID = processID
+        let changed = foregroundProcessName != name
+        if changed { foregroundProcessName = name }
+        guard changed || pending != nil else { return }
+
+        // Settle the provider without emitting a speculative intermediate
+        // completion or approval. Replay only the last round's minimal evidence,
+        // never old titles or historical instruction-capture work.
+        refreshActivityStatus(allowClaudeSnapshotReuse: false, publishesSnapshot: false)
+        var replayObservedActivity = false
+        if let pending {
+            progressReport = pending.retainedProgress(for: tool)
+            // Preserve the report until a subsequent title signal, rather
+            // than letting the unchanged spinner undo a fresh completion.
+            if progressReport != nil { progressTitleRevision = titleRevision }
+            for snapshot in pending.replay(for: tool) {
+                replayObservedActivity = replayObservedActivity || snapshot.status == .active
+                activityStatus = snapshot.status
+                activitySnapshot = snapshot
+            }
+        }
+        refreshActivityStatus(allowClaudeSnapshotReuse: false)
+        if replayObservedActivity { scheduleLastInstructionCapture() }
     }
 
     private func clear(
@@ -400,6 +515,8 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         processLookupGeneration &+= 1
         processLookupIsInFlight = false
         processLookupThrottle.reset()
+        acceptedProcessID = nil
+        pendingProcessActivity = nil
         surfaceCancellables = []
         bindingSource = nil
         surface = nil
@@ -625,6 +742,7 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     }
 
     private func captureLastInstruction() {
+        guard !awaitsProcessIdentity else { return }
         let detectedTool = TerminalSessionTool.detect(
             fromDynamicTitle: dynamicTitle,
             foregroundProcessName: foregroundProcessName
@@ -805,11 +923,15 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
     private func refreshActivityStatus(
         allowClaudeSnapshotReuse: Bool = false,
         defersVisibleContentsRefresh: Bool = false,
-        providedClaudeAnalysis: TerminalSessionVisibleContentsAnalysis? = nil
+        providedClaudeAnalysis: TerminalSessionVisibleContentsAnalysis? = nil,
+        publishesSnapshot: Bool = true
     ) {
+        // Cached provider identity must never label a new PID's events. A
+        // shell/editor can emit the same generic OSC progress as an agent.
+        guard !awaitsProcessIdentity else { return }
         // Every path, including a deferred screen read after a provider change,
         // publishes only the final coherent pair. Async reads reenter here.
-        defer { publishActivitySnapshot() }
+        defer { if publishesSnapshot { publishActivitySnapshot() } }
 
         let detectedTool = TerminalSessionTool.detect(
             fromDynamicTitle: dynamicTitle,
@@ -880,7 +1002,8 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
         // provider signal starts a new turn even if the surface still retains
         // its previous remove/error report during display cleanup.
         if let report = currentProgressReport,
-           report.state == .remove || report.state == .error {
+           report.state == .remove || report.state == .error,
+           progressTitleRevision != titleRevision || currentAnalysis?.requiresUserInput == true {
             let providerStatus = TerminalSessionActivityClassifier.status(
                 tool: detectedTool,
                 dynamicTitle: dynamicTitle,
@@ -906,8 +1029,8 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             activityStatus = nextStatus
         }
 
-        if (previousStatus != .active && nextStatus == .active) ||
-            (previousStatus == .active && nextStatus != .active) {
+        if publishesSnapshot && ((previousStatus != .active && nextStatus == .active) ||
+            (previousStatus == .active && nextStatus != .active)) {
             scheduleLastInstructionCapture()
         }
     }
@@ -917,7 +1040,7 @@ final class TerminalSessionMetadataMonitor: ObservableObject {
             tool: tool,
             status: activityStatus
         )
-        if activitySnapshot != snapshot {
+        if activitySnapshot.tool != snapshot.tool || activitySnapshot.status != snapshot.status {
             activitySnapshot = snapshot
         }
     }
