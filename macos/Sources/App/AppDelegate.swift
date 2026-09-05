@@ -260,6 +260,7 @@ class AppDelegate: NSObject,
 
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
+        SessionAttentionCoordinator.shared.startRendering()
         // System settings overrides
         UserDefaults.ghostty.register(defaults: [
             // Disable this so that repeated key events make it through to our terminal views.
@@ -607,6 +608,7 @@ class AppDelegate: NSObject,
 
     @MainActor
     func applicationWillTerminate(_ notification: Notification) {
+        SessionAttentionCoordinator.shared.stop()
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.
@@ -1071,6 +1073,7 @@ class AppDelegate: NSObject,
     private func updateAppIcon(from config: Ghostty.Config) {
         Task.detached {
             await self.appIconUpdater.update(icon: AppIcon(config: config))
+            await SessionAttentionCoordinator.shared.refreshIcon()
         }
     }
 

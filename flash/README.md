@@ -42,6 +42,11 @@ FLASH-Ghostty owns signing and update-feed infrastructure.
 - [2026-09-04 integration](upstream-sync/2026-09-04.md): compatibility decisions,
   regression coverage, and validation status for the latest upstream sync.
 
+## Feature implementation notes
+
+- [Agent-session Dock attention](session-attention.md): incremental design,
+  clearing rules, monitoring boundaries, and regression coverage.
+
 ## Signed release-candidate runbook
 
 The fork workflow builds, signs, notarizes, staples, and verifies a universal

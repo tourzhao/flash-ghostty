@@ -87,6 +87,28 @@ Activity indicators are deliberately observational. FLASH-Ghostty uses local
 process, title, progress, and terminal-content evidence; it does not require a
 Codex or Claude account integration and does not claim to control the agent.
 
+### Dock reminders for agent sessions
+
+On macOS, a red badge at the **upper-left** of the Dock icon counts sessions
+that need attention from Codex or Claude Code. Each tab counts once, even when
+several of its split panes need attention. The quick terminal is another session.
+
+- A completed turn creates an unread reminder after a one-second stability
+  check. Focusing that pane in the active app clears its completion reminder.
+- An observed approval/input prompt is shown immediately. Viewing it does not
+  clear it; the agent must resume or leave the waiting state.
+- Background tabs, unfocused splits, and hidden sidebars remain monitored at
+  a reduced polling rate. Closing a pane removes its reminder.
+- Zero hides the badge; counts above 99 display `99+`. Existing terminal-bell
+  badges and custom app icons remain independent.
+
+These reminders reuse the observational activity signals described above, not
+official agent hooks. In particular, Claude's text-based prompts can be missed
+or misclassified when its interface changes or old prompt text remains visible.
+Output silence, progress reaching 100%, and progress-display timeouts do not by
+themselves mean a turn is complete. Counts stay in memory and reset on relaunch;
+no notification permission, agent credentials, or outbound service is required.
+
 ### A Finder-style file browser tied to each session
 
 Open the file sidebar to browse the selected session's shell-reported working
