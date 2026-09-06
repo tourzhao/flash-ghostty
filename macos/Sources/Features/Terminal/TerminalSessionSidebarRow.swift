@@ -35,6 +35,7 @@ struct TerminalSessionSidebarRow: View {
     @State private var isHovered = false
     @State private var isRenaming = false
     @State private var draftTitle = ""
+    @State private var attentionSummary = SessionAttentionSummary()
     @FocusState private var isRenameFieldFocused: Bool
 
     init(
@@ -85,6 +86,19 @@ struct TerminalSessionSidebarRow: View {
         min(12, max(9, fontSize * 0.75))
     }
 
+    private var attentionPresentation: TerminalSessionAttentionPresentation? {
+        TerminalSessionAttentionPresentation(summary: attentionSummary)
+    }
+
+    private var attentionAccentColor: Color {
+        attentionPresentation?.accentColor ?? .clear
+    }
+
+    private var sessionNameColor: Color {
+        if attentionSummary.needsAttention { return .primary }
+        return isSelected ? sessionAccentColor : .secondary
+    }
+
     private var sessionAccentColor: Color {
         switch sessionTool {
         case .codex:
@@ -99,6 +113,9 @@ struct TerminalSessionSidebarRow: View {
     }
 
     private var rowBackground: Color {
+        if attentionSummary.needsAttention {
+            return attentionAccentColor.opacity(isSelected ? 0.18 : (isHovered ? 0.14 : 0.10))
+        }
         if isSelected {
             return sessionAccentColor.opacity(0.20)
         }
@@ -152,39 +169,45 @@ struct TerminalSessionSidebarRow: View {
         .contextMenu { contextMenu }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(rowIdentifier)
+        .onReceive(SessionAttentionCoordinator.shared.attentionUpdates(for: sessionController.sessionID.rawValue)) {
+            if attentionSummary != $0 { attentionSummary = $0 }
+        }
     }
 
     @ViewBuilder
     private var sessionNameControl: some View {
         if isRenaming {
             VStack(alignment: .leading, spacing: 3) {
-                TextField("Session name", text: $draftTitle)
-                    .textFieldStyle(.plain)
-                    // Session names commonly contain commands, paths, and
-                    // product names. Inline prediction can alter whitespace
-                    // while the adjacent save button ends editing.
-                    .autocorrectionDisabled()
-                    .font(.system(size: sessionNameFontSize, weight: .regular))
-                    .focused($isRenameFieldFocused)
-                    .onSubmit {
-                        commitRename(restoreTerminalFocus: true)
-                    }
-                    .onExitCommand {
-                        cancelRename(restoreTerminalFocus: true)
-                    }
-                    .padding(.horizontal, 6)
-                    .frame(height: 22)
-                    .background(
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(Color(nsColor: .textBackgroundColor))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 5)
-                            .strokeBorder(sessionAccentColor.opacity(0.75), lineWidth: 1)
-                    )
-                    .accessibilityLabel("Session Name")
-                    .accessibilityHint("Leave blank to display Blank in the sidebar")
-                    .accessibilityIdentifier("\(rowIdentifier).name-field")
+                HStack(spacing: 6) {
+                    TextField("Session name", text: $draftTitle)
+                        .textFieldStyle(.plain)
+                        // Session names commonly contain commands, paths, and
+                        // product names. Inline prediction can alter whitespace
+                        // while the adjacent save button ends editing.
+                        .autocorrectionDisabled()
+                        .font(.system(size: sessionNameFontSize, weight: .regular))
+                        .focused($isRenameFieldFocused)
+                        .onSubmit {
+                            commitRename(restoreTerminalFocus: true)
+                        }
+                        .onExitCommand {
+                            cancelRename(restoreTerminalFocus: true)
+                        }
+                        .padding(.horizontal, 6)
+                        .frame(height: 22)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(Color(nsColor: .textBackgroundColor))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 5)
+                                .strokeBorder(sessionAccentColor.opacity(0.75), lineWidth: 1)
+                        )
+                        .accessibilityLabel("Session Name")
+                        .accessibilityHint("Leave blank to display Blank in the sidebar")
+                        .accessibilityIdentifier("\(rowIdentifier).name-field")
+                    attentionBadge
+                }
 
                 HStack(spacing: 10) {
                     sessionIcon
@@ -197,12 +220,18 @@ struct TerminalSessionSidebarRow: View {
                 hostController.selectSessionFromSidebar(sessionController)
             } label: {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
-                        .font(.system(size: sessionNameFontSize, weight: .regular))
-                        .foregroundStyle(isSelected ? sessionAccentColor : .secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.system(
+                                size: sessionNameFontSize,
+                                weight: attentionSummary.needsAttention ? .semibold : .regular
+                            ))
+                            .foregroundStyle(sessionNameColor)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        attentionBadge
+                    }
 
                     HStack(spacing: 10) {
                         sessionIcon
@@ -213,13 +242,24 @@ struct TerminalSessionSidebarRow: View {
             }
             .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .help("\(title)\n\(instruction)")
+            .help(
+                [title, attentionPresentation?.accessibilityDescription, instruction]
+                    .compactMap { $0 }.joined(separator: "\n")
+            )
             .accessibilityLabel("Select \(title)")
             .accessibilityValue(
                 accessibilityValue
             )
             .accessibilityHint("Select session")
             .accessibilityIdentifier("\(rowIdentifier).select")
+        }
+    }
+
+    @ViewBuilder
+    private var attentionBadge: some View {
+        if let presentation = attentionPresentation {
+            TerminalSessionAttentionBadge(presentation: presentation, fontSize: sessionNameFontSize)
+                .accessibilityIdentifier("\(rowIdentifier).attention")
         }
     }
 
@@ -238,6 +278,9 @@ struct TerminalSessionSidebarRow: View {
         var parts: [String] = []
         if isSelected { parts.append("Selected") }
         parts.append(activityStatusLabel)
+        if let attentionPresentation {
+            parts.append(attentionPresentation.accessibilityDescription)
+        }
         parts.append("Last instruction: \(instruction)")
         return parts.joined(separator: ", ")
     }
@@ -507,5 +550,41 @@ struct TerminalSessionSidebarRow: View {
                 hostController.restoreTerminalFocusAfterSidebarRename()
             }
         }
+    }
+}
+
+extension TerminalSessionAttentionPresentation {
+    var accentColor: Color {
+        switch self {
+        case .unreadCompletion: return Color(nsColor: .systemGreen)
+        case .needsInput: return Color(nsColor: .systemOrange)
+        }
+    }
+}
+
+/// The same badge used in sidebar rows and isolated visual validation.
+struct TerminalSessionAttentionBadge: View {
+    let presentation: TerminalSessionAttentionPresentation
+    /// The row's computed 9...12 pt name size; the badge caps it at 10 pt.
+    let fontSize: Double
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: presentation.systemImage)
+                .foregroundStyle(presentation.accentColor)
+            Text(presentation.label)
+                .foregroundStyle(.primary)
+        }
+        .font(.system(size: min(10, fontSize), weight: .semibold))
+        .lineLimit(1)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Capsule().fill(presentation.accentColor.opacity(0.20)))
+        .overlay(Capsule().strokeBorder(presentation.accentColor.opacity(0.70), lineWidth: 1))
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
+        .help(presentation.accessibilityDescription)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.accessibilityDescription)
     }
 }

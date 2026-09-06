@@ -12,6 +12,7 @@ final class SessionAttentionCoordinator {
     private var reconciliationWork: DispatchWorkItem?
     private var notifications: Set<AnyCancellable> = []
     private var renderer: SessionAttentionDockRenderer?
+    private let attentionStore = SessionAttentionStore()
     private var isStopped = false
 
     private struct WeakSurface {
@@ -21,7 +22,8 @@ final class SessionAttentionCoordinator {
     private lazy var tracker = SessionAttentionTracker(
         makeSource: { [weak self] id in self?.makeSource(for: id) },
         isViewed: { [weak self] id in self?.isViewed(id) == true },
-        countDidChange: { [weak self] count in self?.renderer?.update(count: count) }
+        countDidChange: { [weak self] count in self?.renderer?.update(count: count) },
+        summariesDidChange: { [weak self] summaries in self?.attentionStore.update(summaries) }
     )
 
     private init() {
@@ -43,6 +45,10 @@ final class SessionAttentionCoordinator {
 
     func refreshIcon() {
         renderer?.refreshIcon()
+    }
+
+    func attentionUpdates(for sessionID: UUID) -> AnyPublisher<SessionAttentionSummary, Never> {
+        attentionStore.updates(for: sessionID)
     }
 
     func register(_ controller: BaseTerminalController) {

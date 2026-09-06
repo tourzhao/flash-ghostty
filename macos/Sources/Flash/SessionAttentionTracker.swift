@@ -28,9 +28,11 @@ final class SessionAttentionTracker {
     private var deadlineWork: DispatchWorkItem?
     private var scheduledDeadline: TimeInterval?
     private var publishedCount = 0
+    private var publishedSummaries: [UUID: SessionAttentionSummary] = [:]
     private let makeSource: (UUID) -> (any SessionAttentionSource)?
     private let isViewed: (UUID) -> Bool
     private let countDidChange: (Int) -> Void
+    private let summariesDidChange: ([UUID: SessionAttentionSummary]) -> Void
     private let now: () -> TimeInterval
     private let automaticallySchedule: Bool
 
@@ -38,17 +40,20 @@ final class SessionAttentionTracker {
         makeSource: @escaping (UUID) -> (any SessionAttentionSource)?,
         isViewed: @escaping (UUID) -> Bool,
         countDidChange: @escaping (Int) -> Void,
+        summariesDidChange: @escaping ([UUID: SessionAttentionSummary]) -> Void = { _ in },
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         automaticallySchedule: Bool = true
     ) {
         self.makeSource = makeSource
         self.isViewed = isViewed
         self.countDidChange = countDidChange
+        self.summariesDidChange = summariesDidChange
         self.now = now
         self.automaticallySchedule = automaticallySchedule
     }
 
     var count: Int { state.count }
+    var sessionSummaries: [UUID: SessionAttentionSummary] { state.sessionSummaries }
 
     func reconcile(owners: [UUID: UUID]) {
         state.reconcile(owners: owners)
@@ -126,8 +131,16 @@ final class SessionAttentionTracker {
     }
 
     private func publishAndSchedule() {
-        if publishedCount != state.count {
-            publishedCount = state.count
+        let summaries = state.sessionSummaries
+        if publishedSummaries != summaries {
+            publishedSummaries = summaries
+            summariesDidChange(summaries)
+        }
+        // A summary consumer may synchronously acknowledge or remove a pane.
+        // Read the current state after delivery rather than publishing an old count.
+        let count = state.count
+        if publishedCount != count {
+            publishedCount = count
             countDidChange(publishedCount)
         }
         guard automaticallySchedule, scheduledDeadline != state.nextDeadline else { return }

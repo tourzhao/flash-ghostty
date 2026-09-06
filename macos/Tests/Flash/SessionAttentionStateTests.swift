@@ -4,6 +4,15 @@ import Testing
 
 @Suite
 struct SessionAttentionStateTests {
+    @Test(arguments: [false, true], [false, true])
+    func summaryNeedsAttentionForEitherReason(hasUnreadCompletion: Bool, needsInput: Bool) {
+        var summary = SessionAttentionSummary()
+        #expect(!summary.needsAttention)
+        summary.hasUnreadCompletion = hasUnreadCompletion
+        summary.needsInput = needsInput
+        #expect(summary.needsAttention == (hasUnreadCompletion || needsInput))
+    }
+
     @Test(arguments: [TerminalSessionTool.codex, .claudeCode])
     func unobservedCompletionDoesNotCreateAttention(tool: TerminalSessionTool) {
         let surface = UUID()
@@ -22,18 +31,23 @@ struct SessionAttentionStateTests {
     @Test(arguments: [TerminalSessionTool.codex, .claudeCode])
     func completionNeedsAnObservedRoundAndTheFullDelay(tool: TerminalSessionTool) {
         let surface = UUID()
-        var state = makeState(surface: surface)
+        let session = UUID()
+        var state = makeState(surface: surface, session: session)
         state.update(surfaceID: surface, tool: tool, status: .active, isViewed: false, now: 10)
         #expect(state.count == 0)
+        #expect(state.sessionSummaries.isEmpty)
         #expect(state.nextDeadline == nil)
 
         state.update(surfaceID: surface, tool: tool, status: .completed, isViewed: false, now: 11)
         #expect(state.count == 0)
+        #expect(state.sessionSummaries.isEmpty)
         #expect(state.nextDeadline == 12)
         state.advance(to: 11.999)
         #expect(state.count == 0)
+        #expect(state.sessionSummaries.isEmpty)
         state.advance(to: 12)
         #expect(state.count == 1)
+        #expect(state.sessionSummaries == [session: .init(hasUnreadCompletion: true)])
         #expect(state.nextDeadline == nil)
         state.advance(to: 100)
         #expect(state.count == 1)
@@ -239,13 +253,17 @@ struct SessionAttentionStateTests {
         state.update(surfaceID: approval, tool: .claudeCode, status: .paused, isViewed: false, now: 1)
         state.advance(to: 2)
         #expect(state.count == 1)
+        #expect(state.sessionSummaries == [session: .init(hasUnreadCompletion: true, needsInput: true)])
 
         state.markViewed(surfaceID: first)
         #expect(state.count == 1)
+        #expect(state.sessionSummaries == [session: .init(hasUnreadCompletion: true, needsInput: true)])
         state.update(surfaceID: approval, tool: .claudeCode, status: .ready, isViewed: true, now: 3)
         #expect(state.count == 1)
+        #expect(state.sessionSummaries == [session: .init(hasUnreadCompletion: true)])
         state.markViewed(surfaceID: second)
         #expect(state.count == 0)
+        #expect(state.sessionSummaries.isEmpty)
     }
 
     @Test
@@ -264,12 +282,19 @@ struct SessionAttentionStateTests {
         #expect(state.nextDeadline == 2)
         state.advance(to: 2)
         #expect(state.count == 2)
+        #expect(state.sessionSummaries == [
+            movedSession: .init(hasUnreadCompletion: true),
+            originalSession: .init(needsInput: true),
+        ])
         state.reconcile(owners: [first: originalSession, second: originalSession])
         #expect(state.count == 1)
+        #expect(state.sessionSummaries == [originalSession: .init(hasUnreadCompletion: true, needsInput: true)])
         state.reconcile(owners: [first: movedSession])
         #expect(state.count == 1)
+        #expect(state.sessionSummaries == [movedSession: .init(hasUnreadCompletion: true)])
         state.markViewed(surfaceID: first)
         #expect(state.count == 0)
+        #expect(state.sessionSummaries.isEmpty)
     }
 
     @Test
@@ -348,9 +373,9 @@ struct SessionAttentionStateTests {
         #expect(state.nextDeadline == nil)
     }
 
-    private func makeState(surface: UUID) -> SessionAttentionState {
+    private func makeState(surface: UUID, session: UUID = UUID()) -> SessionAttentionState {
         var state = SessionAttentionState()
-        state.reconcile(owners: [surface: UUID()])
+        state.reconcile(owners: [surface: session])
         return state
     }
 }

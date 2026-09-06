@@ -1,4 +1,4 @@
-# Agent-session Dock attention
+# Agent-session attention
 
 ## Incremental implementation
 
@@ -17,6 +17,9 @@
 5. Resolve changed foreground PIDs on title/progress events without waiting
    for the background tick. Retain a bounded, process-scoped reduction of the
    latest round while asynchronous provider discovery is pending.
+6. Project the same unread/input state into per-session sidebar summaries.
+   Fan out only changed values to each row; do not add a second detector,
+   acknowledgement path, timer, or persisted preference.
 
 ## Policy
 
@@ -61,13 +64,40 @@ lose its pending evidence. Events with no readable foreground PID are ignored
 rather than guessed. These are best-effort observational reminders, not a
 guarantee that every agent completion or approval will be detected.
 
+## Sidebar cues
+
+- Unread completed results use a green `Unread` text/icon pill, a semibold
+  session title, and a subtle green row background.
+- Pending approval/input uses an orange `Needs input` text/icon pill and
+  orange row background. Viewing the session alone does not dismiss it.
+- If different panes in one session need attention for both reasons, input
+  takes visual priority. The Dock still counts the session only once.
+- Viewing a completed pane clears its unread reason. Another unread or
+  input-waiting pane can keep the session highlighted. Once no pane needs
+  attention, the row returns to its ordinary appearance.
+
+The selected-row outline and leading stripe remain visible. Rows never flash
+or reorder because of attention. Text, symbols, tooltips, and accessibility
+descriptions supplement color. The compact labels use English, matching the
+existing sidebar controls.
+
+The metadata icon's `Complete` activity status is not an unread flag: it can
+remain after acknowledgement. Prominent cues instead use the same mature
+unread/input state that contributes to the Dock count. Reason changes and
+ownership moves update the affected rows even when the total count is unchanged.
+
 ## Regression coverage
 
 - `SessionAttentionStateTests`: pure transition, de-duplication, time,
   acknowledgement, transfer, close, and stale-event cases.
 - `SessionAttentionTrackerTests`: subscriptions, source replacement, teardown
   callbacks, pane-specific viewing, deadline visibility checks, and delayed
-  completion acknowledgement across focus changes.
+  completion acknowledgement across focus changes; summary updates at a stable
+  count, mixed split reasons, and stopping during synchronous summary delivery.
+- `SessionAttentionStoreTests`: immediate per-session state, deduplication,
+  ownership changes, clearing, and subscription cancellation.
+- `SessionAttentionSidebarTests`: no cue for acknowledged state, explicit text
+  and symbol mapping, and input priority over unread completion.
 - `SessionAttentionMetadataPollingTests` and
   `SessionAttentionMetadataSnapshotTests`: opt-in background scheduling,
   atomic provider changes, duplicate/expired progress, stopped sources.
@@ -148,3 +178,105 @@ cleaned; the verified new candidate app was copied back to
 `macos/build/ReleaseLocal`.
 This is why isolated validation must use a fresh `--build-dir`, not just a
 products-directory override.
+
+### GUI acceptance follow-up on 2026-09-05
+
+- A dedicated arm64 ReleaseLocal candidate at `8646f7305` was built with fresh
+  DerivedData and a recognized `.debug.ui-tests.run-` bundle identity, keeping
+  the app and Dock helper in the same isolated defaults domain.
+- Real Codex 0.153.4 ran a harmless `sleep 4` instruction. Its background
+  sidebar state changed from Active to Complete; subsequently opening the
+  session confirmed the command result and `DOCK-COMPLETE` reply. This verifies
+  the visible provider state, **not** the system Dock count or acknowledgement.
+- A first harmless approval probe executed without an observable approval
+  prompt. A new read-only test invocation with `approvals_reviewer="user"`
+  produced a real, pending one-time `printf` approval. The sidebar showed
+  Needs input while selected, after switching away, and after returning.
+  The user confirmed an actual red Dock badge showing 1 at this pending
+  approval checkpoint, after the session had been revisited. A one-time
+  approval then produced the expected command output and `DOCK-APPROVED`;
+  the selected session changed from Needs input to Active to Complete.
+  The user confirmed that the badge disappeared after the approved command
+  completed in the viewed pane. This visually verifies pending approval 1
+  through one-time approval to viewed completion with no badge; the exact
+  clearing point during the transient Active state was not observed.
+  No persistent command-prefix approval or global approval configuration
+  was changed.
+- A later round in QA Approval changed from Active to Complete while that
+  session was in the background. The user observed the actual red Dock badge
+  showing 1, then confirmed that clicking the corresponding session cleared
+  it. This passes user-assisted acceptance of single-session background
+  completion display and acknowledgement. It does not retroactively verify
+  the Dock state of the earlier `DOCK-COMPLETE` round.
+- Two later background Codex rounds produced a user-observed Dock count of 2;
+  both actual final replies were subsequently verified. The user's clearing
+  report did not establish the intermediate count after visiting only one
+  session, so that first report alone did not verify ordered clearing or
+  establish a bug.
+  A controlled recheck completed two new background rounds and opened only
+  QA Codex. The user confirmed that Dock 1 remained for the other unread
+  session, so cross-session clearing was not reproduced. The remaining
+  QA Approval session was then opened and its actual final reply verified;
+  the user confirmed that the last badge disappeared. Together these checks
+  verify a count of two and independent per-session acknowledgement. They are
+  not one continuously captured `2 -> 1 -> 0` trace: the recheck's initial
+  count of 2 was not separately captured.
+- Claude Code 2.1.59 reached its first-run login-method screen. No account
+  login or paid-service selection was performed; real Claude completion and
+  approval acceptance remains pending authentication.
+- Added explicit accessibility getter assertions for the Dock view's initial
+  role/label and count updates (including unclipped 100 and nonpositive counts).
+  All 10 renderer tests passed against the previously verified production Debug
+  dylib, without production stubs. Scoped strict SwiftLint passed with zero
+  violations. Production code was unchanged; the combined 128-test suite was
+  not rerun in this follow-up.
+- Added a two-session Tracker regression: two unread completions count as 2;
+  viewing one leaves 1 through repeated visibility refreshes and duplicate
+  completion updates; viewing the other clears it. All 14 Tracker tests passed
+  against the same real production Debug dylib. Scoped strict SwiftLint and
+  `git diff --check` passed. No production implementation was changed.
+
+Computer-use window inspection works but has intermittent long delays;
+automated Dock inspection remains unavailable. User observation confirms the
+single pending-approval badge and its absence after one-time approval and
+viewed completion, as well as a later single-session background-completion
+badge and its clearance after selecting that session. A two-session count of
+2 was also observed; a controlled recheck confirmed one reminder remains after
+viewing only one session, and disappears after viewing the remaining session.
+Real Claude behavior, custom-icon switching, and quit/relaunch
+scenarios remain unverified.
+These observations do not qualify the candidate for a stable release.
+
+### Sidebar prominence follow-up on 2026-09-05
+
+- Added the sidebar cues described above using the Dock tracker's per-session
+  unread/input summaries. Detection, completion delay, acknowledgement rules,
+  session ordering, and saved preferences are unchanged.
+- An isolated arm64 Debug app and all test targets passed `build-for-testing`
+  with a fresh build directory and recognized `.debug.ui-tests.run-` identity.
+  The initial sandboxed attempt failed in Xcode's icon asset compiler; the
+  normal-permission retry succeeded without source or asset workarounds.
+- 142 tests in 25 suites passed against this new production Debug module and
+  dylib, including state, tracker, store, sidebar presentation, Dock renderer,
+  and process-attribution regressions. Only the two existing full-app/view
+  initialization tests, `metadataInvalidationDoesNotInvalidateTheTerminalController`
+  and `glassAvailability`, were explicitly excluded. The GUI-hosted suite was
+  not executed and production classes were not replaced with stubs.
+- Scoped strict SwiftLint passed with zero violations across all 11 changed
+  Swift source/test files. Independent code review found no blocking issue in
+  this increment.
+- Rendered the actual production `TerminalSessionAttentionBadge` offscreen in
+  light and dark mode at 9, 9.75, and 12 pt row-name sizes. All 12 combinations
+  fit the checked bounds; the longest pill was 88 x 17 pt (the badge font caps
+  at 10 pt). Both preview sheets were visually inspected with no clipped text
+  or symbols. This validates the badge component, not complete sidebar layout,
+  inline renaming, or live end-to-end interaction.
+- Deep strict app signature verification and command-line version startup
+  passed. Critical file hashes of both previously running test apps remained
+  unchanged. Neither app was restarted or overwritten; no new Codex/Claude
+  prompts, account settings, or macOS security settings were used or changed.
+
+The earlier human-assisted Dock acceptance applies to the pre-sidebar
+candidate, not this new build. Complete sidebar GUI acceptance (including the
+minimum width, inline renaming, and per-pane clearing) remains to be performed.
+This increment is a local test candidate, not an installed or published release.

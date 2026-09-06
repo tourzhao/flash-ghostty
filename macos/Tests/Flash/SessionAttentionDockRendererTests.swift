@@ -26,6 +26,28 @@ struct SessionAttentionDockRendererTests {
     }
 
     @Test
+    func accessibilityDescribesInitialAndUpdatedAttentionCounts() {
+        let view = SessionAttentionDockView(
+            frame: NSRect(x: 0, y: 0, width: 128, height: 128),
+            icon: nil,
+            count: 1
+        )
+        #expect(view.isAccessibilityElement())
+        #expect(view.accessibilityRole() == .image)
+        #expect(view.accessibilityLabel() == "1 sessions need attention")
+
+        view.count = 100
+        #expect(view.isAccessibilityElement())
+        #expect(view.accessibilityRole() == .image)
+        #expect(view.accessibilityLabel() == "100 sessions need attention")
+
+        view.count = 0
+        #expect(view.accessibilityLabel() == "0 sessions need attention")
+        view.count = -1
+        #expect(view.accessibilityLabel() == "0 sessions need attention")
+    }
+
+    @Test
     func installsTransientViewAndRestoresDefaultWithoutTouchingBellBadge() throws {
         let tile = RecordingDockTile()
         let icon = NSImage(size: NSSize(width: 128, height: 128))

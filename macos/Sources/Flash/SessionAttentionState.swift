@@ -1,5 +1,14 @@
 import Foundation
 
+/// The same session-level reasons drive both the Dock count and sidebar cues.
+/// A session can contain an unread completion and an approval in different panes.
+struct SessionAttentionSummary: Equatable {
+    var hasUnreadCompletion = false
+    var needsInput = false
+
+    var needsAttention: Bool { hasUnreadCompletion || needsInput }
+}
+
 /// Tracks attention for live agent panes, counting each owning session once.
 /// Time and visibility come from the caller so this state has no UI or timer
 /// dependencies and can be reconciled before handling asynchronous callbacks.
@@ -16,11 +25,12 @@ struct SessionAttentionState {
         var approval = false
         var completion: Completion = .none
 
-        var needsAttention: Bool {
-            if approval { return true }
+        var hasUnreadCompletion: Bool {
             if case .unread = completion { return true }
             return false
         }
+
+        var needsAttention: Bool { approval || hasUnreadCompletion }
     }
 
     private let completionDelay: TimeInterval
@@ -32,12 +42,20 @@ struct SessionAttentionState {
         self.completionDelay = completionDelay
     }
 
-    var count: Int {
-        var sessions: Set<UUID> = []
+    var count: Int { sessionSummaries.count }
+
+    /// Excludes delayed completions and sessions that no longer need attention.
+    /// Multiple panes contribute reasons, not additional session counts.
+    var sessionSummaries: [UUID: SessionAttentionSummary] {
+        var sessions: [UUID: SessionAttentionSummary] = [:]
         for (surfaceID, state) in surfaces where state.needsAttention {
-            if let owner = owners[surfaceID] { sessions.insert(owner) }
+            guard let owner = owners[surfaceID] else { continue }
+            var summary = sessions[owner] ?? SessionAttentionSummary()
+            summary.hasUnreadCompletion = summary.hasUnreadCompletion || state.hasUnreadCompletion
+            summary.needsInput = summary.needsInput || state.approval
+            sessions[owner] = summary
         }
-        return sessions.count
+        return sessions
     }
 
     var nextDeadline: TimeInterval? {
