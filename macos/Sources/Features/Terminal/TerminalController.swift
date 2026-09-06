@@ -79,6 +79,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     var sessionID: SessionWorkspace.SessionID {
         flashSessionTabCoordinator.sessionID
     }
+
+    override var sessionAttentionID: UUID { sessionID.rawValue }
     var sessionTabGroupAdapter: NativeTabGroupAdapter {
         flashSessionTabCoordinator.adapter
     }

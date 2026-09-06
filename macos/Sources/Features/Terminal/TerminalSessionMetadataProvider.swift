@@ -1,3 +1,5 @@
+import Foundation
+
 enum TerminalSessionTool: Equatable, Hashable, Sendable {
     case codex
     case claudeCode
@@ -14,4 +16,23 @@ enum TerminalSessionActivityStatus: Equatable, Sendable {
     case paused
     case completed
     case failed
+}
+
+/// A coherent provider/activity value for consumers that must not observe one
+/// provider's status paired with another provider during a binding transition.
+struct TerminalSessionActivitySnapshot: Equatable, Sendable {
+    let tool: TerminalSessionTool
+    let status: TerminalSessionActivityStatus
+    /// Original monotonic observation time when provider discovery delays delivery.
+    let observedAt: TimeInterval?
+
+    init(
+        tool: TerminalSessionTool,
+        status: TerminalSessionActivityStatus,
+        observedAt: TimeInterval? = nil
+    ) {
+        self.tool = tool
+        self.status = status
+        self.observedAt = observedAt
+    }
 }

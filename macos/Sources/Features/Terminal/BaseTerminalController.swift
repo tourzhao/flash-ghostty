@@ -79,6 +79,10 @@ class BaseTerminalController: NSWindowController,
     /// observe this narrow model directly so frequent provider/title updates do
     /// not invalidate the terminal controller's entire SwiftUI root.
     let sessionMetadata = TerminalSessionMetadataMonitor()
+    private let attentionIdentity = UUID()
+    /// Normal tabs override this with their workspace identity. Quick terminals
+    /// still form one logical attention session, including all their splits.
+    var sessionAttentionID: UUID { attentionIdentity }
     var sessionDynamicTitle: String { sessionMetadata.dynamicTitle }
     var sessionForegroundProcessName: String? { sessionMetadata.foregroundProcessName }
     var sessionTool: TerminalSessionTool { sessionMetadata.tool }
@@ -252,9 +256,14 @@ class BaseTerminalController: NSWindowController,
         self.eventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.flagsChanged]
         ) { [weak self] event in self?.localEventHandler(event) }
+
+        SessionAttentionCoordinator.shared.register(self)
     }
 
     deinit {
+        // Do not retain or escape a deinitializing controller. The registry is
+        // weak; reconcile its remaining members on the main actor instead.
+        Task { @MainActor in SessionAttentionCoordinator.shared.surfacesDidChange() }
         NotificationCenter.default.removeObserver(self)
         undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
@@ -370,6 +379,7 @@ class BaseTerminalController: NSWindowController,
     ///
     /// Subclasses should call super first.
     func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+        SessionAttentionCoordinator.shared.surfacesDidChange()
         for surfaceView in from where !to.contains(surfaceView) {
             cancelPendingClipboardConfirmation(for: surfaceView)
         }
@@ -406,6 +416,7 @@ class BaseTerminalController: NSWindowController,
         if let newlyFocused {
             presentPendingClipboardConfirmation(for: newlyFocused)
         }
+        SessionAttentionCoordinator.shared.refreshVisibility()
     }
 
     // Call this whenever the frame changes
@@ -1344,6 +1355,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     func windowWillClose(_ notification: Notification) {
+        SessionAttentionCoordinator.shared.unregister(self)
         guard let window else { return }
 
         for surfaceView in surfaceTree {

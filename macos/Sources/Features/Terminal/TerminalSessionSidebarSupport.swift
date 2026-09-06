@@ -67,6 +67,46 @@ enum TerminalSessionName {
     }
 }
 
+/// Presentation only: unread and input state come from the shared attention
+/// tracker, not from the sidebar's latest metadata status.
+enum TerminalSessionAttentionPresentation: Equatable {
+    case unreadCompletion
+    case needsInput
+
+    init?(summary: SessionAttentionSummary) {
+        if summary.needsInput {
+            self = .needsInput
+        } else if summary.hasUnreadCompletion {
+            self = .unreadCompletion
+        } else {
+            return nil
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .unreadCompletion: return "Unread"
+        case .needsInput: return "Needs input"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .unreadCompletion: return "checkmark.circle.fill"
+        case .needsInput: return "exclamationmark.circle.fill"
+        }
+    }
+
+    var accessibilityDescription: String {
+        switch self {
+        case .unreadCompletion:
+            return "Unread completed result. View the completed pane to clear this reminder."
+        case .needsInput:
+            return "Needs input. Viewing this session does not clear this reminder."
+        }
+    }
+}
+
 enum SessionWorkingDirectory {
     static func displayPath(for url: URL?) -> String? {
         guard let url else { return nil }
