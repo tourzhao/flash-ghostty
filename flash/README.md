@@ -37,6 +37,11 @@ so they are inert in this fork. The fork uses
 `.github/workflows/flash-release.yml`; update distribution stays disabled until
 FLASH-Ghostty owns signing and update-feed infrastructure.
 
+## Upstream integration notes
+
+- [2026-09-04 integration](upstream-sync/2026-09-04.md): compatibility decisions,
+  regression coverage, and validation status for the latest upstream sync.
+
 ## Signed release-candidate runbook
 
 The fork workflow builds, signs, notarizes, staples, and verifies a universal

@@ -33,7 +33,9 @@ final class ScriptKeyEventCommand: NSScriptCommand {
         do {
             keyEvent = try Self.parse(
                 directParameter: directParameter,
-                evaluatedArguments: evaluatedArguments)
+                evaluatedArguments: evaluatedArguments,
+                translationMods: surface.keyTranslationMods,
+            )
         } catch ArgumentError.missingKey {
             scriptErrorNumber = errAEParamMissed
             scriptErrorString = "Missing key name."
@@ -108,9 +110,10 @@ extension ScriptKeyEventCommand {
         }
 
         return Ghostty.Input.KeyEvent(
-            key: key,
+            synthesizing: key,
             action: action,
             mods: mods,
+            translationMods: translationMods(mods),
         )
     }
 }

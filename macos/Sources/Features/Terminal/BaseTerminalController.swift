@@ -1582,7 +1582,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     @IBAction func findPrevious(_ sender: Any) {
-        focusedSurface?.findNext(sender)
+        focusedSurface?.findPrevious(sender)
     }
 
     @IBAction func findHide(_ sender: Any) {

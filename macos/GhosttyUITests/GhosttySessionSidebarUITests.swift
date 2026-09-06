@@ -47,9 +47,21 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
             """
         )
 
-        terminal.typeKey("t", modifierFlags: .command)
-        terminal.typeKey("t", modifierFlags: .command)
-        XCTAssertTrue(waitForSessionCount(3, in: app))
+        let initialWindowFrame = app.windows.firstMatch.frame
+        for sessionIndex in 1...2 {
+            app.groups["Terminal pane"].typeKey("t", modifierFlags: .command)
+            XCTAssertTrue(waitForSelectedSession(
+                at: sessionIndex,
+                count: sessionIndex + 1,
+                in: app
+            ))
+            XCTAssertEqual(app.windows.count, 1, "New sidebar sessions must remain native tabs in one window")
+            XCTAssertEqual(
+                app.windows.firstMatch.frame,
+                initialWindowFrame,
+                "A new native tab must not cascade or reposition the workspace"
+            )
+        }
 
         // Exercise the same path as a user clicking a newly created session.
         // Background native-tab roots retain inert sidebar placeholders. The
@@ -155,6 +167,103 @@ final class GhosttySessionSidebarUITests: GhosttyCustomConfigCase {
         XCTAssertTrue(openViewMenu(in: app))
         XCTAssertTrue(app.menuItems["Hide Sidebar"].waitForExistence(timeout: 2))
         app.typeKey(.escape, modifierFlags: [])
+    }
+
+    @MainActor
+    func testHiddenTitlebarNewTabCascadesStandaloneWindow() throws {
+        try updateConfig(
+            """
+            macos-titlebar-style = hidden
+            title = "GhosttySessionSidebarUITests"
+            command = /bin/zsh
+            working-directory = /private/tmp
+            """
+        )
+        let app = try isolatedGhosttyApplication(testName: #function)
+        app.launch()
+        XCTAssertTrue(app.groups["Terminal pane"].waitForExistence(timeout: 2))
+        let initialFrame = app.windows.firstMatch.frame
+
+        app.groups["Terminal pane"].typeKey("t", modifierFlags: .command)
+        XCTAssertTrue(app.wait(for: \.windows.count, toEqual: 2, timeout: 10))
+        let cascade = NSPredicate { _, _ in
+            app.windows.firstMatch.frame.origin != initialFrame.origin
+        }
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [XCTNSPredicateExpectation(predicate: cascade, object: app)],
+                timeout: 10
+            ),
+            .completed,
+            "The hidden-titlebar new-tab action must cascade its standalone window after initial positioning"
+        )
+        XCTAssertEqual(sessionSelectors(in: app).count, 0)
+    }
+
+    @MainActor
+    func testCloseWindowReviewSelectsBusySessionsAndClosesIdleSession() throws {
+        let fixtureDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("flash-close-review-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: fixtureDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixtureDirectory) }
+
+        let app = try isolatedGhosttyApplication(testName: #function)
+        app.launch()
+        XCTAssertTrue(app.groups["Terminal pane"].waitForExistence(timeout: 2))
+        XCTAssertTrue(waitForSessionCount(1, in: app))
+
+        for index in 0...1 {
+            XCTAssertTrue(waitForWorkingDirectory("/private/tmp", in: app))
+            let sentinel = fixtureDirectory.appendingPathComponent("running-\(index)")
+            let quotedPath = sentinel.path.replacingOccurrences(of: "'", with: "'\\''")
+            app.groups["Terminal pane"].typeText("touch '\(quotedPath)'; sleep 600\n")
+            // The shell creates this only after its pre-exec integration has
+            // reported a running command. Ordinary shell jobs intentionally
+            // do not use the sidebar's AI-provider activity indicators.
+            let running = NSPredicate { _, _ in
+                FileManager.default.fileExists(atPath: sentinel.path)
+            }
+            XCTAssertEqual(
+                XCTWaiter.wait(
+                    for: [XCTNSPredicateExpectation(predicate: running, object: app)],
+                    timeout: 10
+                ),
+                .completed
+            )
+            app.groups["Terminal pane"].typeKey("t", modifierFlags: .command)
+            XCTAssertTrue(waitForSelectedSession(at: index + 1, count: index + 2, in: app))
+        }
+        XCTAssertTrue(waitForWorkingDirectory("/private/tmp", in: app))
+
+        openCloseWindowReview(in: app)
+        app.sheets.buttons["Cancel"].click()
+        XCTAssertTrue(waitForSessionCount(3, in: app))
+
+        openCloseWindowReview(in: app)
+        app.sheets.buttons["Review Windows..."].click()
+        XCTAssertTrue(app.sheets.staticTexts["Close Tab?"].waitForExistence(timeout: 5))
+        XCTAssertTrue(waitForSelectedSession(at: 0, count: 3, in: app))
+        app.sheets.buttons["Cancel"].click()
+        XCTAssertTrue(waitForSessionCount(3, in: app), "Canceling review must preserve the unreviewed sessions")
+
+        openCloseWindowReview(in: app)
+        app.sheets.buttons["Review Windows..."].click()
+        for remainingCount in [3, 2] {
+            XCTAssertTrue(app.sheets.staticTexts["Close Tab?"].waitForExistence(timeout: 5))
+            XCTAssertTrue(waitForSelectedSession(at: 0, count: remainingCount, in: app))
+            app.sheets.buttons["Close"].click()
+        }
+        XCTAssertTrue(
+            app.wait(for: \.windows.count, toEqual: 0, timeout: 10),
+            "Accepting both busy sessions must also close the idle session from the original window"
+        )
+    }
+
+    @MainActor
+    private func openCloseWindowReview(in app: XCUIApplication) {
+        app.menuBars.menuBarItems["File"].click()
+        app.menuItems["Close Window"].click()
+        XCTAssertTrue(app.sheets.buttons["Review Windows..."].waitForExistence(timeout: 5))
     }
 
     @MainActor

@@ -50,7 +50,10 @@ pub fn encode(
     // Continuation errors must not emit even the snapshot envelope.
     try continuation.validate(options.continuation);
 
-    var stream: record.Writer = .init(alloc, destination);
+    // A measured 512-byte buffer handles our smallest records on the stack
+    // before larger records fall back to the heap.
+    var stack_alloc = std.heap.stackFallback(512, alloc);
+    var stream: record.Writer = .init(stack_alloc.get(), destination);
     defer stream.deinit();
 
     // 1. Envelope
@@ -1677,13 +1680,21 @@ test "complete snapshot decode allocation failures are transactional" {
     // The complete golden exercises Terminal, both screens, and history.
     try S.exercise(&test_complete_fixture);
 
-    // A non-ground component additionally exercises owned continuation bytes.
+    // Exercise owned continuation bytes and a custom palette. An alternate
+    // screen also introduces fallible work after the decoded palette has
+    // transferred from its payload to the terminal, covering both owners'
+    // cleanup paths without leaking or releasing the palette twice.
     var t = try Terminal.init(
         testing.io,
         testing.allocator,
         .{ .cols = 2, .rows = 1 },
     );
     defer t.deinit(testing.allocator);
+    var original_palette = t.colors.palette.current;
+    original_palette[0] = .{ .r = 1, .g = 2, .b = 3 };
+    try t.colors.palette.changeDefault(testing.allocator, original_palette);
+    _ = try t.switchScreen(.alternate);
+    _ = try t.switchScreen(.primary);
     var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
     defer encoded.deinit();
     try encode(testing.allocator, &encoded.writer, &t, .{

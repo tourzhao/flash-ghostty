@@ -103,41 +103,24 @@ struct ScriptKeyEventCommandTests {
 
     // MARK: Produced key event
 
-    // These record known issues until `send key` derives text and codepoints
-    // from the keyboard layout the way real NSEvent-based input does.
-    // Uncomment the expectations and remove the Issue.record calls once the
-    // fix lands.
+    // `send key` derives text and codepoints from the current keyboard layout,
+    // matching real NSEvent-based input without composing dead keys.
 
     @Test func pressCarriesLayoutText() throws {
         let event = try parse("a")
-//        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
-//        #expect(event.text == String(expected))
-//        #expect(event.unshiftedCodepoint == expected.unicodeScalars.first?.value)
-//        #expect(event.consumedMods == [])
-        Issue.record(
-            """
-            press should carry the layout's text and unshifted codepoint; \
-            got text \(String(describing: event.text)), \
-            codepoint \(event.unshiftedCodepoint)
-            """,
-            severity: .warning
-        )
+        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
+        #expect(event.text == String(expected))
+        #expect(event.unshiftedCodepoint == expected.unicodeScalars.first?.value)
+        #expect(event.consumedMods == [])
     }
 
     @Test func shiftShiftsTextAndIsConsumed() throws {
         let event = try parse("a", modifiers: "shift")
-//        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: .shift))
-//        let unshifted = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
-//        #expect(event.text == String(expected))
-//        #expect(event.consumedMods == .shift)
-//        #expect(event.unshiftedCodepoint == unshifted.unicodeScalars.first?.value)
-        Issue.record(
-            """
-            shift should apply to the translated text and be consumed; \
-            got text \(String(describing: event.text))
-            """,
-            severity: .warning
-        )
+        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: .shift))
+        let unshifted = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
+        #expect(event.text == String(expected))
+        #expect(event.consumedMods == .shift)
+        #expect(event.unshiftedCodepoint == unshifted.unicodeScalars.first?.value)
     }
 
     /// The original bug scenario: `send key "c" with modifiers "control"`
@@ -145,34 +128,20 @@ struct ScriptKeyEventCommandTests {
     /// unconsumed, so core can encode the control sequence itself.
     @Test func controlKeepsBaseTextAndIsNotConsumed() throws {
         let event = try parse("c", modifiers: "control")
-//        let expected = try #require(KeyboardLayout.character(
-//            for: 0x08, // W3C KeyC
-//            modifiers: []))
-//        #expect(event.text == String(expected))
-//        #expect(event.mods == .ctrl)
-//        #expect(event.consumedMods == [])
-        Issue.record(
-            """
-            ctrl should be stripped from translation ("c", not 0x03) and \
-            stay unconsumed; got text \(String(describing: event.text))
-            """,
-            severity: .warning
-        )
+        let expected = try #require(KeyboardLayout.character(
+            for: 0x08, // W3C KeyC
+            modifiers: []))
+        #expect(event.text == String(expected))
+        #expect(event.mods == .ctrl)
+        #expect(event.consumedMods == [])
     }
 
     @Test func optionIncludedInTranslationIsConsumed() throws {
         // macos-option-as-alt=false: option participates in translation.
         let event = try parse("a", modifiers: "option")
-//        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: .option))
-//        #expect(event.text == String(expected))
-//        #expect(event.consumedMods == .alt)
-        Issue.record(
-            """
-            option in the translation mods should apply to the text and be \
-            consumed; got text \(String(describing: event.text))
-            """,
-            severity: .warning
-        )
+        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: .option))
+        #expect(event.text == String(expected))
+        #expect(event.consumedMods == .alt)
     }
 
     @Test func optionExcludedFromTranslationIsNotConsumed() throws {
@@ -180,16 +149,9 @@ struct ScriptKeyEventCommandTests {
         // option, so it stays unconsumed and core can encode it (e.g. ESC
         // prefix).
         let event = try parse("a", modifiers: "option") { $0.subtracting(.alt) }
-//        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
-//        #expect(event.text == String(expected))
-//        #expect(event.consumedMods == [])
-        Issue.record(
-            """
-            option excluded from the translation mods should leave the base \
-            text and stay unconsumed; got text \(String(describing: event.text))
-            """,
-            severity: .warning
-        )
+        let expected = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
+        #expect(event.text == String(expected))
+        #expect(event.consumedMods == [])
     }
 
     @Test func releaseCarriesNoText() throws {
@@ -198,16 +160,9 @@ struct ScriptKeyEventCommandTests {
             modifiers: "shift",
             action: "GIrl".fourCharCode
         )
-//        let unshifted = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
-//        #expect(event.text == nil)
-//        #expect(event.unshiftedCodepoint == unshifted.unicodeScalars.first?.value)
-        Issue.record(
-            """
-            release should carry no text but still report the unshifted \
-            codepoint; got codepoint \(event.unshiftedCodepoint)
-            """,
-            severity: .warning
-        )
+        let unshifted = try #require(KeyboardLayout.character(for: keyCodeA, modifiers: []))
+        #expect(event.text == nil)
+        #expect(event.unshiftedCodepoint == unshifted.unicodeScalars.first?.value)
     }
 
     /// Keys whose layout translation is a control character (or a PUA
